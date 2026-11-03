@@ -1,0 +1,545 @@
+// backends/terminal/ascii_test — the cell contract of the terminal backend.
+//
+// Pure: scenes are built directly with mp_scene_* (chart/ is imported nowhere
+// here, by lane rule, and is not needed — the backend's input is the display
+// list). Every fixture asserts the whole document, not a substring, so a
+// backend that dropped a row, an SGR or a reset still fails.
+//
+// Expected documents are assembled in an MpBuf (`wp`/`wr`/`wfg`/`wbg`) rather
+// than with `+`, because `mettle test` runs in the compile-time interpreter and
+// a runtime string concatenation puts `mettle_string_free` in the call graph,
+// which makes it skip the whole file (same reason backends/web/svg_test uses
+// this shape).
+//
+// ESC is written as mp_buf_putc(b, 27) everywhere so no source byte is a
+// control character.
+//
+// Coverage (the gate's list): empty scene -> blank canvas of the exact size;
+// one rect -> exact SGR prefix and interior; a horizontal line -> exact `-`
+// row; a diagonal -> `/`; text clipping at both edges; the 200x80 cap
+// rejection; determinism. Plus circle sizes, POLY, plain mode and the
+// argument errors.
+
+import "std/conv";
+import "harness";
+import "core/buf";
+import "core/color";
+import "core/geom";
+import "renderer/scene";
+import "renderer/backend";
+import "backends/terminal/ascii";
+
+const ESC: int32 = 27;
+
+fn wp(b: MpBuf*, s: string) {
+  if (mp_buf_puts(b, s) != MP_OK) {
+    mp_expect("expected document append", false);
+  }
+}
+
+fn wch(b: MpBuf*, c: int32) {
+  if (mp_buf_putc(b, c) != MP_OK) {
+    mp_expect("expected document char", false);
+  }
+}
+
+fn wi(b: MpBuf*, v: int64) {
+  if (mp_buf_put_i64(b, v) != MP_OK) {
+    mp_expect("expected document number", false);
+  }
+}
+
+// `ESC[0m`
+fn wr(b: MpBuf*) {
+  wch(b, ESC);
+  wp(b, "[0m");
+}
+
+// `ESC[38;2;r;g;bm`
+fn wfg(b: MpBuf*, r: int64, g: int64, bl: int64) {
+  wch(b, ESC);
+  wp(b, "[38;2;");
+  wi(b, r);
+  wch(b, 59);
+  wi(b, g);
+  wch(b, 59);
+  wi(b, bl);
+  wch(b, 109);
+}
+
+// `ESC[48;2;r;g;bm`
+fn wbg(b: MpBuf*, r: int64, g: int64, bl: int64) {
+  wch(b, ESC);
+  wp(b, "[48;2;");
+  wi(b, r);
+  wch(b, 59);
+  wi(b, g);
+  wch(b, 59);
+  wi(b, bl);
+  wch(b, 109);
+}
+
+fn new_scene() -> MpScene* {
+  var sc: MpScene* = mp_scene_new();
+  mp_expect("scene allocated", sc != 0);
+  return sc;
+}
+
+fn new_buf(cap: int64) -> MpBuf* {
+  var b: MpBuf* = mp_buf_new(cap);
+  mp_expect("buffer allocated", b != 0);
+  return b;
+}
+
+// Renders `sc` at cols x rows cells. pad < 0 selects plain mode.
+fn rd(sc: MpScene*, cols: float64, rows: float64, pad: float64,
+      b: MpBuf*) -> string {
+  var o: MpRenderOpts = mp_render_opts(cols, rows, mp_theme_light());
+  o.pad = pad;
+  var rc: int32 = mp_ascii_render(sc, &o, b);
+  mp_expect_i64("mp_ascii_render returns MP_OK", (int64)rc, (int64)MP_OK);
+  return mp_buf_str(b);
+}
+
+fn add_rect(sc: MpScene*, x: float64, y: float64, w: float64, h: float64,
+            fill: MpColor) {
+  var rc: int32 = mp_scene_rect(sc, mp_rect(x, y, w, h), fill,
+                                mp_color_a(0, 0, 0, 0), 0.0, MP_CLS_PLOT);
+  mp_expect_i64("scene rect added", (int64)rc, (int64)MP_OK);
+}
+
+fn add_line(sc: MpScene*, x0: float64, y0: float64, x1: float64, y1: float64,
+            stroke: MpColor) {
+  var rc: int32 = mp_scene_line(sc, x0, y0, x1, y1, stroke, 1.0, MP_CLS_AXIS);
+  mp_expect_i64("scene line added", (int64)rc, (int64)MP_OK);
+}
+
+fn add_text(sc: MpScene*, x: float64, y: float64, s: string, size: float64,
+            align: int32, color: MpColor) {
+  var rc: int32 = mp_scene_text(sc, x, y, s, size, color, align, MP_CLS_TICK);
+  mp_expect_i64("scene text added", (int64)rc, (int64)MP_OK);
+}
+
+fn count_ch(s: string, ch: uint8) -> int64 {
+  var i: int64 = 0;
+  var n: int64 = 0;
+  while (i < (int64)s.length) {
+    if (s.chars[i] == ch) { n = n + 1; }
+    i = i + 1;
+  }
+  return n;
+}
+
+// ------------------------------------------------------- empty scene
+
+fn check_empty() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  var want: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0 || want == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+  defer mp_buf_free(want);
+
+  // ANSI: every row is exactly 4 cells then the reset then a newline.
+  var i: int32 = 0;
+  while (i < 2) {
+    wp(want, "    ");
+    wr(want);
+    wp(want, "\n");
+    i = i + 1;
+  }
+  var doc: string = rd(sc, 4.0, 2.0, 8.0, b);
+  mp_expect_str("empty scene, ansi 4x2", doc, mp_buf_str(want));
+  mp_expect_i64("two rows", count_ch(doc, 10), (int64)2);
+  mp_expect_i64("no escape but the two resets", count_ch(doc, 27), (int64)2);
+
+  // Plain mode trims the all-space rows to nothing.
+  doc = rd(sc, 4.0, 2.0, -1.0, b);
+  mp_expect_str("empty scene, plain 4x2", doc, "\n\n");
+  mp_expect_i64("plain mode emits no escapes", count_ch(doc, 27), (int64)0);
+
+  // A wide canvas keeps the exact width on every row.
+  mp_buf_clear(want);
+  i = 0;
+  while (i < 3) {
+    wp(want, "            ");
+    wr(want);
+    wp(want, "\n");
+    i = i + 1;
+  }
+  doc = rd(sc, 12.0, 3.0, 8.0, b);
+  mp_expect_str("12 spaces then the reset, three times", doc,
+                mp_buf_str(want));
+  mp_expect_i64("three rows at 12 cols", count_ch(doc, 10), (int64)3);
+}
+
+// ------------------------------------------------------- rects
+
+fn check_rect() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  var want: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0 || want == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+  defer mp_buf_free(want);
+
+  // 6x3 canvas, a 2x1 rect at (2,1): cells [2,4) x [1,2).
+  add_rect(sc, 2.0, 1.0, 2.0, 1.0, mp_color(10, 20, 30));
+  wp(want, "      ");
+  wr(want);
+  wp(want, "\n");
+  wp(want, "  ");
+  wbg(want, 10, 20, 30);
+  wp(want, "  ");
+  wr(want);
+  wp(want, "  ");
+  wr(want);
+  wp(want, "\n");
+  wp(want, "      ");
+  wr(want);
+  wp(want, "\n");
+  // Leaving a background run emits a reset, so the row carries two: one where
+  // the fill ends and one at the row end.
+  var doc: string = rd(sc, 6.0, 3.0, 8.0, b);
+  mp_expect_str("rect fills its interior only", doc, mp_buf_str(want));
+
+  // The same rect in plain mode: nothing to see.
+  doc = rd(sc, 6.0, 3.0, -1.0, b);
+  mp_expect_str("rect is background only in plain mode", doc, "\n\n\n");
+
+  // fill.a == 0 is skipped entirely.
+  mp_scene_clear(sc);
+  add_rect(sc, 0.0, 0.0, 6.0, 3.0, mp_color_a(10, 20, 30, 0));
+  doc = rd(sc, 6.0, 3.0, 8.0, b);
+  mp_expect_i64("transparent rect emits no SGR", count_ch(doc, 27), (int64)3);
+}
+
+// ------------------------------------------------------- lines
+
+fn check_horizontal() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  var want: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0 || want == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+  defer mp_buf_free(want);
+
+  add_line(sc, 0.0, 1.0, 6.0, 1.0, mp_color(1, 2, 3));
+  wp(want, "      ");
+  wr(want);
+  wp(want, "\n");
+  wfg(want, 1, 2, 3);
+  wp(want, "------");
+  wr(want);
+  wp(want, "\n");
+  wp(want, "      ");
+  wr(want);
+  wp(want, "\n");
+  var doc: string = rd(sc, 6.0, 3.0, 8.0, b);
+  mp_expect_str("horizontal line is one dash row", doc, mp_buf_str(want));
+  mp_expect_str("plain mode trims the dashes", rd(sc, 6.0, 3.0, -1.0, b),
+                "\n------\n\n");
+}
+
+fn check_diagonal() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  var want: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0 || want == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+  defer mp_buf_free(want);
+
+  // A rising diagonal: (0,4) -> (4,0). Cell rows run downwards, so up-and-
+  // right is `/` (the falling one is covered in check_steep).
+  add_line(sc, 0.0, 4.0, 4.0, 0.0, mp_color(1, 2, 3));
+  wp(want, "    ");
+  wfg(want, 1, 2, 3);
+  wp(want, "/");
+  wr(want);
+  wp(want, "\n");
+  wp(want, "   ");
+  wfg(want, 1, 2, 3);
+  wp(want, "/ ");
+  wr(want);
+  wp(want, "\n");
+  wp(want, "  ");
+  wfg(want, 1, 2, 3);
+  wp(want, "/  ");
+  wr(want);
+  wp(want, "\n");
+  wp(want, " ");
+  wfg(want, 1, 2, 3);
+  wp(want, "/   ");
+  wr(want);
+  wp(want, "\n");
+  wfg(want, 1, 2, 3);
+  wp(want, "/    ");
+  wr(want);
+  wp(want, "\n");
+  var doc: string = rd(sc, 5.0, 5.0, 8.0, b);
+  mp_expect_str("rising diagonal is one slash per row", doc,
+                mp_buf_str(want));
+  mp_expect_i64("five slashes", count_ch(doc, 47), (int64)5);
+  mp_expect_i64("no backslashes", count_ch(doc, 92), (int64)0);
+}
+
+fn check_steep() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+
+  // Down-right and steeper than 45 degrees: bars plus backslashes.
+  add_line(sc, 0.0, 0.0, 1.0, 4.0, mp_color(1, 2, 3));
+  var doc: string = rd(sc, 2.0, 4.0, 8.0, b);
+  mp_expect("vertical-ish line has bars",
+            count_ch(doc, 124) + count_ch(doc, 92) >= (int64)3);
+  mp_expect_i64("vertical-ish line has no dashes", count_ch(doc, 45),
+                (int64)0);
+
+  // Down-right at 45 degrees is a backslash.
+  mp_scene_clear(sc);
+  add_line(sc, 0.0, 0.0, 3.0, 3.0, mp_color(1, 2, 3));
+  doc = rd(sc, 3.0, 3.0, 8.0, b);
+  mp_expect_i64("backslash diagonal", count_ch(doc, 92), (int64)3);
+  mp_expect_i64("no slashes", count_ch(doc, 47), (int64)0);
+}
+
+fn check_poly() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+
+  // A "V": (0,0) -> (2,2) -> (4,0). Two slashes on the way down, two on the
+  // way up, and a `+`/`/` bend at the shared vertex.
+  var xs: float64[3];
+  var ys: float64[3];
+  xs[0] = 0.0;
+  xs[1] = 2.0;
+  xs[2] = 4.0;
+  ys[0] = 0.0;
+  ys[1] = 4.0;
+  ys[2] = 0.0;
+  var rc: int32 = mp_scene_poly(sc, &xs[0], &ys[0], 3, mp_color(1, 2, 3), 1.0,
+                                MP_CLS_SERIES);
+  mp_expect_i64("poly added", (int64)rc, (int64)MP_OK);
+  var doc: string = rd(sc, 5.0, 5.0, 8.0, b);
+  // (0,0)->(2,4) is two `\` and two `|`; (2,4)->(4,0) is `/`, `|`, `/`, `|`,
+  // and the shared vertex (2,4) is already `|`, so it becomes `+`.
+  mp_expect_i64("poly backslashes", count_ch(doc, 92), (int64)2);
+  mp_expect_i64("poly slashes", count_ch(doc, 47), (int64)1);
+  mp_expect_i64("poly bars", count_ch(doc, 124), (int64)5);
+  mp_expect_i64("poly bend is a junction", count_ch(doc, 43), (int64)1);
+  mp_expect_i64("poly covers nine cells", count_ch(doc, 32), (int64)16);
+}
+
+// ------------------------------------------------------- text
+
+fn check_text() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  var want: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0 || want == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+  defer mp_buf_free(want);
+
+  // 6x1 canvas, size 1.0 -> baseline 0.8 -> row 0.
+  add_text(sc, 0.0, 0.0, "abcdef", 1.0, MP_ALIGN_START, mp_color(1, 2, 3));
+  wfg(want, 1, 2, 3);
+  wp(want, "abcdef");
+  wr(want);
+  wp(want, "\n");
+  mp_expect_str("text fits the row", rd(sc, 6.0, 1.0, 8.0, b),
+                mp_buf_str(want));
+
+  // Clipped on the left: only the bytes that land inside survive.
+  mp_scene_clear(sc);
+  add_text(sc, -2.0, 0.0, "abcdef", 1.0, MP_ALIGN_START, mp_color(1, 2, 3));
+  mp_buf_clear(want);
+  wfg(want, 1, 2, 3);
+  wp(want, "cdef  ");
+  wr(want);
+  wp(want, "\n");
+  mp_expect_str("text clips on the left edge", rd(sc, 6.0, 1.0, 8.0, b),
+                mp_buf_str(want));
+
+  // Clipped on the right: an END anchor at the right edge keeps every byte.
+  mp_scene_clear(sc);
+  add_text(sc, 6.0, 0.0, "abcdef", 1.0, MP_ALIGN_END, mp_color(1, 2, 3));
+  mp_buf_clear(want);
+  wfg(want, 1, 2, 3);
+  wp(want, "abcdef");
+  wr(want);
+  wp(want, "\n");
+  mp_expect_str("end anchor ends at the right edge", rd(sc, 6.0, 1.0, 8.0, b),
+                mp_buf_str(want));
+
+  // Entirely off the right edge: nothing is drawn.
+  mp_scene_clear(sc);
+  add_text(sc, 6.0, 0.0, "ab", 1.0, MP_ALIGN_START, mp_color(1, 2, 3));
+  mp_expect_str("text past the right edge vanishes",
+                rd(sc, 6.0, 1.0, -1.0, b), "\n");
+
+  // A CENTER anchor straddling the right edge draws only its left half.
+  mp_scene_clear(sc);
+  add_text(sc, 5.0, 0.0, "abcd", 1.0, MP_ALIGN_CENTER, mp_color(1, 2, 3));
+  mp_expect_str("centered text clips at the right edge",
+                rd(sc, 6.0, 1.0, -1.0, b), "   abc\n");
+
+  // Bytes that are not printable ASCII become `?`. The source cannot spell a
+  // high byte in a literal (`\u{}`/`\x` are not escapes at this compiler
+  // build), so the four bytes are built in an array: 'a', 0xC3, 0xA9, 'z'.
+  mp_scene_clear(sc);
+  var raw: uint8[4];
+  raw[0] = 97;
+  raw[1] = 195;
+  raw[2] = 169;
+  raw[3] = 122;
+  add_text(sc, 0.0, 0.0, str_from_bytes((cstring)&raw[0], 4), 1.0,
+           MP_ALIGN_START, mp_color(1, 2, 3));
+  mp_expect_str("non-ascii bytes become question marks",
+                rd(sc, 6.0, 1.0, -1.0, b), "a??z\n");
+}
+
+// ------------------------------------------------------- circles
+
+fn check_circle() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+
+  // r = 3 cells at a 9x9 canvas: an outline, hollow centre.
+  var rc: int32 = mp_scene_circle(sc, 4.5, 4.5, 3.0, mp_color_a(0, 0, 0, 0),
+                                  mp_color(1, 2, 3), 1.0, MP_CLS_SERIES);
+  mp_expect_i64("circle added", (int64)rc, (int64)MP_OK);
+  var doc: string = rd(sc, 9.0, 9.0, 8.0, b);
+  mp_expect("circle outline has `o` cells", count_ch(doc, 111) >= (int64)8);
+  mp_expect_i64("circle is not filled", count_ch(doc, 64), (int64)0);
+  mp_expect_i64("no `@` for a big circle", count_ch(doc, 64), (int64)0);
+
+  // r < 1.5 cells is a single `@`.
+  mp_scene_clear(sc);
+  mp_scene_circle(sc, 4.5, 4.5, 1.0, mp_color_a(0, 0, 0, 0),
+                  mp_color(1, 2, 3), 1.0, MP_CLS_SERIES);
+  doc = rd(sc, 9.0, 9.0, 8.0, b);
+  mp_expect_i64("tiny circle is one `@`", count_ch(doc, 64), (int64)1);
+  mp_expect_i64("tiny circle has no `o`", count_ch(doc, 111), (int64)0);
+}
+
+// ------------------------------------------------------- size rules
+
+fn check_sizes() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+
+  var o: MpRenderOpts = mp_render_opts(200.0, 80.0, mp_theme_light());
+  mp_expect_i64("200x80 is the cap and is accepted",
+                (int64)mp_ascii_render(sc, &o, b), (int64)MP_OK);
+  mp_expect_i64("200x80 has 80 rows", count_ch(mp_buf_str(b), 10), (int64)80);
+
+  o = mp_render_opts(201.0, 8.0, mp_theme_light());
+  mp_expect_i64("201 cols is MP_ERR_ARG",
+                (int64)mp_ascii_render(sc, &o, b), (int64)MP_ERR_ARG);
+  mp_expect_i64("a rejected size clears out", mp_buf_len(b), (int64)0);
+
+  o = mp_render_opts(20.0, 81.0, mp_theme_light());
+  mp_expect_i64("81 rows is MP_ERR_ARG",
+                (int64)mp_ascii_render(sc, &o, b), (int64)MP_ERR_ARG);
+
+  o = mp_render_opts(0.0, 8.0, mp_theme_light());
+  mp_expect_i64("zero cols is MP_ERR_ARG",
+                (int64)mp_ascii_render(sc, &o, b), (int64)MP_ERR_ARG);
+
+  o = mp_render_opts(20.0, -4.0, mp_theme_light());
+  mp_expect_i64("negative rows is MP_ERR_ARG",
+                (int64)mp_ascii_render(sc, &o, b), (int64)MP_ERR_ARG);
+
+  o = mp_render_opts(20.0, 8.0, mp_theme_light());
+  mp_expect_i64("null scene is MP_ERR_ARG",
+                (int64)mp_ascii_render(0, &o, b), (int64)MP_ERR_ARG);
+  mp_expect_i64("null out is MP_ERR_ARG",
+                (int64)mp_ascii_render(sc, &o, 0), (int64)MP_ERR_ARG);
+}
+
+// ------------------------------------------------------- determinism
+
+fn check_determinism() {
+  var sc: MpScene* = new_scene();
+  if (sc == 0) { return; }
+  defer mp_scene_free(sc);
+
+  add_rect(sc, 0.0, 0.0, 20.0, 8.0, mp_color(250, 250, 250));
+  add_rect(sc, 4.0, 2.0, 6.0, 3.0, mp_color(10, 20, 30));
+  add_line(sc, 1.0, 7.0, 18.0, 7.0, mp_color(90, 90, 90));
+  add_line(sc, 2.0, 1.0, 9.0, 6.0, mp_color(200, 30, 40));
+  var xs: float64[4];
+  var ys: float64[4];
+  xs[0] = 11.0;
+  xs[1] = 13.0;
+  xs[2] = 15.0;
+  xs[3] = 17.0;
+  ys[0] = 6.0;
+  ys[1] = 3.0;
+  ys[2] = 5.0;
+  ys[3] = 2.0;
+  var rc: int32 = mp_scene_poly(sc, &xs[0], &ys[0], 4, mp_color(30, 120, 60),
+                                1.0, MP_CLS_SERIES);
+  mp_expect_i64("poly for determinism", (int64)rc, (int64)MP_OK);
+  mp_scene_circle(sc, 15.5, 5.5, 2.0, mp_color_a(0, 0, 0, 0),
+                  mp_color(120, 60, 160), 1.0, MP_CLS_SERIES);
+  add_text(sc, 1.0, 0.0, "20x8", 2.0, MP_ALIGN_START, mp_color(31, 41, 51));
+
+  // Different initial capacities, so the growth history differs too.
+  var b1: MpBuf* = new_buf(64);
+  var b2: MpBuf* = new_buf(8192);
+  if (b1 == 0 || b2 == 0) { return; }
+  defer mp_buf_free(b1);
+  defer mp_buf_free(b2);
+
+  var d1: string = rd(sc, 20.0, 8.0, 8.0, b1);
+  var d2: string = rd(sc, 20.0, 8.0, 8.0, b2);
+  mp_expect("two ansi renders are byte-identical", d1 == d2);
+  mp_expect_i64("the scene renders eight rows", count_ch(d1, 10), (int64)8);
+  var p1: string = rd(sc, 20.0, 8.0, -1.0, b1);
+  var p2: string = rd(sc, 20.0, 8.0, -1.0, b2);
+  mp_expect("two plain renders are byte-identical", p1 == p2);
+  mp_expect_i64("plain mode never escapes", count_ch(p1, 27), (int64)0);
+  mp_expect("plain and ansi differ", p1 != d1);
+}
+
+fn run_all() {
+  check_empty();
+  check_rect();
+  check_horizontal();
+  check_diagonal();
+  check_steep();
+  check_poly();
+  check_text();
+  check_circle();
+  check_sizes();
+  check_determinism();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_terminal_ascii() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

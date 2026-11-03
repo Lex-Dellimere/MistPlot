@@ -1,0 +1,155 @@
+// chart/axis — grid lines, axis lines, tick labels and axis titles for one
+// frame (docs/02-seams.md §4).
+//
+// Dependencies: chart/{spec,layout} + core/{scale,color,geom,text} +
+// renderer/scene. Nothing chart-kind specific lives here: an axis only knows
+// the two scales, the tick *values* and the frame.
+//
+// Emit order (asserted by the tests): grid (MP_CLS_GRID), axis lines
+// (MP_CLS_AXIS), tick labels (MP_CLS_TICK), axis titles (MP_CLS_LABEL).
+//
+// One placement rule for every TEXT node (mp_axis_emit_text): the anchor is
+// shifted by the smallest amount that puts the *measured* box inside the
+// canvas, and a label wider than the whole canvas is dropped. So the axis never
+// emits a node outside the canvas rect. This is *not* collision skipping (§4
+// defers that to Phase 2: a label that overlaps another is still emitted, in
+// the place its tick asks for).
+
+import "core/color";
+import "core/geom";
+import "core/scale";
+import "core/text";
+import "renderer/scene";
+import "chart/spec";
+import "chart/layout";
+
+// Pixel position of one axis value: a band axis labels its band centres (the
+// tick values of a band axis are band indices), a value axis maps the value.
+export fn mp_axis_pos(s: MpScale, v: float64) -> float64 {
+  if (s.kind == MP_SCALE_BAND) { return mp_scale_band_center(s, (int32)v); }
+  return mp_scale_map(s, v);
+}
+
+// A band axis labels band indices, so it formats as an integer regardless of
+// the requested label format (layout measures labels the same way).
+fn axis_fmt(kind: int32, fmt: int32) -> int32 {
+  if (kind == MP_SCALE_BAND) { return MP_FMT_INT; }
+  return fmt;
+}
+
+fn axis_box_left(x: float64, w: float64, align: int32) -> float64 {
+  if (align == MP_ALIGN_CENTER) { return x - w * 0.5; }
+  if (align == MP_ALIGN_END) { return x - w; }
+  return x;
+}
+
+// Emits one TEXT node inside [0,cw]x[0,ch]. Shared with resolve for the title,
+// subtitle and legend text, so every TEXT node in a chart scene goes through
+// this one rule:
+//   * shift the anchor by the smallest amount that puts the measured box (in
+//     its alignment) inside the canvas — the label keeps its tick;
+//   * a label wider than the whole canvas cannot be placed inside it at all,
+//     so it is dropped rather than drawn over the edge (Phase 2 wraps or
+//     ellipsizes; the seam only forbids emitting outside the canvas).
+export fn mp_axis_emit_text(s: MpScene*, x: float64, y: float64,
+                            label: string, size: float64, color: MpColor,
+                            align: int32, cls: int32, cw: float64,
+                            ch: float64) -> int32 {
+  var w: float64 = mp_text_width(label, size);
+  if (w > cw) { return MP_OK; }
+  var h: float64 = mp_text_height(size);
+  var dx: float64 = 0.0;
+  var l: float64 = axis_box_left(x, w, align);
+  if (l < 0.0) { dx = 0.0 - l; }
+  var r: float64 = l + dx + w;
+  if (r > cw) { dx = dx - (r - cw); }
+  var ay: float64 = y;
+  if (ay < 0.0) { ay = 0.0; }
+  if (ay + h > ch) { ay = ch - h; }
+  if (ay < 0.0) { ay = 0.0; }
+  return mp_scene_text(s, x + dx, ay, label, size, color, align, cls);
+}
+
+export fn mp_axis_draw(s: MpScene*, spec: MpChartSpec*, f: MpFrame*,
+                       xs: MpScale, ys: MpScale, xv: float64*, nx: int32,
+                       yv: float64*, ny: int32) -> int32 {
+  if (s == 0 || spec == 0 || f == 0) { return MP_ERR_ARG; }
+  var plot: MpRect = f->plot;
+  var cw: float64 = spec->width;
+  var ch: float64 = spec->height;
+  var rc: int32 = MP_OK;
+  var i: int32 = 0;
+
+  // 1. grid: one line per tick, inside the plot rect only.
+  if (spec->grid) {
+    while (i < ny) {
+      var py: float64 = mp_axis_pos(ys, yv[(int64)i]);
+      if (py >= plot.y && py <= plot.y + plot.h) {
+        rc = mp_scene_line(s, plot.x, py, plot.x + plot.w, py,
+                           spec->theme.grid, 1.0, MP_CLS_GRID);
+        if (rc != MP_OK) { return rc; }
+      }
+      i = i + 1;
+    }
+    var j: int32 = 0;
+    while (j < nx) {
+      var px: float64 = mp_axis_pos(xs, xv[(int64)j]);
+      if (px >= plot.x && px <= plot.x + plot.w) {
+        rc = mp_scene_line(s, px, plot.y, px, plot.y + plot.h,
+                           spec->theme.grid, 1.0, MP_CLS_GRID);
+        if (rc != MP_OK) { return rc; }
+      }
+      j = j + 1;
+    }
+  }
+
+  // 2. axis lines: the value axis on the left, the category axis at the bottom.
+  rc = mp_scene_line(s, plot.x, plot.y, plot.x, plot.y + plot.h,
+                     spec->theme.axis, 1.0, MP_CLS_AXIS);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_scene_line(s, plot.x, plot.y + plot.h, plot.x + plot.w,
+                     plot.y + plot.h, spec->theme.axis, 1.0, MP_CLS_AXIS);
+  if (rc != MP_OK) { return rc; }
+
+  // 3. tick labels: y right-aligned against the axis, x centred under its tick.
+  var th: float64 = mp_layout_text_h();
+  var b: uint8[64];
+  var yfmt: int32 = axis_fmt(ys.kind, spec->y_format);
+  var xfmt: int32 = axis_fmt(xs.kind, spec->x_format);
+  i = 0;
+  while (i < ny) {
+    var py: float64 = mp_axis_pos(ys, yv[(int64)i]);
+    var lab: string = mp_chart_fmt_value(yv[(int64)i], yfmt, &b[0], 64);
+    rc = mp_axis_emit_text(s, plot.x - MP_LAYOUT_TICK_GAP, py - th * 0.5,
+                           lab, MP_CHART_TEXT_SIZE, spec->theme.muted,
+                           MP_ALIGN_END, MP_CLS_TICK, cw, ch);
+    if (rc != MP_OK) { return rc; }
+    i = i + 1;
+  }
+  i = 0;
+  while (i < nx) {
+    var px: float64 = mp_axis_pos(xs, xv[(int64)i]);
+    var lab2: string = mp_chart_fmt_value(xv[(int64)i], xfmt, &b[0], 64);
+    rc = mp_axis_emit_text(s, px, plot.y + plot.h + MP_LAYOUT_TICK_PAD,
+                           lab2, MP_CHART_TEXT_SIZE, spec->theme.muted,
+                           MP_ALIGN_CENTER, MP_CLS_TICK, cw, ch);
+    if (rc != MP_OK) { return rc; }
+    i = i + 1;
+  }
+
+  // 4. axis titles, each in its own frame band.
+  if ((int64)spec->x_label.length > 0) {
+    rc = mp_axis_emit_text(s, f->x_label.x + f->x_label.w * 0.5, f->x_label.y,
+                           spec->x_label, MP_CHART_TEXT_SIZE,
+                           spec->theme.muted, MP_ALIGN_CENTER, MP_CLS_LABEL,
+                           cw, ch);
+    if (rc != MP_OK) { return rc; }
+  }
+  if ((int64)spec->y_label.length > 0) {
+    rc = mp_axis_emit_text(s, f->y_label.x, f->y_label.y, spec->y_label,
+                           MP_CHART_TEXT_SIZE, spec->theme.muted,
+                           MP_ALIGN_START, MP_CLS_LABEL, cw, ch);
+    if (rc != MP_OK) { return rc; }
+  }
+  return MP_OK;
+}

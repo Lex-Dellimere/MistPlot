@@ -1,0 +1,453 @@
+// backends/terminal/ascii — the terminal backend: one character cell per
+// (col,row) of a cols x rows grid, emitted as ANSI SGR text or as plain text.
+//
+// Dependencies (docs/02-seams.md §3, docs/04-integration.md §4):
+// renderer/scene, renderer/backend, core/{buf,color} and std/math (floor).
+// Nothing chart-shaped is imported: the backend walks the display list and does
+// no arithmetic beyond the coordinate mapping and the text baseline shift.
+//
+// Ownership: mp_ascii_render clears `out` and writes only into it. The cell
+// grid is a stack array of MP_ASCII_MAX_CELLS (200*80) cells, so the only
+// allocation is `out`'s growth — the seam's "no allocation but out" rule holds
+// and there is nothing to free.
+//
+// Determinism: the bytes are a pure function of the scene, the two viewport
+// numbers, the theme and the sign of o->pad. No ids, no time, no addresses, no
+// locale — two renders of one scene are byte-identical.
+//
+// Interpretation (the seam leaves these to the backend; all are documented in
+// reports/export.md):
+//   * canvas: cols = (int32)o->width, rows = (int32)o->height, truncated; a
+//     non-finite, non-positive or > 200x80 size is MP_ERR_ARG (after clear);
+//   * mapping: col = floor(x / o->width * cols), row = floor(y / o->height *
+//     rows) — the divisor is the float viewport, not the truncated cell count;
+//     a mapped cell is clamped to ±4096 so a wild coordinate cannot spin the
+//     rasterizer;
+//   * RECT: the half-open cell range [col(x), col(x+w)) x [row(y), row(y+h)) is
+//     filled with the fill colour as a background SGR and its glyphs are
+//     cleared to spaces (painter's order: a later opaque rect covers earlier
+//     glyphs). fill.a == 0 skips the node; a rect thinner than one cell
+//     vanishes. Rects are fills only — stroke is ignored;
+//   * LINE/POLY: Bresenham per segment; the glyph of a cell is the direction of
+//     the step leaving it (`-` horizontal, `|` vertical, `\` when x and y move
+//     the same way, `/` when they move oppositely) and the last cell keeps the
+//     incoming direction. A cell that already holds a different glyph becomes
+//     `+`, which is where junctions and crossings come from. No anti-aliasing;
+//   * CIRCLE: midpoint outline of `o`; `@` when the radius is < 1.5 cells. The
+//     radius is measured in columns (r / width * cols) because a cell is not
+//     square and Phase 3 does not correct the aspect ratio;
+//   * TEXT: one cell per byte, clipped per cell to the canvas. The glyph row is
+//     the row containing the baseline y + size*0.8 (the same baseline choice
+//     backends/web/svg documents); the column is the anchor, shifted left by
+//     len/2 for CENTER and by len for END. Phase 3 is ASCII-only: bytes
+//     0x20..0x7E are drawn as themselves and every other byte (control or
+//     >= 0x80, i.e. every UTF-8 continuation byte) becomes `?`;
+//   * ANSI: `ESC[38;2;r;g;bm` foreground, `ESC[48;2;r;g;bm` background, and
+//     `ESC[0m` at the end of every row (the last row's reset is the document's
+//     final reset). SGR is emitted only when a cell's colour differs from the
+//     row's current colour, and never for a space's foreground, so a blank
+//     canvas carries no colour escapes. o->theme.fg is the default foreground;
+//   * plain mode (o->pad < 0) emits no escapes at all and trims trailing
+//     spaces from each row. Every row ends with a newline in both modes.
+
+import "std/math";
+import "core/buf";
+import "core/color";
+import "renderer/backend";
+import "renderer/scene";
+
+export const MP_ASCII_MAX_COLS: int32 = 200;
+export const MP_ASCII_MAX_ROWS: int32 = 80;
+export const MP_ASCII_MAX_CELLS: int32 = 16000;
+
+// A mapped cell coordinate is clamped here before rasterizing: the canvas is at
+// most 200x80, so anything beyond this is off-canvas anyway and the clamp only
+// bounds the Bresenham loop.
+const MP_ASCII_CELL_LIMIT: int32 = 4096;
+
+// The scene's TEXT y is the top of the box; the glyph row is the row holding
+// the baseline, at 0.8 of the em box (the choice backends/web/svg documents).
+const MP_ASCII_BASELINE: float64 = 0.8;
+
+const MP_ASCII_SPACE: uint8 = 32;
+const MP_ASCII_PLUS: uint8 = 43;
+const MP_ASCII_DASH: uint8 = 45;
+const MP_ASCII_SLASH: uint8 = 47;
+const MP_ASCII_QUESTION: uint8 = 63;
+const MP_ASCII_AT: uint8 = 64;
+const MP_ASCII_BACKSLASH: uint8 = 92;
+const MP_ASCII_BAR: uint8 = 124;
+const MP_ASCII_O: uint8 = 111;
+const MP_ASCII_ESC: int32 = 27;
+
+// The cell grid. `glyphs` is the character, `fg`/`bg` the SGR colours; a bg
+// with a == 0 means "no background" (the terminal's own).
+struct AsciiGrid {
+  glyphs: uint8*;
+  fg: MpColor*;
+  bg: MpColor*;
+  cols: int32;
+  rows: int32;
+}
+
+fn ascii_none() -> MpColor {
+  return mp_color_a(0, 0, 0, 0);
+}
+
+fn ascii_same(a: MpColor, b: MpColor) -> bool {
+  if (a.r != b.r) { return false; }
+  if (a.g != b.g) { return false; }
+  if (a.b != b.b) { return false; }
+  if (a.a != b.a) { return false; }
+  return true;
+}
+
+// floor(v / span * n), clamped to ±MP_ASCII_CELL_LIMIT. `span` is > 0 (the
+// caller rejected a non-positive viewport) and `n` is > 0.
+fn ascii_cell(v: float64, span: float64, n: int32) -> int32 {
+  if (v != v) { return 0; }
+  var t: float64 = v / span * (float64)n;
+  if (t < 0.0 - (float64)MP_ASCII_CELL_LIMIT) {
+    return 0 - MP_ASCII_CELL_LIMIT;
+  }
+  if (t > (float64)MP_ASCII_CELL_LIMIT) { return MP_ASCII_CELL_LIMIT; }
+  return (int32)floor(t);
+}
+
+fn ascii_index(g: AsciiGrid*, col: int32, row: int32) -> int64 {
+  return (int64)row * (int64)g->cols + (int64)col;
+}
+
+fn ascii_blank(g: AsciiGrid*, fg: MpColor) {
+  var n: int64 = (int64)g->cols * (int64)g->rows;
+  var i: int64 = 0;
+  while (i < n) {
+    g->glyphs[i] = MP_ASCII_SPACE;
+    g->fg[i] = fg;
+    g->bg[i] = ascii_none();
+    i = i + 1;
+  }
+}
+
+// Overwrite: text and circle points win over whatever was there.
+fn ascii_set(g: AsciiGrid*, col: int32, row: int32, ch: uint8, fg: MpColor) {
+  if (col < 0 || col >= g->cols) { return; }
+  if (row < 0 || row >= g->rows) { return; }
+  var i: int64 = ascii_index(g, col, row);
+  g->glyphs[i] = ch;
+  g->fg[i] = fg;
+}
+
+// Line semantics: a cell that already holds a different glyph becomes `+`, so
+// crossings and polyline bends read as junctions.
+fn ascii_plot(g: AsciiGrid*, col: int32, row: int32, ch: uint8, fg: MpColor) {
+  if (col < 0 || col >= g->cols) { return; }
+  if (row < 0 || row >= g->rows) { return; }
+  var i: int64 = ascii_index(g, col, row);
+  var old: uint8 = g->glyphs[i];
+  if (old != MP_ASCII_SPACE && old != ch) {
+    g->glyphs[i] = MP_ASCII_PLUS;
+  } else {
+    g->glyphs[i] = ch;
+  }
+  g->fg[i] = fg;
+}
+
+// One Bresenham segment in cell space. The glyph of a cell is the direction of
+// the step that leaves it; the final cell keeps the incoming direction.
+fn ascii_seg(g: AsciiGrid*, x0: int32, y0: int32, x1: int32, y1: int32,
+             fg: MpColor) {
+  var dx: int32 = x1 - x0;
+  if (dx < 0) { dx = 0 - dx; }
+  var sx: int32 = 1;
+  if (x0 > x1) { sx = -1; }
+  var dy: int32 = y1 - y0;
+  if (dy > 0) { dy = 0 - dy; }
+  var sy: int32 = 1;
+  if (y0 > y1) { sy = -1; }
+  var err: int32 = dx + dy;
+  var ch: uint8 = MP_ASCII_DASH;
+  var have: bool = false;
+  var cx: int32 = x0;
+  var cy: int32 = y0;
+  while (true) {
+    if (cx == x1 && cy == y1) {
+      if (have) {
+        ascii_plot(g, cx, cy, ch, fg);
+      } else {
+        ascii_plot(g, cx, cy, MP_ASCII_DASH, fg);
+      }
+      return;
+    }
+    var e2: int32 = 2 * err;
+    var mx: bool = false;
+    var my: bool = false;
+    if (e2 >= dy) { mx = true; }
+    if (e2 <= dx) { my = true; }
+    if (mx && my) {
+      if ((sx > 0) == (sy > 0)) {
+        ch = MP_ASCII_BACKSLASH;
+      } else {
+        ch = MP_ASCII_SLASH;
+      }
+    } else if (my) {
+      ch = MP_ASCII_BAR;
+    } else {
+      ch = MP_ASCII_DASH;
+    }
+    have = true;
+    ascii_plot(g, cx, cy, ch, fg);
+    if (mx) {
+      err = err + dy;
+      cx = cx + sx;
+    }
+    if (my) {
+      err = err + dx;
+      cy = cy + sy;
+    }
+  }
+}
+
+// Midpoint circle outline; `@` for a radius below 1.5 cells.
+fn ascii_circle(g: AsciiGrid*, cx: int32, cy: int32, r: float64, fg: MpColor) {
+  if (r < 1.5) {
+    ascii_set(g, cx, cy, MP_ASCII_AT, fg);
+    return;
+  }
+  var rr: int32 = (int32)(r + 0.5);
+  if (rr < 1) { rr = 1; }
+  var x: int32 = rr;
+  var y: int32 = 0;
+  var err: int32 = 1 - rr;
+  while (x >= y) {
+    ascii_set(g, cx + x, cy + y, MP_ASCII_O, fg);
+    ascii_set(g, cx + y, cy + x, MP_ASCII_O, fg);
+    ascii_set(g, cx - y, cy + x, MP_ASCII_O, fg);
+    ascii_set(g, cx - x, cy + y, MP_ASCII_O, fg);
+    ascii_set(g, cx - x, cy - y, MP_ASCII_O, fg);
+    ascii_set(g, cx - y, cy - x, MP_ASCII_O, fg);
+    ascii_set(g, cx + y, cy - x, MP_ASCII_O, fg);
+    ascii_set(g, cx + x, cy - y, MP_ASCII_O, fg);
+    y = y + 1;
+    if (err < 0) {
+      err = err + 2 * y + 1;
+    } else {
+      x = x - 1;
+      err = err + 2 * (y - x) + 1;
+    }
+  }
+}
+
+fn ascii_rect(g: AsciiGrid*, nd: MpNode*, w: float64, h: float64) {
+  if (nd->fill.a == 0) { return; }
+  var c0: int32 = ascii_cell(nd->x, w, g->cols);
+  var c1: int32 = ascii_cell(nd->x + nd->w, w, g->cols);
+  var r0: int32 = ascii_cell(nd->y, h, g->rows);
+  var r1: int32 = ascii_cell(nd->y + nd->h, h, g->rows);
+  if (c0 < 0) { c0 = 0; }
+  if (r0 < 0) { r0 = 0; }
+  if (c1 > g->cols) { c1 = g->cols; }
+  if (r1 > g->rows) { r1 = g->rows; }
+  var row: int32 = r0;
+  while (row < r1) {
+    var col: int32 = c0;
+    while (col < c1) {
+      var i: int64 = ascii_index(g, col, row);
+      g->glyphs[i] = MP_ASCII_SPACE;
+      g->bg[i] = nd->fill;
+      col = col + 1;
+    }
+    row = row + 1;
+  }
+}
+
+fn ascii_text(g: AsciiGrid*, nd: MpNode*, s: string, w: float64, h: float64) {
+  var n: int64 = (int64)s.length;
+  if (n == 0) { return; }
+  var row: int32 = ascii_cell(nd->y + nd->size * MP_ASCII_BASELINE, h, g->rows);
+  if (row < 0 || row >= g->rows) { return; }
+  var col: int32 = ascii_cell(nd->x, w, g->cols);
+  if (nd->align == MP_ALIGN_CENTER) {
+    col = col - (int32)(n / 2);
+  } else if (nd->align == MP_ALIGN_END) {
+    col = col - (int32)n;
+  }
+  var i: int64 = 0;
+  while (i < n) {
+    var c: uint8 = s.chars[i];
+    var ch: uint8 = c;
+    if (c < 32 || c > 126) { ch = MP_ASCII_QUESTION; }
+    ascii_set(g, col + (int32)i, row, ch, nd->fill);
+    i = i + 1;
+  }
+}
+
+fn ascii_node(g: AsciiGrid*, s: MpScene*, nd: MpNode*, w: float64, h: float64,
+              def_fg: MpColor) {
+  switch (nd->kind) {
+    case MP_NODE_RECT: {
+      ascii_rect(g, nd, w, h);
+    }
+    case MP_NODE_LINE: {
+      var p: float64* = mp_scene_node_pts(s, nd);
+      if (p == 0 || nd->pts_len < 4) { return; }
+      var fg: MpColor = nd->stroke;
+      if (fg.a == 0) { fg = def_fg; }
+      ascii_seg(g, ascii_cell(p[0], w, g->cols), ascii_cell(p[1], h, g->rows),
+                ascii_cell(p[2], w, g->cols), ascii_cell(p[3], h, g->rows), fg);
+    }
+    case MP_NODE_POLY: {
+      var p: float64* = mp_scene_node_pts(s, nd);
+      if (p == 0 || nd->pts_len < 4) { return; }
+      var fg: MpColor = nd->stroke;
+      if (fg.a == 0) { fg = def_fg; }
+      var i: int32 = 0;
+      var n: int32 = nd->pts_len;
+      while (i + 3 < n) {
+        ascii_seg(g, ascii_cell(p[i], w, g->cols),
+                  ascii_cell(p[i + 1], h, g->rows),
+                  ascii_cell(p[i + 2], w, g->cols),
+                  ascii_cell(p[i + 3], h, g->rows), fg);
+        i = i + 2;
+      }
+    }
+    case MP_NODE_CIRCLE: {
+      var fg: MpColor = nd->stroke;
+      if (fg.a == 0) { fg = nd->fill; }
+      if (fg.a == 0) { fg = def_fg; }
+      var r: float64 = nd->r / w * (float64)g->cols;
+      ascii_circle(g, ascii_cell(nd->x, w, g->cols),
+                   ascii_cell(nd->y, h, g->rows), r, fg);
+    }
+    case MP_NODE_TEXT: {
+      ascii_text(g, nd, mp_scene_node_text(s, nd), w, h);
+    }
+    default: { return; }
+  }
+}
+
+fn ascii_put_esc(b: MpBuf*) -> int32 {
+  return mp_buf_putc(b, MP_ASCII_ESC);
+}
+
+fn ascii_put_reset(b: MpBuf*) -> int32 {
+  var rc: int32 = ascii_put_esc(b);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_puts(b, "[0m");
+}
+
+// `ESC[38;2;r;g;bm` (kind 38) or `ESC[48;2;r;g;bm` (kind 48).
+fn ascii_put_sgr(b: MpBuf*, kind: int32, c: MpColor) -> int32 {
+  var rc: int32 = ascii_put_esc(b);
+  if (rc != MP_OK) { return rc; }
+  if (kind == 38) {
+    rc = mp_buf_puts(b, "[38;2;");
+  } else {
+    rc = mp_buf_puts(b, "[48;2;");
+  }
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_i64(b, (int64)c.r);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_putc(b, 59);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_i64(b, (int64)c.g);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_putc(b, 59);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_i64(b, (int64)c.b);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_putc(b, 109);
+}
+
+// One row: `cols` cells, then the reset (ANSI) or the trimmed cells (plain),
+// then a newline.
+fn ascii_emit_row(g: AsciiGrid*, out: MpBuf*, row: int32,
+                  plain: bool) -> int32 {
+  var rc: int32 = MP_OK;
+  var cur_fg: MpColor = ascii_none();
+  var cur_bg: MpColor = ascii_none();
+  var last: int32 = g->cols - 1;
+  if (plain) {
+    while (last >= 0) {
+      if (g->glyphs[ascii_index(g, last, row)] != MP_ASCII_SPACE) { break; }
+      last = last - 1;
+    }
+  }
+  var col: int32 = 0;
+  while (col <= last) {
+    var i: int64 = ascii_index(g, col, row);
+    var ch: uint8 = g->glyphs[i];
+    if (!plain) {
+      if (!ascii_same(g->bg[i], cur_bg)) {
+        if (g->bg[i].a == 0) {
+          rc = ascii_put_reset(out);
+          if (rc != MP_OK) { return rc; }
+          cur_fg = ascii_none();
+          cur_bg = ascii_none();
+        } else {
+          rc = ascii_put_sgr(out, 48, g->bg[i]);
+          if (rc != MP_OK) { return rc; }
+          cur_bg = g->bg[i];
+        }
+      }
+      if (ch != MP_ASCII_SPACE && !ascii_same(g->fg[i], cur_fg)) {
+        rc = ascii_put_sgr(out, 38, g->fg[i]);
+        if (rc != MP_OK) { return rc; }
+        cur_fg = g->fg[i];
+      }
+    }
+    rc = mp_buf_putc(out, (int32)ch);
+    if (rc != MP_OK) { return rc; }
+    col = col + 1;
+  }
+  if (!plain) {
+    rc = ascii_put_reset(out);
+    if (rc != MP_OK) { return rc; }
+  }
+  return mp_buf_putc(out, 10);
+}
+
+export fn mp_ascii_render(s: MpScene*, o: MpRenderOpts*, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (s == 0 || o == 0) { return MP_ERR_ARG; }
+  if (o->width != o->width || o->height != o->height) { return MP_ERR_ARG; }
+  if (o->width <= 0.0 || o->height <= 0.0) { return MP_ERR_ARG; }
+  if (o->width > 1e9 || o->height > 1e9) { return MP_ERR_ARG; }
+  var cols: int32 = (int32)o->width;
+  var rows: int32 = (int32)o->height;
+  if (cols <= 0 || rows <= 0) { return MP_ERR_ARG; }
+  if (cols > MP_ASCII_MAX_COLS || rows > MP_ASCII_MAX_ROWS) {
+    return MP_ERR_ARG;
+  }
+
+  var glyphs: uint8[MP_ASCII_MAX_CELLS];
+  var fgs: MpColor[MP_ASCII_MAX_CELLS];
+  var bgs: MpColor[MP_ASCII_MAX_CELLS];
+  var g: AsciiGrid;
+  g.glyphs = &glyphs[0];
+  g.fg = &fgs[0];
+  g.bg = &bgs[0];
+  g.cols = cols;
+  g.rows = rows;
+  ascii_blank(&g, o->theme.fg);
+
+  var i: int64 = 0;
+  var n: int64 = mp_scene_count(s);
+  while (i < n) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd != 0) {
+      ascii_node(&g, s, nd, o->width, o->height, o->theme.fg);
+    }
+    i = i + 1;
+  }
+
+  var plain: bool = o->pad < 0.0;
+  var row: int32 = 0;
+  while (row < rows) {
+    var rc: int32 = ascii_emit_row(&g, out, row, plain);
+    if (rc != MP_OK) { return rc; }
+    row = row + 1;
+  }
+  return MP_OK;
+}

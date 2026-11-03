@@ -1,0 +1,678 @@
+// tests/t_scene — core/buf + core/color + core/geom + core/text + core/data +
+// renderer/scene + renderer/backend.
+//
+// Pure: allocation only through malloc/new (which the compile-time interpreter
+// supports), no files, no externs. The scene-ownership check is architecture
+// §7 test 4: build text from a heap buffer, free the buffer, then read the
+// bytes back out of the scene.
+
+import "std/conv";
+import "std/mem";
+import "harness";
+import "core/buf";
+import "core/color";
+import "core/geom";
+import "core/text";
+import "core/data";
+import "renderer/scene";
+import "renderer/backend";
+
+// Injected measurer: twice the byte length, so a test can tell the seam apart
+// from the default 0.58 heuristic.
+fn scene_double_measure(ctx: rawptr, s: string, size: float64) -> float64 {
+  return (float64)s.length * size * 2.0;
+}
+
+// Second measurer: proves the opaque context pointer is actually delivered.
+fn scene_ctx_measure(ctx: rawptr, s: string, size: float64) -> float64 {
+  var k: int32* = (int32*)ctx;
+  return (float64)s.length * size * (float64)k[0];
+}
+
+fn check_buf() {
+  // A zero-length put is a no-op; a null source or buffer is an argument error.
+  var b: MpBuf* = mp_buf_new(0);
+  mp_expect("buf allocated", mp_buf_ok(b));
+  if (b == 0) { return; }
+  defer mp_buf_free(b);
+  mp_expect_i64("buf starts empty", mp_buf_len(b), (int64)0);
+  mp_expect_str("buf empty string", mp_buf_str(b), "");
+  mp_expect_i64("buf cap minimum", b->cap, (int64)64);
+
+  mp_expect_i64("buf puts rc", (int64)mp_buf_puts(b, "hi"), (int64)MP_OK);
+  mp_expect_i64("buf putc rc", (int64)mp_buf_putc(b, (int32)33),
+                (int64)MP_OK);
+  mp_expect_i64("buf put_i64 rc", (int64)mp_buf_put_i64(b, (int64)-7),
+                (int64)MP_OK);
+  mp_expect_i64("buf put_f64 rc", (int64)mp_buf_put_f64(b, 1.5, 2),
+                (int64)MP_OK);
+  mp_expect_str("buf contents", mp_buf_str(b), "hi!-71.50");
+  mp_expect_i64("buf len after puts", mp_buf_len(b), (int64)9);
+  // cap >= len + 1 always, so cstr can NUL-terminate in place.
+  mp_expect("buf cstr room", b->cap >= mp_buf_len(b) + 1);
+  var cs: cstring = mp_buf_cstr(b);
+  mp_expect_i64("buf cstr terminates", cstr_len(cs), (int64)9);
+  mp_expect_i64("buf cstr does not advance len", mp_buf_len(b), (int64)9);
+
+  var e: MpBuf* = mp_buf_new(8);
+  if (e == 0) { return; }
+  defer mp_buf_free(e);
+  mp_expect_i64("buf esc rc", (int64)mp_buf_put_esc(e, "<a&b>\"'"),
+                (int64)MP_OK);
+  mp_expect_str("buf escapes five entities", mp_buf_str(e),
+                "&lt;a&amp;b&gt;&quot;&#39;");
+  mp_expect_i64("buf put_color hex rc",
+                (int64)mp_buf_put_color(e, mp_color(255, 0, 0)),
+                (int64)MP_OK);
+  mp_expect_str("buf color appended", mp_buf_str(e),
+                "&lt;a&amp;b&gt;&quot;&#39;#ff0000");
+
+  var len_before: int64 = mp_buf_len(e);
+  mp_expect_i64("buf put zero bytes is a no-op",
+                (int64)mp_buf_put(e, 0, (int64)0), (int64)MP_OK);
+  mp_expect_i64("buf put zero bytes keeps len", mp_buf_len(e), len_before);
+  mp_expect_i64("buf put null source",
+                (int64)mp_buf_put(e, 0, (int64)2), (int64)MP_ERR_ARG);
+  mp_expect_i64("buf put into null buffer",
+                (int64)mp_buf_put(0, 0, (int64)1), (int64)MP_ERR_ARG);
+  mp_expect_i64("buf putc into null buffer",
+                (int64)mp_buf_putc(0, (int32)65), (int64)MP_ERR_ARG);
+
+  // An empty buffer still has a NUL to hand out, and it is not the data.
+  var z: MpBuf* = mp_buf_new(0);
+  mp_expect("empty buffer allocated", z != 0);
+  if (z != 0) {
+    defer mp_buf_free(z);
+    var zc: cstring = mp_buf_cstr(z);
+    mp_expect("empty buffer cstr is present", zc != 0);
+    mp_expect_i64("empty buffer cstr is empty", cstr_len(zc), (int64)0);
+  }
+
+  mp_buf_clear(e);
+  mp_expect_i64("buf clear", mp_buf_len(e), (int64)0);
+  var i: int64 = 0;
+  while (i < 1000) {
+    mp_buf_putc(e, (int32)120);
+    i = i + 1;
+  }
+  mp_expect_i64("buf grows to 1000", mp_buf_len(e), (int64)1000);
+  mp_expect("buf keeps NUL room after growth", e->cap >= 1001);
+  // Growth reallocs; the bytes written before it must be the same bytes after.
+  mp_expect("buf growth kept the first byte",
+            mp_buf_str(e).chars[0] == (uint8)120);
+  mp_expect("buf growth kept the last byte",
+            mp_buf_str(e).chars[999] == (uint8)120);
+  mp_expect_i64("buf reserve negative", (int64)mp_buf_reserve(e, (int64)-1),
+                (int64)MP_ERR_ARG);
+}
+
+fn check_color() {
+  var c: MpColor = mp_color(0x12, 0x34, 0x56);
+  mp_expect_i64("color default alpha", (int64)c.a, (int64)255);
+  mp_expect_i64("color hex", (int64)mp_color_hex(c), (int64)0x123456);
+  var back: MpColor = mp_color_from_hex((uint32)0x123456);
+  mp_expect("color hex roundtrip r", back.r == 0x12);
+  mp_expect("color hex roundtrip g", back.g == 0x34);
+  mp_expect("color hex roundtrip b", back.b == 0x56);
+  mp_expect_i64("color from hex alpha", (int64)back.a, (int64)255);
+
+  var b: uint8[48];
+  mp_expect_str("css opaque", mp_color_css(c, &b[0], 48), "#123456");
+  mp_expect_str("css zero", mp_color_css(mp_color(0, 0, 0), &b[0], 48),
+                "#000000");
+  mp_expect_str("css alpha",
+                mp_color_css(mp_color_a(1, 2, 3, 128), &b[0], 48),
+                "rgba(1,2,3,0.502)");
+  mp_expect_str("css transparent",
+                mp_color_css(mp_color_a(0, 0, 0, 0), &b[0], 48),
+                "rgba(0,0,0,0.000)");
+  mp_expect_str("css near opaque",
+                mp_color_css(mp_color_a(1, 2, 3, 254), &b[0], 48),
+                "rgba(1,2,3,0.996)");
+  mp_expect_str("css lowercase hex digits",
+                mp_color_css(mp_color((uint8)0xAB, (uint8)0xCD, (uint8)0xEF),
+                             &b[0], 48),
+                "#abcdef");
+  var cb: uint8[8];
+  mp_expect_str("css short buffer", mp_color_css(c, &cb[0], 8), "");
+
+  mp_expect_i64("palette size", (int64)mp_palette_size(), (int64)8);
+  mp_expect_i64("palette wraps", (int64)mp_color_hex(mp_palette_color(8)),
+                (int64)mp_color_hex(mp_palette_color(0)));
+  mp_expect_i64("palette wraps negative",
+                (int64)mp_color_hex(mp_palette_color(-1)),
+                (int64)mp_color_hex(mp_palette_color(7)));
+  var distinct: int32 = 1;
+  var i: int32 = 1;
+  while (i < mp_palette_size()) {
+    var j: int32 = 0;
+    while (j < i) {
+      if (mp_color_hex(mp_palette_color(i)) !=
+          mp_color_hex(mp_palette_color(j))) {
+        j = i;
+      } else {
+        distinct = 0;
+        j = i;
+      }
+    }
+    i = i + 1;
+  }
+  mp_expect("palette entries differ", distinct == 1);
+
+  var light: MpTheme = mp_theme_light();
+  var dark: MpTheme = mp_theme_dark();
+  mp_expect_str("light theme name", light.name, "light");
+  mp_expect_str("dark theme name", dark.name, "dark");
+  mp_expect_i64("light bg is white", (int64)mp_color_hex(light.bg),
+                (int64)0xffffff);
+  mp_expect_i64("dark bg", (int64)mp_color_hex(dark.bg), (int64)0x111827);
+  mp_expect("themes differ", mp_color_hex(light.fg) != mp_color_hex(dark.fg));
+}
+
+fn check_geom() {
+  var r: MpRect = mp_rect(10.0, 20.0, 100.0, 50.0);
+  var ins: MpInsets = mp_insets(5.0, 10.0, 5.0, 10.0);
+  var s: MpRect = mp_rect_shrink(r, ins);
+  mp_expect_near("shrink x", s.x, 20.0, 1e-9);
+  mp_expect_near("shrink y", s.y, 25.0, 1e-9);
+  mp_expect_near("shrink w", s.w, 80.0, 1e-9);
+  mp_expect_near("shrink h", s.h, 40.0, 1e-9);
+  mp_expect("contains inside", mp_rect_contains(r, 50.0, 30.0));
+  mp_expect("contains edge", mp_rect_contains(r, 10.0, 70.0));
+  mp_expect("rejects left", !mp_rect_contains(r, 9.0, 30.0));
+  mp_expect("rejects below", !mp_rect_contains(r, 50.0, 71.0));
+  var in5: MpRect = mp_rect_inside(r, 5.0);
+  mp_expect_near("inside x", in5.x, 15.0, 1e-9);
+  mp_expect_near("inside w", in5.w, 90.0, 1e-9);
+  mp_expect_near("inside h", in5.h, 40.0, 1e-9);
+  mp_expect_near("insets h", mp_insets_h(ins), 20.0, 1e-9);
+  mp_expect_near("insets v", mp_insets_v(ins), 10.0, 1e-9);
+  // Shrinking past the extent yields a negative size on purpose: clamping is
+  // the layout layer's job, not the primitive's (module header).
+  var over: MpRect = mp_rect_shrink(mp_rect(0.0, 0.0, 10.0, 10.0),
+                                    mp_insets(6.0, 6.0, 6.0, 6.0));
+  mp_expect_near("over-shrink keeps x", over.x, 6.0, 1e-9);
+  mp_expect_near("over-shrink goes negative", over.w, -2.0, 1e-9);
+  mp_expect_near("inside by zero keeps the rect", mp_rect_inside(r, 0.0).w,
+                 r.w, 1e-9);
+  mp_expect("contains the far corner", mp_rect_contains(r, 110.0, 70.0));
+  mp_expect("rejects just past the far corner",
+            !mp_rect_contains(r, 110.5, 70.0));
+  mp_expect_near("clamp01 low", mp_clamp01(-1.0), 0.0, 1e-9);
+  mp_expect_near("clamp01 high", mp_clamp01(2.0), 1.0, 1e-9);
+  mp_expect_near("clamp01 inside", mp_clamp01(0.25), 0.25, 1e-9);
+}
+
+fn check_text() {
+  mp_expect("no measurer by default", !mp_text_measure_active());
+  mp_expect_near("default width", mp_text_width("abcd", 10.0), 23.2, 1e-9);
+  mp_expect_near("default height", mp_text_height(12.0), 14.4, 1e-9);
+  mp_expect_near("empty width", mp_text_width("", 10.0), 0.0, 1e-9);
+  mp_text_set_measure(&scene_double_measure, 0);
+  mp_expect("measurer active", mp_text_measure_active());
+  mp_expect_near("injected width", mp_text_width("abcd", 10.0), 80.0, 1e-9);
+  mp_expect_near("injected keeps height", mp_text_height(10.0), 12.0, 1e-9);
+  var no_fn: fn(rawptr, string, float64) -> float64 = 0;
+  mp_text_set_measure(no_fn, 0);
+  mp_expect("measurer cleared", !mp_text_measure_active());
+  mp_expect_near("default restored", mp_text_width("abcd", 10.0), 23.2, 1e-9);
+
+  // The context pointer reaches the measurer (no closures, no allocation).
+  var factor: int32 = 3;
+  mp_text_set_measure(&scene_ctx_measure, (rawptr)&factor);
+  mp_expect_near("measurer receives its context",
+                 mp_text_width("ab", 10.0), 60.0, 1e-9);
+  mp_text_set_measure(no_fn, 0);
+  mp_expect("measurer cleared after the context test",
+            !mp_text_measure_active());
+  mp_expect_near("zero size measures zero", mp_text_width("abc", 0.0),
+                 0.0, 1e-9);
+}
+
+fn check_data() {
+  var s: MpSeries* = mp_series_new("alpha", 0);
+  mp_expect("series allocated", s != 0);
+  if (s == 0) { return; }
+  defer mp_series_free(s);
+  mp_expect_str("series name copied", s->name, "alpha");
+  mp_expect_i64("series default cap", s->cap, (int64)16);
+  mp_expect_i64("series empty n", s->n, (int64)0);
+  mp_expect_i64("push rc", (int64)mp_series_push(s, 1.0, 2.0), (int64)MP_OK);
+  mp_series_push(s, 3.0, 4.0);
+  mp_series_push(s, 5.0, 8.0);
+  mp_expect_i64("series n", s->n, (int64)3);
+  mp_expect_near("series xs", s->xs[1], 3.0, 1e-9);
+  mp_expect_near("series ys", s->ys[2], 8.0, 1e-9);
+  mp_expect_i64("series set rc", (int64)mp_series_set(s, 0, 9.0, 10.0),
+                (int64)MP_OK);
+  mp_expect_near("series set visible", s->ys[0], 10.0, 1e-9);
+  mp_expect_i64("series set OOB", (int64)mp_series_set(s, 3, 0.0, 0.0),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("series set negative", (int64)mp_series_set(s, -1, 0.0, 0.0),
+                (int64)MP_ERR_ARG);
+
+  var i: int64 = 0;
+  while (i < 40) {
+    mp_series_push(s, (float64)i, (float64)i);
+    i = i + 1;
+  }
+  mp_expect_i64("series grew", s->n, (int64)43);
+  mp_expect("series cap doubled", s->cap >= 43);
+
+  var e: MpExtent = mp_extent_empty();
+  mp_expect("empty extent invalid", !e.valid);
+  mp_extent_add(&e, 1.0, 2.0);
+  mp_extent_add(&e, -3.0, 7.0);
+  mp_expect("extent valid", e.valid);
+  mp_expect_near("extent min_x", e.min_x, -3.0, 1e-9);
+  mp_expect_near("extent max_x", e.max_x, 1.0, 1e-9);
+  mp_expect_near("extent min_y", e.min_y, 2.0, 1e-9);
+  mp_expect_near("extent max_y", e.max_y, 7.0, 1e-9);
+
+  var u: MpExtent = mp_extent_union(e, mp_extent_empty());
+  mp_expect_near("union with empty keeps min", u.min_x, -3.0, 1e-9);
+  var e2: MpExtent = mp_extent_empty();
+  mp_extent_add(&e2, 5.0, 5.0);
+  var u2: MpExtent = mp_extent_union(e, e2);
+  mp_expect_near("union max_x", u2.max_x, 5.0, 1e-9);
+  mp_expect_near("union max_y", u2.max_y, 7.0, 1e-9);
+
+  var p: MpExtent = mp_extent_pad(e, 0.1);
+  mp_expect_near("pad min_x", p.min_x, -3.4, 1e-9);
+  mp_expect_near("pad max_y", p.max_y, 7.5, 1e-9);
+  var flat: MpExtent = mp_extent_empty();
+  mp_extent_add(&flat, 4.0, 4.0);
+  var pf: MpExtent = mp_extent_pad(flat, 0.5);
+  mp_expect_near("pad zero span is zero", pf.max_x, 4.0, 1e-9);
+
+  // Non-finite samples are not data: one NaN must not poison the extent.
+  var sn: MpSeries* = mp_series_new("mixed", 4);
+  mp_series_push(sn, 0.0 / 0.0, 0.0 / 0.0);
+  mp_series_push(sn, 2.0, 5.0);
+  mp_series_push(sn, 3.0, 6.0);
+  mp_series_push(sn, 1.0 / 0.0, 7.0);
+  var en: MpExtent = mp_series_extent(sn);
+  mp_expect("mixed extent is valid", en.valid);
+  mp_expect_near("extent skips the NaN x", en.min_x, 2.0, 1e-9);
+  mp_expect_near("extent skips the inf x", en.max_x, 3.0, 1e-9);
+  mp_expect_near("extent min y", en.min_y, 5.0, 1e-9);
+  mp_expect_near("extent max y", en.max_y, 6.0, 1e-9);
+  mp_series_free(sn);
+  var sbad: MpSeries* = mp_series_new("allbad", 2);
+  mp_series_push(sbad, 0.0 / 0.0, 1.0);
+  mp_series_push(sbad, 2.0, 0.0 / 0.0);
+  mp_expect("all non-finite extent is invalid",
+            !mp_series_extent(sbad).valid);
+  mp_series_free(sbad);
+
+  var se: MpExtent = mp_series_extent(s);
+  mp_expect("series extent valid", se.valid);
+  mp_expect_near("series extent min_x", se.min_x, 0.0, 1e-9);
+  mp_expect_near("series extent max_x", se.max_x, 39.0, 1e-9);
+  mp_expect_near("series extent max_y", se.max_y, 39.0, 1e-9);
+
+  // mp_series_free_all over a caller-owned array of MpSeries VALUES: the
+  // shells are released here, the arrays and name copies by free_all.
+  var arr: MpSeries[2];
+  var k: int32 = 0;
+  while (k < 2) {
+    var t: MpSeries* = mp_series_new("s", 4);
+    if (t == 0) { return; }
+    mp_series_push(t, 1.0, 2.0);
+    arr[(int64)k] = t[0];
+    free(t);
+    k = k + 1;
+  }
+  mp_expect_i64("free_all source n", arr[1].n, (int64)1);
+  mp_series_free_all(&arr[0], 2);
+  mp_expect("free_all completed", true);
+
+  // cap <= 0 defaults to 16, an empty name is not allocated, and every value
+  // survives each doubling of the columns.
+  var g: MpSeries* = mp_series_new("", (int64)-5);
+  mp_expect("series with an empty name allocated", g != 0);
+  if (g != 0) {
+    defer mp_series_free(g);
+    mp_expect_i64("negative cap defaults to 16", g->cap, (int64)16);
+    mp_expect_str("empty series name", g->name, "");
+    var gi: int64 = 0;
+    while (gi < 100) {
+      mp_series_push(g, (float64)gi, (float64)gi * 2.0);
+      gi = gi + 1;
+    }
+    var kept: bool = true;
+    gi = 0;
+    while (gi < g->n) {
+      if (g->xs[gi] != (float64)gi) { kept = false; }
+      if (g->ys[gi] != (float64)gi * 2.0) { kept = false; }
+      gi = gi + 1;
+    }
+    mp_expect("growth preserves both columns", kept);
+    mp_expect("cap covers n after growth", g->cap >= g->n);
+  }
+
+  var u0: MpExtent = mp_extent_union(mp_extent_empty(), mp_extent_empty());
+  mp_expect("union of two empties is invalid", !u0.valid);
+  var none: MpSeries* = 0;
+  mp_expect("null series has an invalid extent", !mp_series_extent(none).valid);
+  mp_series_free_all(none, 0);
+}
+
+fn check_scene() {
+  var sc: MpScene* = mp_scene_new();
+  mp_expect("scene allocated", sc != 0);
+  if (sc == 0) { return; }
+  defer mp_scene_free(sc);
+  mp_expect_i64("scene starts empty", mp_scene_count(sc), (int64)0);
+  mp_expect("scene node 0 is null", mp_scene_node(sc, 0) == 0);
+
+  var r: MpRect = mp_rect(1.0, 2.0, 30.0, 40.0);
+  mp_expect_i64("rect rc",
+                (int64)mp_scene_rect(sc, r, mp_color(1, 2, 3),
+                                     mp_color_a(0, 0, 0, 0), 0.0, MP_CLS_BG),
+                (int64)MP_OK);
+  mp_expect_i64("line rc",
+                (int64)mp_scene_line(sc, 1.0, 2.0, 5.0, 9.0,
+                                     mp_color(9, 9, 9), 1.0, MP_CLS_AXIS),
+                (int64)MP_OK);
+  mp_expect_i64("circle rc",
+                (int64)mp_scene_circle(sc, 50.0, 60.0, 3.0, mp_color(4, 5, 6),
+                                       mp_color_a(0, 0, 0, 0), 0.0,
+                                       MP_CLS_SERIES + 1),
+                (int64)MP_OK);
+  var xs: float64[3];
+  var ys: float64[3];
+  xs[0] = 10.0;
+  xs[1] = 20.0;
+  xs[2] = 30.0;
+  ys[0] = 40.0;
+  ys[1] = 10.0;
+  ys[2] = 25.0;
+  mp_expect_i64("poly rc",
+                (int64)mp_scene_poly(sc, &xs[0], &ys[0], (int64)3,
+                                     mp_color(7, 7, 7), 2.0, MP_CLS_SERIES),
+                (int64)MP_OK);
+  mp_expect_i64("point count is exact (line 4 + poly 6)", sc->npts,
+                (int64)10);
+  mp_expect_i64("text rc",
+                (int64)mp_scene_text(sc, 5.0, 6.0, "hello", 12.0,
+                                     mp_color(0, 0, 0), MP_ALIGN_CENTER,
+                                     MP_CLS_TICK),
+                (int64)MP_OK);
+  mp_expect_i64("scene count", mp_scene_count(sc), (int64)5);
+  mp_expect("scene node OOB null", mp_scene_node(sc, 5) == 0);
+  mp_expect("scene node negative null", mp_scene_node(sc, -1) == 0);
+
+  var nd: MpNode* = mp_scene_node(sc, 0);
+  mp_expect_i64("rect kind", (int64)nd->kind, (int64)MP_NODE_RECT);
+  mp_expect_i64("rect cls", (int64)nd->cls, (int64)MP_CLS_BG);
+  mp_expect_near("rect x", nd->x, 1.0, 1e-9);
+  mp_expect_near("rect h", nd->h, 40.0, 1e-9);
+  mp_expect_i64("rect fill r", (int64)nd->fill.r, (int64)1);
+  mp_expect_near("rect default opacity", nd->opacity, 1.0, 1e-9);
+  mp_expect_str("rect has no text", mp_scene_node_text(sc, nd), "");
+  mp_expect("rect has no pts", mp_scene_node_pts(sc, nd) == 0);
+
+  var ln: MpNode* = mp_scene_node(sc, 1);
+  mp_expect_i64("line kind", (int64)ln->kind, (int64)MP_NODE_LINE);
+  mp_expect_i64("line stores 4 floats", (int64)ln->pts_len, (int64)4);
+  var lp: float64* = mp_scene_node_pts(sc, ln);
+  mp_expect("line pts present", lp != 0);
+  if (lp != 0) {
+    mp_expect_near("line pts x0", lp[0], 1.0, 1e-9);
+    mp_expect_near("line pts y0", lp[1], 2.0, 1e-9);
+    mp_expect_near("line pts x1", lp[2], 5.0, 1e-9);
+    mp_expect_near("line pts y1", lp[3], 9.0, 1e-9);
+  }
+  mp_expect_near("line bbox x", ln->x, 1.0, 1e-9);
+  mp_expect_near("line bbox w", ln->w, 4.0, 1e-9);
+  mp_expect_near("line bbox h", ln->h, 7.0, 1e-9);
+
+  var ci: MpNode* = mp_scene_node(sc, 2);
+  mp_expect_i64("circle kind", (int64)ci->kind, (int64)MP_NODE_CIRCLE);
+  mp_expect_near("circle centre x", ci->x, 50.0, 1e-9);
+  mp_expect_near("circle radius", ci->r, 3.0, 1e-9);
+  mp_expect_i64("series cls encodes index", (int64)ci->cls,
+                (int64)MP_CLS_SERIES + 1);
+
+  var pl: MpNode* = mp_scene_node(sc, 3);
+  mp_expect_i64("poly kind", (int64)pl->kind, (int64)MP_NODE_POLY);
+  mp_expect_i64("poly pts_len", (int64)pl->pts_len, (int64)6);
+  var pp: float64* = mp_scene_node_pts(sc, pl);
+  if (pp != 0) {
+    mp_expect_near("poly interleaved", pp[5], 25.0, 1e-9);
+  }
+  mp_expect_near("poly bbox x", pl->x, 10.0, 1e-9);
+  mp_expect_near("poly bbox w", pl->w, 20.0, 1e-9);
+  mp_expect_near("poly bbox h", pl->h, 30.0, 1e-9);
+
+  var tx: MpNode* = mp_scene_node(sc, 4);
+  mp_expect_i64("text kind", (int64)tx->kind, (int64)MP_NODE_TEXT);
+  mp_expect_str("text bytes", mp_scene_node_text(sc, tx), "hello");
+  mp_expect_i64("text len", (int64)tx->text_len, (int64)5);
+  mp_expect_i64("text align", (int64)tx->align, (int64)MP_ALIGN_CENTER);
+  mp_expect_near("text measured w", tx->w, mp_text_width("hello", 12.0),
+                 1e-9);
+  mp_expect_near("text measured h", tx->h, 14.4, 1e-9);
+  mp_expect_near("text y is the top", tx->y, 6.0, 1e-9);
+
+  // A second text node must not disturb the first: offsets/indexes only.
+  mp_scene_text(sc, 0.0, 0.0, "wo", 10.0, mp_color(0, 0, 0), MP_ALIGN_START,
+                MP_CLS_LABEL);
+  mp_expect_str("first text survives", mp_scene_node_text(sc, tx), "hello");
+  mp_expect_str("second text",
+                mp_scene_node_text(sc, mp_scene_node(sc, 5)), "wo");
+  mp_expect_i64("second text offset", (int64)mp_scene_node(sc, 5)->text_off,
+                (int64)5);
+
+  // Scene owns its text: free the caller's bytes, read the node back.
+  var raw: uint8* = (uint8*)malloc(16);
+  mp_expect("text scratch allocated", raw != 0);
+  if (raw != 0) {
+    raw[0] = 111;
+    raw[1] = 119;
+    raw[2] = 110;
+    raw[3] = 101;
+    raw[4] = 100;
+    var tmp: string = str_from_bytes((cstring)raw, (int64)5);
+    mp_scene_text(sc, 1.0, 1.0, tmp, 10.0, mp_color(0, 0, 0), MP_ALIGN_END,
+                  MP_CLS_TITLE);
+    free(raw);
+    mp_expect_str("scene owns copied text",
+                  mp_scene_node_text(sc, mp_scene_node(sc, 6)), "owned");
+  }
+
+  mp_expect_i64("poly rejects negative n",
+                (int64)mp_scene_poly(sc, &xs[0], &ys[0], (int64)-1,
+                                     mp_color(0, 0, 0), 1.0, MP_CLS_GRID),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("poly accepts zero n",
+                (int64)mp_scene_poly(sc, &xs[0], &ys[0], (int64)0,
+                                     mp_color(0, 0, 0), 1.0, MP_CLS_GRID),
+                (int64)MP_OK);
+  mp_expect_i64("failed add did not change count", mp_scene_count(sc),
+                (int64)8);
+  mp_expect_i64("failed add did not change points", sc->npts, (int64)10);
+
+  // Every add validates its arguments before it reserves or writes anything, so
+  // a rejected call leaves the scene exactly as it was. The allocation-failure
+  // half of the same rule has no injection seam; it is reviewed (both reserves
+  // run before any byte, count or point is written).
+  var nullcol: float64* = 0;
+  mp_expect_i64("poly rejects null columns",
+                (int64)mp_scene_poly(sc, &xs[0], nullcol, (int64)3,
+                                     mp_color(0, 0, 0), 1.0, MP_CLS_GRID),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("rect rejects a null scene",
+                (int64)mp_scene_rect(0, r, mp_color(0, 0, 0),
+                                     mp_color_a(0, 0, 0, 0), 0.0, MP_CLS_BG),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("line rejects a null scene",
+                (int64)mp_scene_line(0, 0.0, 0.0, 1.0, 1.0, mp_color(0, 0, 0),
+                                     1.0, MP_CLS_AXIS),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("text rejects a null scene",
+                (int64)mp_scene_text(0, 0.0, 0.0, "x", 10.0,
+                                     mp_color(0, 0, 0), MP_ALIGN_START,
+                                     MP_CLS_LABEL),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("count of a null scene", mp_scene_count(0), (int64)0);
+  mp_expect("node of a null scene", mp_scene_node(0, 0) == 0);
+  mp_expect_str("text of a null scene", mp_scene_node_text(0, 0), "");
+  mp_expect("points of a null scene", mp_scene_node_pts(0, 0) == 0);
+  mp_expect_i64("still eight nodes", mp_scene_count(sc), (int64)8);
+
+  mp_scene_clear(sc);
+  mp_expect_i64("scene clear", mp_scene_count(sc), (int64)0);
+  mp_expect_i64("scene clear text", mp_buf_len(sc->text), (int64)0);
+  mp_expect_i64("scene clear pts", sc->npts, (int64)0);
+  mp_expect_i64("rect after clear",
+                (int64)mp_scene_rect(sc, r, mp_color(0, 0, 0),
+                                     mp_color_a(0, 0, 0, 0), 0.0, MP_CLS_PLOT),
+                (int64)MP_OK);
+  mp_expect_i64("scene reusable", mp_scene_count(sc), (int64)1);
+
+  var o: MpRenderOpts = mp_render_opts(640.0, 400.0, mp_theme_light());
+  mp_expect_near("opts width", o.width, 640.0, 1e-9);
+  mp_expect_near("opts height", o.height, 400.0, 1e-9);
+  mp_expect_near("opts default pad", o.pad, 8.0, 1e-9);
+  mp_expect("opts default aria", o.aria);
+  mp_expect_str("opts theme carried", o.theme.name, "light");
+}
+
+// Growth is the failure mode the seam calls out ("every add returns
+// MP_ERR_ALLOC and leaves the scene consistent"). The allocator will not fail
+// on demand here, so this asserts the other half: every realloc of the node,
+// point and text arrays is transparent — counts are exact, offsets stay put,
+// and data written before a growth still reads back after it.
+fn check_scene_growth() {
+  var sc: MpScene* = mp_scene_new();
+  mp_expect("growth scene allocated", sc != 0);
+  if (sc == 0) { return; }
+  defer mp_scene_free(sc);
+
+  // Node 0 is a line whose point range must survive every later realloc.
+  mp_scene_line(sc, 1.0, 2.0, 3.0, 4.0, mp_color(9, 9, 9), 1.0, MP_CLS_AXIS);
+
+  // 300 rects: the 16-node array has to grow more than once.
+  var i: int64 = 0;
+  var add_ok: bool = true;
+  while (i < 300) {
+    var r: MpRect = mp_rect((float64)i, 1.0, 1.0, 1.0);
+    if (mp_scene_rect(sc, r, mp_color(1, 1, 1), mp_color_a(0, 0, 0, 0), 0.0,
+                      MP_CLS_PLOT) != MP_OK) {
+      add_ok = false;
+      i = 300;
+    } else {
+      i = i + 1;
+    }
+  }
+  mp_expect("scene grew without a failure", add_ok);
+  mp_expect_i64("node count after growth", mp_scene_count(sc), (int64)301);
+
+  var n0: MpNode* = mp_scene_node(sc, 0);
+  var last: MpNode* = mp_scene_node(sc, 300);
+  mp_expect_i64("node 0 kind survives growth", (int64)n0->kind,
+                (int64)MP_NODE_LINE);
+  mp_expect_i64("last node cls", (int64)last->cls, (int64)MP_CLS_PLOT);
+  mp_expect_near("last node x", last->x, 299.0, 1e-9);
+  var lp: float64* = mp_scene_node_pts(sc, mp_scene_node(sc, 0));
+  var line_ok: bool = false;
+  if (lp != 0) {
+    line_ok = lp[0] == 1.0 && lp[1] == 2.0 && lp[2] == 3.0 && lp[3] == 4.0;
+  }
+  mp_expect("line points survive the node growth", line_ok);
+
+  // A 100-point polyline grows the point array from 32 floats to 204.
+  var xs: float64[100];
+  var ys: float64[100];
+  var j: int64 = 0;
+  while (j < 100) {
+    xs[j] = (float64)j;
+    ys[j] = 100.0 + (float64)j;
+    j = j + 1;
+  }
+  mp_expect_i64("poly into a grown scene",
+                (int64)mp_scene_poly(sc, &xs[0], &ys[0], (int64)100,
+                                     mp_color(2, 2, 2), 1.0, MP_CLS_SERIES),
+                (int64)MP_OK);
+  mp_expect_i64("point count after the poly (4 + 200)", sc->npts, (int64)204);
+  var pn: MpNode* = mp_scene_node(sc, 301);
+  mp_expect_i64("poly pts_len", (int64)pn->pts_len, (int64)200);
+  var pp: float64* = mp_scene_node_pts(sc, pn);
+  var poly_ok: bool = false;
+  if (pp != 0) {
+    poly_ok = pp[0] == 0.0 && pp[1] == 100.0 &&
+              pp[198] == 99.0 && pp[199] == 199.0;
+  }
+  mp_expect("poly points survive the point growth", poly_ok);
+  var lp2: float64* = mp_scene_node_pts(sc, mp_scene_node(sc, 0));
+  mp_expect("line still addresses its offset after the point growth",
+            lp2 != 0 && lp2[0] == 1.0 && lp2[3] == 4.0);
+
+  // Text growth: 64 labels of 40 bytes; offsets are cumulative byte counts.
+  var label: string = "0123456789012345678901234567890123456789";
+  j = 0;
+  while (j < 64) {
+    mp_scene_text(sc, 0.0, 0.0, label, 10.0, mp_color(0, 0, 0),
+                  MP_ALIGN_START, MP_CLS_LABEL);
+    j = j + 1;
+  }
+  mp_expect_i64("scene text length after 64 labels", mp_buf_len(sc->text),
+                (int64)2560);
+  var t0: MpNode* = mp_scene_node(sc, 302);
+  var t63: MpNode* = mp_scene_node(sc, 365);
+  mp_expect_i64("first text offset", (int64)t0->text_off, (int64)0);
+  mp_expect_i64("last text offset", (int64)t63->text_off, (int64)2520);
+  mp_expect_str("first text reads back", mp_scene_node_text(sc, t0), label);
+  mp_expect_str("last text reads back", mp_scene_node_text(sc, t63), label);
+
+  // An empty label still makes a node, without appending bytes.
+  mp_expect_i64("empty label rc",
+                (int64)mp_scene_text(sc, 0.0, 0.0, "", 10.0,
+                                     mp_color(0, 0, 0), MP_ALIGN_START,
+                                     MP_CLS_LABEL),
+                (int64)MP_OK);
+  var tn: MpNode* = mp_scene_node(sc, 366);
+  mp_expect_i64("empty text len", (int64)tn->text_len, (int64)0);
+  mp_expect_str("empty text reads back empty", mp_scene_node_text(sc, tn), "");
+  mp_expect("text node has no points", mp_scene_node_pts(sc, tn) == 0);
+  mp_expect_i64("empty label appends no bytes", mp_buf_len(sc->text),
+                (int64)2560);
+  mp_expect_i64("node count is exact", mp_scene_count(sc), (int64)367);
+
+  // A reused (cleared) scene keeps its grown arrays and is still exact.
+  mp_scene_clear(sc);
+  mp_expect_i64("clear keeps no nodes", mp_scene_count(sc), (int64)0);
+  mp_expect_i64("clear keeps no points", sc->npts, (int64)0);
+  mp_expect_i64("clear keeps no text", mp_buf_len(sc->text), (int64)0);
+  mp_expect_i64("scene reusable after growth",
+                (int64)mp_scene_rect(sc, mp_rect(0.0, 0.0, 1.0, 1.0),
+                                     mp_color(0, 0, 0),
+                                     mp_color_a(0, 0, 0, 0), 0.0,
+                                     MP_CLS_BG),
+                (int64)MP_OK);
+}
+
+export fn main() -> int32 {
+  check_buf();
+  check_color();
+  check_geom();
+  check_text();
+  check_data();
+  check_scene();
+  check_scene_growth();
+  return mp_summary();
+}
+
+@test fn t_scene() -> int32 {
+  check_buf();
+  check_color();
+  check_geom();
+  check_text();
+  check_data();
+  check_scene();
+  check_scene_growth();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

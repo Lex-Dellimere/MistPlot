@@ -1,0 +1,374 @@
+// backends/web/svg — turns a scene IR into one deterministic SVG document.
+//
+// Dependencies (docs/02-seams.md §5): renderer/scene, renderer/backend and
+// core/{buf,color,format} only — no float classification from std/math is
+// needed because a NaN is its own witness (`v != v`) and the only other
+// rejection is an absolute-magnitude clamp. Nothing chart-shaped is imported:
+// the backend walks the display list and does no arithmetic beyond the text
+// baseline shift.
+//
+// Ownership: mp_svg_render clears `out` and writes only into it; the only
+// allocation is `out`'s growth. A growth failure returns MP_ERR_ALLOC with a
+// partial document left in `out` (documented by §5, not a bug).
+//
+// Determinism: the bytes are a pure function of the scene and the two viewport
+// numbers — no ids, no timestamps, no random values, no allocation addresses,
+// no `system()`-derived anything. Two renders of one scene are byte-identical,
+// which is what the golden file and the debug/release diff depend on.
+//
+// Serialization policy (docs/03-phase1.md §7):
+//   * exactly one root at depth 0, every node on its own line at depth 1
+//     (two spaces of indent), trailing newline, no XML declaration;
+//   * attribute order is fixed and global: geometry (x y width height, or
+//     cx cy r, or x1 y1 x2 y2, or points, or x y), paint (fill stroke
+//     stroke-width), then opacity, then text metrics (font-family font-size
+//     text-anchor), then class;
+//   * numbers: at most 3 decimals with trailing zeros and a trailing dot
+//     stripped, `-0` -> `0`, NaN/±inf -> `0`, and |v| >= 1e15 -> `0` so the
+//     formatter's scientific fallback can never leak `e+` into the markup;
+//   * colors: `#rrggbb` when a == 255, otherwise `rgba(r,g,b,a/255)` with the
+//     alpha written at exactly three decimals (the form §7 fixes for this
+//     backend; core/color keeps the literal 0..255 spelling for its callers);
+//   * `stroke` is omitted when `stroke_w <= 0`, `fill` when `fill.a == 0`,
+//     `opacity` when it is exactly 1.0;
+//   * text is escaped (& < > " '), carries font-family="system-ui, sans-serif",
+//     font-size and text-anchor, and its y is node.y + size*0.8 because
+//     renderer/scene stores the TOP of the text box, not the baseline;
+//   * class is `mp-c-<name>` for the eight base classes and
+//     `mp-c-series mp-s-<cls - MP_CLS_SERIES>` for cls >= MP_CLS_SERIES; a cls
+//     outside both sets (the chart layer never emits one) becomes `mp-c-<n>`
+//     so nothing is silently renamed;
+//   * o->theme and o->pad are not consumed: colors are already baked into the
+//     nodes by chart/resolve, and padding is a layout concept. o->aria is not
+//     consumed either, because Phase 1 forbids ids (no aria-labelledby is
+//     possible); the root always carries role="img".
+
+import "core/buf";
+import "core/color";
+import "core/format";
+import "renderer/backend";
+import "renderer/scene";
+
+// Anything at or beyond 1e15 would make mp_fmt_fixed fall back to `%g`-style
+// scientific text, so it is serialized as 0 instead (`e+` is banned here).
+const MP_SVG_MAX_ABS: float64 = 1e15;
+
+// The scene's TEXT y is the top of the box; Phase 1 puts the baseline at 0.8
+// of the em box (§5 leaves the choice to the backend and asks for it here).
+const MP_SVG_BASELINE: float64 = 0.8;
+
+// Strips trailing zeros in the fraction, then a trailing dot. mp_fmt_fixed
+// always emits the dot for decimals > 0, so this only ever shrinks.
+fn svg_trim(out: uint8*, n: int64) -> int64 {
+  if (n <= 0) { return 0; }
+  var dot: int64 = -1;
+  var i: int64 = 0;
+  while (i < n) {
+    if (out[i] == 46) { dot = i; }
+    i = i + 1;
+  }
+  if (dot < 0) { return n; }
+  var m: int64 = n;
+  while (m > dot + 1 && out[m - 1] == 48) { m = m - 1; }
+  if (m == dot + 1) { m = dot; }
+  return m;
+}
+
+// A number is only serialized when it is finite and inside the fixed-notation
+// window; everything else becomes `0` (determinism over honesty, §5).
+fn svg_num_finite(v: float64) -> bool {
+  if (v != v) { return false; }
+  if (v >= MP_SVG_MAX_ABS) { return false; }
+  if (v <= 0.0 - MP_SVG_MAX_ABS) { return false; }
+  return true;
+}
+
+fn svg_put_num(b: MpBuf*, v: float64) -> int32 {
+  if (!svg_num_finite(v)) { return mp_buf_puts(b, "0"); }
+  var tmp: uint8[64];
+  var s: string = mp_fmt_fixed(v, 3, &tmp[0], 64);
+  var n: int64 = svg_trim(&tmp[0], (int64)s.length);
+  if (n <= 0) { return mp_buf_puts(b, "0"); }
+  return mp_buf_put(b, &tmp[0], n);
+}
+
+// ` name="`, leaving the closing quote to the caller's value writer.
+fn svg_attr_open(b: MpBuf*, name: string) -> int32 {
+  var rc: int32 = mp_buf_putc(b, 32);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(b, name);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_puts(b, "=\"");
+}
+
+fn svg_num_attr(b: MpBuf*, name: string, v: float64) -> int32 {
+  var rc: int32 = svg_attr_open(b, name);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_num(b, v);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_putc(b, 34);
+}
+
+fn svg_str_attr(b: MpBuf*, name: string, v: string) -> int32 {
+  var rc: int32 = svg_attr_open(b, name);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_esc(b, v);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_putc(b, 34);
+}
+
+// `#rrggbb` at full alpha, else `rgba(r,g,b,a/255)` with three alpha decimals.
+fn svg_put_color(b: MpBuf*, c: MpColor) -> int32 {
+  if (c.a == 255) {
+    var tmp: uint8[48];
+    var s: string = mp_color_css(c, &tmp[0], 48);
+    if (s.length == 0) { return MP_ERR_STATE; }
+    return mp_buf_put(b, s.chars, (int64)s.length);
+  }
+  var rc: int32 = mp_buf_puts(b, "rgba(");
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_i64(b, (int64)c.r);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(b, ",");
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_i64(b, (int64)c.g);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(b, ",");
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_i64(b, (int64)c.b);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(b, ",");
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_f64(b, (float64)c.a / 255.0, 3);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_putc(b, 41);
+}
+
+// One `class` attribute. The eight base classes are named; cls >= SERIES is
+// the palette encoding; anything else (never emitted by chart/resolve) keeps
+// its number so nothing is silently renamed. Written as one switch instead of
+// a name-returning helper: a borrowed string from a helper put a string free
+// into the call graph and made `mettle test` skip the whole file.
+fn svg_put_class(b: MpBuf*, cls: int32) -> int32 {
+  var rc: int32 = svg_attr_open(b, "class");
+  if (rc != MP_OK) { return rc; }
+  if (cls >= MP_CLS_SERIES) {
+    rc = mp_buf_puts(b, "mp-c-series mp-s-");
+    if (rc != MP_OK) { return rc; }
+    rc = mp_buf_put_i64(b, (int64)(cls - MP_CLS_SERIES));
+  } else {
+    switch (cls) {
+      case MP_CLS_BG: { rc = mp_buf_puts(b, "mp-c-bg"); }
+      case MP_CLS_PLOT: { rc = mp_buf_puts(b, "mp-c-plot"); }
+      case MP_CLS_GRID: { rc = mp_buf_puts(b, "mp-c-grid"); }
+      case MP_CLS_AXIS: { rc = mp_buf_puts(b, "mp-c-axis"); }
+      case MP_CLS_TICK: { rc = mp_buf_puts(b, "mp-c-tick"); }
+      case MP_CLS_LABEL: { rc = mp_buf_puts(b, "mp-c-label"); }
+      case MP_CLS_TITLE: { rc = mp_buf_puts(b, "mp-c-title"); }
+      case MP_CLS_LEGEND: { rc = mp_buf_puts(b, "mp-c-legend"); }
+      default: {
+        rc = mp_buf_puts(b, "mp-c-");
+        if (rc == MP_OK) { rc = mp_buf_put_i64(b, (int64)cls); }
+      }
+    }
+  }
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_putc(b, 34);
+}
+
+fn svg_anchor(align: int32) -> string {
+  switch (align) {
+    case MP_ALIGN_CENTER: { return "middle"; }
+    case MP_ALIGN_END: { return "end"; }
+    default: { return "start"; }
+  }
+}
+
+// fill, stroke, stroke-width, opacity — in that fixed order.
+fn svg_put_paint(b: MpBuf*, nd: MpNode*) -> int32 {
+  var rc: int32 = MP_OK;
+  if (nd->fill.a != 0) {
+    rc = svg_attr_open(b, "fill");
+    if (rc != MP_OK) { return rc; }
+    rc = svg_put_color(b, nd->fill);
+    if (rc != MP_OK) { return rc; }
+    rc = mp_buf_putc(b, 34);
+    if (rc != MP_OK) { return rc; }
+  }
+  if (nd->stroke_w > 0.0) {
+    rc = svg_attr_open(b, "stroke");
+    if (rc != MP_OK) { return rc; }
+    rc = svg_put_color(b, nd->stroke);
+    if (rc != MP_OK) { return rc; }
+    rc = mp_buf_putc(b, 34);
+    if (rc != MP_OK) { return rc; }
+    rc = svg_num_attr(b, "stroke-width", nd->stroke_w);
+    if (rc != MP_OK) { return rc; }
+  }
+  if (nd->opacity != 1.0) {
+    rc = svg_num_attr(b, "opacity", nd->opacity);
+    if (rc != MP_OK) { return rc; }
+  }
+  return MP_OK;
+}
+
+fn svg_emit_rect(b: MpBuf*, nd: MpNode*) -> int32 {
+  var rc: int32 = mp_buf_puts(b, "  <rect");
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "x", nd->x);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "y", nd->y);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "width", nd->w);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "height", nd->h);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_paint(b, nd);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_class(b, nd->cls);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_puts(b, " />\n");
+}
+
+fn svg_emit_line(s: MpScene*, b: MpBuf*, nd: MpNode*) -> int32 {
+  var p: float64* = mp_scene_node_pts(s, nd);
+  if (p == 0 || nd->pts_len < 4) { return MP_OK; }
+  var rc: int32 = mp_buf_puts(b, "  <line");
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "x1", p[0]);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "y1", p[1]);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "x2", p[2]);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "y2", p[3]);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_paint(b, nd);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_class(b, nd->cls);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_puts(b, " />\n");
+}
+
+fn svg_emit_circle(b: MpBuf*, nd: MpNode*) -> int32 {
+  var rc: int32 = mp_buf_puts(b, "  <circle");
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "cx", nd->x);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "cy", nd->y);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "r", nd->r);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_paint(b, nd);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_class(b, nd->cls);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_puts(b, " />\n");
+}
+
+fn svg_put_points(b: MpBuf*, p: float64*, npts: int64) -> int32 {
+  var rc: int32 = svg_attr_open(b, "points");
+  if (rc != MP_OK) { return rc; }
+  var i: int64 = 0;
+  while (i + 1 < npts) {
+    if (i > 0) {
+      rc = mp_buf_putc(b, 32);
+      if (rc != MP_OK) { return rc; }
+    }
+    rc = svg_put_num(b, p[i]);
+    if (rc != MP_OK) { return rc; }
+    rc = mp_buf_putc(b, 44);
+    if (rc != MP_OK) { return rc; }
+    rc = svg_put_num(b, p[i + 1]);
+    if (rc != MP_OK) { return rc; }
+    i = i + 2;
+  }
+  return mp_buf_putc(b, 34);
+}
+
+fn svg_emit_poly(s: MpScene*, b: MpBuf*, nd: MpNode*) -> int32 {
+  var p: float64* = mp_scene_node_pts(s, nd);
+  if (p == 0 || nd->pts_len < 2) { return MP_OK; }
+  var rc: int32 = mp_buf_puts(b, "  <polyline");
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_points(b, p, (int64)nd->pts_len);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_paint(b, nd);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_class(b, nd->cls);
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_puts(b, " />\n");
+}
+
+fn svg_emit_text(s: MpScene*, b: MpBuf*, nd: MpNode*) -> int32 {
+  var rc: int32 = mp_buf_puts(b, "  <text");
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "x", nd->x);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "y", nd->y + nd->size * MP_SVG_BASELINE);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_paint(b, nd);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_str_attr(b, "font-family", "system-ui, sans-serif");
+  if (rc != MP_OK) { return rc; }
+  rc = svg_num_attr(b, "font-size", nd->size);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_str_attr(b, "text-anchor", svg_anchor(nd->align));
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_class(b, nd->cls);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_putc(b, 62);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_esc(b, mp_scene_node_text(s, nd));
+  if (rc != MP_OK) { return rc; }
+  return mp_buf_puts(b, "</text>\n");
+}
+
+// Unknown node kinds are skipped rather than fatal: a backend that fails on a
+// future primitive would break an unrelated golden.
+fn svg_emit_node(s: MpScene*, b: MpBuf*, nd: MpNode*) -> int32 {
+  switch (nd->kind) {
+    case MP_NODE_RECT: { return svg_emit_rect(b, nd); }
+    case MP_NODE_LINE: { return svg_emit_line(s, b, nd); }
+    case MP_NODE_CIRCLE: { return svg_emit_circle(b, nd); }
+    case MP_NODE_TEXT: { return svg_emit_text(s, b, nd); }
+    case MP_NODE_POLY: { return svg_emit_poly(s, b, nd); }
+    default: { return MP_OK; }
+  }
+}
+
+export fn mp_svg_render(s: MpScene*, o: MpRenderOpts*, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (s == 0 || o == 0) { return MP_ERR_ARG; }
+  var rc: int32 = mp_buf_puts(out,
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 ");
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_num(out, o->width);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_putc(out, 32);
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_num(out, o->height);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(out, "\" width=\"");
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_num(out, o->width);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(out, "\" height=\"");
+  if (rc != MP_OK) { return rc; }
+  rc = svg_put_num(out, o->height);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(out, "\" role=\"img\">\n");
+  if (rc != MP_OK) { return rc; }
+  var i: int64 = 0;
+  var n: int64 = mp_scene_count(s);
+  while (i < n) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd != 0) {
+      rc = svg_emit_node(s, out, nd);
+      if (rc != MP_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  return mp_buf_puts(out, "</svg>\n");
+}

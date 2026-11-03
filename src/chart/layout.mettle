@@ -1,0 +1,244 @@
+// chart/layout — the frame rectangles of one chart, with margins derived from
+// measured text (docs/02-seams.md §4, docs/03-phase1.md §5).
+//
+// Dependencies: core/{geom,text,scale,data} + chart/spec. No scene, no backend,
+// no allocation: layout only measures strings it is handed.
+//
+// Auto margins, with th = mp_text_height(12) = 14.4:
+//   top    = 1.6*th (title) + 1.25*th (subtitle) + 8
+//   left   = max(widest y tick label, y_label) + 10
+//   right  = legend_w + 12 when the legend is on the right, else 8
+//   bottom = th + 10 + (x title ? 1.4*th + 4 : 0) +
+//            (bottom legend ? 18 + 4 : 0)
+// plus one text guard of its own: the first (and last) x tick label is centred
+// on the plot edge, so each side needs half its measured width, and left/right
+// grow to half the outermost label + 2 when that is wider.
+// The seam spells bottom as "text height + 10" and the guide adds the axis
+// title band; both are honoured by making the axis-title band additive, so the
+// x tick labels *and* the x title fit inside the frame and nothing has to be
+// drawn outside the canvas.
+//
+// legend_w = widest series name + 24 (swatch 12 + gap 4 + right pad 8).
+//
+// Clamp rule: when left+right > width-2 (or top+bottom > height-2) both members
+// of the pair are scaled down by the same factor, so the plot keeps a positive
+// extent and still sits inside the canvas: plot.w = 2 for a canvas whose labels
+// would eat it. plot.w/plot.h are floored at 1 for degenerate canvases.
+
+import "std/math";
+import "core/geom";
+import "core/text";
+import "core/scale";
+import "core/data";
+import "chart/spec";
+
+export struct MpFrame { plot: MpRect; title: MpRect; legend: MpRect;
+                        x_label: MpRect; y_label: MpRect; }
+
+// Exported because axis.mettle needs them for label placement; the rest of the
+// layout policy is private to this module.
+export const MP_LAYOUT_TICK_GAP: float64 = 6.0;  // tick label -> plot edge
+export const MP_LAYOUT_TICK_PAD: float64 = 4.0;  // plot edge -> tick label top
+
+const MP_LAYOUT_GAP: float64 = 10.0;       // seam: left / bottom pad
+const MP_LAYOUT_RIGHT: float64 = 8.0;      // no right legend
+const MP_LAYOUT_TOP: float64 = 8.0;        // above the plot, below the title
+const MP_LAYOUT_MARGIN_MIN: float64 = 2.0; // canvas minus the clamp
+
+export fn mp_layout_text_h() -> float64 {
+  return mp_text_height(MP_CHART_TEXT_SIZE);
+}
+
+export fn mp_layout_title_h(spec: MpChartSpec*) -> float64 {
+  if (spec == 0) { return 0.0; }
+  if ((int64)spec->title.length == 0) { return 0.0; }
+  return mp_layout_text_h() * 1.6;
+}
+
+export fn mp_layout_subtitle_h(spec: MpChartSpec*) -> float64 {
+  if (spec == 0) { return 0.0; }
+  if ((int64)spec->subtitle.length == 0) { return 0.0; }
+  return mp_layout_text_h() * 1.25;
+}
+
+// Measured width of one tick label (0 when the index is out of range).
+fn layout_label_at(v: float64*, i: int32, n: int32, fmt: int32) -> float64 {
+  if (v == 0 || i < 0 || i >= n) { return 0.0; }
+  var b: uint8[64];
+  var s: string = mp_chart_fmt_value(v[(int64)i], fmt, &b[0], 64);
+  return mp_text_width(s, MP_CHART_TEXT_SIZE);
+}
+
+// Widest label in a tick-value array, measured in the label font.
+fn layout_label_w(v: float64*, n: int32, fmt: int32) -> float64 {
+  var widest: float64 = 0.0;
+  if (v == 0) { return 0.0; }
+  var i: int32 = 0;
+  while (i < n) {
+    var w: float64 = layout_label_at(v, i, n, fmt);
+    if (w > widest) { widest = w; }
+    i = i + 1;
+  }
+  return widest;
+}
+
+// Right-legend column width; 0 when there is no right legend or no series. A
+// series without a name still shows its swatch, so the width floor is 24.
+export fn mp_layout_legend_w(spec: MpChartSpec*) -> float64 {
+  if (spec == 0) { return 0.0; }
+  if (spec->legend != MP_LEGEND_RIGHT) { return 0.0; }
+  if (spec->series == 0) { return 0.0; }
+  if (spec->n_series <= 0) { return 0.0; }
+  var widest: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < spec->n_series) {
+    var nm: string = spec->series[(int64)i].name;
+    var w: float64 = mp_text_width(nm, MP_CHART_TEXT_SIZE);
+    if (w > widest) { widest = w; }
+    i = i + 1;
+  }
+  return widest + MP_CHART_LEGEND_PAD;
+}
+
+// Shrinks one margin pair proportionally so `*a + *b <= avail`, never negative.
+fn layout_clamp_pair(avail: float64, a: float64*, b: float64*) {
+  if (is_finite(*a) == 0 || *a < 0.0) { *a = 0.0; }
+  if (is_finite(*b) == 0 || *b < 0.0) { *b = 0.0; }
+  var t: float64 = avail;
+  if (t < 0.0) { t = 0.0; }
+  var sum: float64 = *a + *b;
+  if (sum > t && sum > 0.0) {
+    var f: float64 = t / sum;
+    *a = *a * f;
+    *b = *b * f;
+  }
+}
+
+// Height of the band below the plot that holds the x tick labels, the x title
+// and (optionally) a bottom legend. Shared with axis/resolve through the frame.
+fn layout_bottom(spec: MpChartSpec*, th: float64) -> float64 {
+  var b: float64 = th + MP_LAYOUT_GAP;
+  if ((int64)spec->x_label.length > 0) { b = b + th * 1.4 + 4.0; }
+  if (spec->legend == MP_LEGEND_BOTTOM) { b = b + MP_CHART_LEGEND_ROW + 4.0; }
+  return b;
+}
+
+// Y position of the first band below the plot that is *not* the tick labels
+// (the x title band starts here), then the legend band after that.
+fn layout_below_ticks(spec: MpChartSpec*, plot_bottom: float64,
+                      th: float64) -> float64 {
+  var y: float64 = plot_bottom + MP_LAYOUT_TICK_PAD + th;
+  if ((int64)spec->x_label.length > 0) { y = y + 4.0 + th * 1.4; }
+  return y;
+}
+
+export fn mp_layout_compute(spec: MpChartSpec*, xv: float64*, nx: int32,
+                            yv: float64*, ny: int32, xs: MpScale,
+                            ys: MpScale, out: MpFrame*) -> int32 {
+  if (spec == 0 || out == 0) { return MP_ERR_ARG; }
+  if (nx > 0 && xv == 0) { return MP_ERR_ARG; }
+  if (ny > 0 && yv == 0) { return MP_ERR_ARG; }
+  var w: float64 = spec->width;
+  var h: float64 = spec->height;
+  if (is_finite(w) == 0 || is_finite(h) == 0) { return MP_ERR_ARG; }
+  if (w < 0.0 || h < 0.0) { return MP_ERR_ARG; }
+
+  // The scales are read for their *kind* only: a band axis has no (finite)
+  // axis values to format, so its labels are the band index in integer form.
+  // Tick values themselves are the caller's business — layout never maps a
+  // value into a pixel, which is what keeps the two passes independent.
+  var xfmt: int32 = spec->x_format;
+  if (xs.kind == MP_SCALE_BAND) { xfmt = MP_FMT_INT; }
+  var yfmt: int32 = spec->y_format;
+  if (ys.kind == MP_SCALE_BAND) { yfmt = MP_FMT_INT; }
+
+  var th: float64 = mp_layout_text_h();
+  var title_h: float64 = mp_layout_title_h(spec);
+  var sub_h: float64 = mp_layout_subtitle_h(spec);
+
+  var top: float64 = title_h + sub_h + MP_LAYOUT_TOP;
+  var left: float64 = layout_label_w(yv, ny, yfmt);
+  if ((int64)spec->y_label.length > 0) {
+    var wl: float64 = mp_text_width(spec->y_label, MP_CHART_TEXT_SIZE);
+    if (wl > left) { left = wl; }
+  }
+  left = left + MP_LAYOUT_GAP;
+
+  var legend_w: float64 = mp_layout_legend_w(spec);
+  var right: float64 = MP_LAYOUT_RIGHT;
+  if (spec->legend == MP_LEGEND_RIGHT) { right = legend_w + 12.0; }
+
+  var bottom: float64 = layout_bottom(spec, th);
+
+  if (spec->margin_auto == false) {
+    top = spec->margins.top;
+    right = spec->margins.right;
+    bottom = spec->margins.bottom;
+    left = spec->margins.left;
+  } else {
+    // The first x tick label is centred on plot.x and the last on the plot's
+    // right edge, so each needs half its measured width inside the canvas.
+    var g: float64 = layout_label_at(xv, 0, nx, xfmt) * 0.5 + 2.0;
+    if (g > left) { left = g; }
+    g = layout_label_at(xv, nx - 1, nx, xfmt) * 0.5 + 2.0;
+    if (g > right) { right = g; }
+  }
+
+  layout_clamp_pair(w - MP_LAYOUT_MARGIN_MIN, &left, &right);
+  layout_clamp_pair(h - MP_LAYOUT_MARGIN_MIN, &top, &bottom);
+
+  var plot: MpRect = mp_rect(left, top, w - left - right, h - top - bottom);
+  if (plot.w < 1.0) { plot.w = 1.0; }
+  if (plot.h < 1.0) { plot.h = 1.0; }
+  out->plot = plot;
+
+  out->title = mp_rect(0.0, 0.0, w, title_h + sub_h);
+
+  var lx: float64 = 0.0;
+  var ly: float64 = 0.0;
+  var lw: float64 = 0.0;
+  var lh: float64 = 0.0;
+  if (spec->legend == MP_LEGEND_RIGHT) {
+    lx = w - right + 6.0;
+    if (lx < 0.0) { lx = 0.0; }
+    lw = legend_w;
+    if (lx + lw > w) { lw = w - lx; }
+    if (lw < 0.0) { lw = 0.0; }
+    ly = plot.y;
+    lh = (float64)spec->n_series * MP_CHART_LEGEND_ROW;
+  } else if (spec->legend == MP_LEGEND_BOTTOM) {
+    lx = plot.x;
+    lw = plot.w;
+    ly = layout_below_ticks(spec, plot.y + plot.h, th) + 4.0;
+    lh = MP_CHART_LEGEND_ROW;
+  }
+  out->legend = mp_rect(lx, ly, lw, lh);
+
+  var xlx: float64 = 0.0;
+  var xly: float64 = 0.0;
+  var xlw: float64 = 0.0;
+  var xlh: float64 = 0.0;
+  if ((int64)spec->x_label.length > 0) {
+    xlx = plot.x;
+    xlw = plot.w;
+    xly = layout_below_ticks(spec, plot.y + plot.h, th) -
+          (th * 1.4 + 4.0);
+    xlh = th * 1.4;
+  }
+  out->x_label = mp_rect(xlx, xly, xlw, xlh);
+
+  var ylx: float64 = 0.0;
+  var yly: float64 = 0.0;
+  var ylw: float64 = 0.0;
+  var ylh: float64 = 0.0;
+  if ((int64)spec->y_label.length > 0) {
+    var band: float64 = left - MP_LAYOUT_GAP;
+    if (band < 0.0) { band = 0.0; }
+    ylx = 0.0;
+    ylw = band;
+    yly = plot.y + (plot.h - th) * 0.5;
+    ylh = th;
+  }
+  out->y_label = mp_rect(ylx, yly, ylw, ylh);
+  return MP_OK;
+}

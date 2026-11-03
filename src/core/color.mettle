@@ -1,0 +1,168 @@
+// core/color — RGBA values, hex/css serialization, palette and themes.
+//
+// Dependencies: core/format (channel integers go through the one
+// number formatter), std/conv for the returned string view. This module must
+// NOT import core/buf: buf imports color for mp_buf_put_color, so an
+// arrow back would be a cycle (docs/02-seams.md §1).
+//
+// Serialization policy (§0): `#rrggbb` when a == 255, else `rgba(r,g,b,a)` with
+// the raw 0..255 alpha, exactly as the seam spells it. Backends that need CSS
+// alpha (docs/03-phase1.md §7 wants `a/255`) format it themselves; that is the
+// documented seam/guide conflict, resolved in favor of the seam.
+//
+// Nothing here allocates; mp_color_css writes into the caller's buffer and
+// returns a borrowed view of it.
+
+import "std/conv";
+import "core/format";
+
+export struct MpColor { r: uint8; g: uint8; b: uint8; a: uint8; }
+
+export struct MpTheme { name: string; bg: MpColor; fg: MpColor;
+                        muted: MpColor; grid: MpColor; axis: MpColor; }
+
+// Categorical palette, shared by every backend so a terminal chart and an SVG
+// chart of one spec agree in order. Indices wrap modulo 8.
+const MP_PALETTE_N: int32 = 8;
+
+export fn mp_color(r: uint8, g: uint8, b: uint8) -> MpColor {
+  var c: MpColor;
+  c.r = r;
+  c.g = g;
+  c.b = b;
+  c.a = 255;
+  return c;
+}
+
+export fn mp_color_a(r: uint8, g: uint8, b: uint8, a: uint8) -> MpColor {
+  var c: MpColor;
+  c.r = r;
+  c.g = g;
+  c.b = b;
+  c.a = a;
+  return c;
+}
+
+export fn mp_color_hex(c: MpColor) -> uint32 {
+  return ((uint32)c.r << 16) | ((uint32)c.g << 8) | (uint32)c.b;
+}
+
+export fn mp_color_from_hex(h: uint32) -> MpColor {
+  return mp_color((uint8)((h >> 16) & 0xFF), (uint8)((h >> 8) & 0xFF),
+                  (uint8)(h & 0xFF));
+}
+
+// Copies a channel value (0..255) at `pos`; returns the new offset.
+fn color_put_u8(out: uint8*, pos: int64, v: uint8) -> int64 {
+  var buf: uint8[32];
+  var s: string = mp_fmt_int((int64)v, &buf[0], 32);
+  var j: int64 = 0;
+  while (j < (int64)s.length) {
+    out[pos] = s.chars[j];
+    pos = pos + 1;
+    j = j + 1;
+  }
+  return pos;
+}
+
+export fn mp_color_css(c: MpColor, out: uint8*, cap: int64) -> string {
+  if (out == 0 || cap < 32) { return ""; }
+  var pos: int64 = 0;
+  if (c.a == 255) {
+    var v: uint32 = mp_color_hex(c);
+    var digits: uint8[6];
+    var i: int32 = 5;
+    while (i >= 0) {
+      var d: int32 = (int32)(v & 0xF);
+      if (d < 10) {
+        digits[(int64)i] = (uint8)(48 + d);
+      } else {
+        digits[(int64)i] = (uint8)(87 + d);
+      }
+      v = v >> 4;
+      i = i - 1;
+    }
+    out[0] = 35;
+    var k: int64 = 0;
+    while (k < 6) {
+      out[1 + k] = digits[k];
+      k = k + 1;
+    }
+    return str_from_bytes((cstring)out, 7);
+  }
+  var pre: string = "rgba(";
+  var i2: int64 = 0;
+  while (i2 < (int64)pre.length) {
+    out[pos] = pre.chars[i2];
+    pos = pos + 1;
+    i2 = i2 + 1;
+  }
+  pos = color_put_u8(out, pos, c.r);
+  out[pos] = 44;
+  pos = pos + 1;
+  pos = color_put_u8(out, pos, c.g);
+  out[pos] = 44;
+  pos = pos + 1;
+  pos = color_put_u8(out, pos, c.b);
+  out[pos] = 44;
+  pos = pos + 1;
+  // CSS alpha is a 0..1 fraction, not the raw byte. 128 -> 0.502.
+  var q: int32 = ((int32)c.a * 1000 + 127) / 255;
+  if (q >= 1000) {
+    out[pos] = 49;
+    pos = pos + 1;
+  } else {
+    out[pos] = 48;
+    out[pos + 1] = 46;
+    pos = pos + 2;
+    out[pos] = (uint8)(48 + q / 100);
+    out[pos + 1] = (uint8)(48 + (q / 10) % 10);
+    out[pos + 2] = (uint8)(48 + q % 10);
+    pos = pos + 3;
+  }
+  out[pos] = 41;
+  pos = pos + 1;
+  return str_from_bytes((cstring)out, pos);
+}
+
+export fn mp_palette_size() -> int32 {
+  return MP_PALETTE_N;
+}
+
+export fn mp_palette_color(i: int32) -> MpColor {
+  var k: int32 = i % MP_PALETTE_N;
+  if (k < 0) { k = k + MP_PALETTE_N; }
+  switch (k) {
+    case 0: { return mp_color(78, 121, 167); }
+    case 1: { return mp_color(242, 142, 43); }
+    case 2: { return mp_color(225, 87, 89); }
+    case 3: { return mp_color(118, 183, 178); }
+    case 4: { return mp_color(89, 161, 79); }
+    case 5: { return mp_color(237, 201, 72); }
+    case 6: { return mp_color(176, 122, 161); }
+    default: { return mp_color(255, 157, 167); }
+  }
+}
+
+// Theme names are static literals, so the borrowed `name` never dangles.
+export fn mp_theme_light() -> MpTheme {
+  var t: MpTheme;
+  t.name = "light";
+  t.bg = mp_color(255, 255, 255);
+  t.fg = mp_color(31, 41, 51);
+  t.muted = mp_color(107, 114, 128);
+  t.grid = mp_color(229, 231, 235);
+  t.axis = mp_color(156, 163, 175);
+  return t;
+}
+
+export fn mp_theme_dark() -> MpTheme {
+  var t: MpTheme;
+  t.name = "dark";
+  t.bg = mp_color(17, 24, 39);
+  t.fg = mp_color(249, 250, 251);
+  t.muted = mp_color(156, 163, 175);
+  t.grid = mp_color(55, 65, 81);
+  t.axis = mp_color(107, 114, 128);
+  return t;
+}

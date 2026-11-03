@@ -1,0 +1,58 @@
+// core/geom — rectangles, insets and the clamp helpers layout needs.
+//
+// Dependencies: nothing (pure value math, no allocation, no std import).
+// Rects are top-left origin, +y down, CSS pixel units (docs/03-phase1.md §1).
+// Shrinking by more than the extent yields negative w/h on purpose: clamping is
+// the layout layer's job, not the geometry primitive's.
+
+export struct MpRect { x: float64; y: float64; w: float64; h: float64; }
+export struct MpInsets { top: float64; right: float64; bottom: float64;
+                         left: float64; }
+
+export fn mp_rect(x: float64, y: float64, w: float64, h: float64) -> MpRect {
+  var r: MpRect;
+  r.x = x;
+  r.y = y;
+  r.w = w;
+  r.h = h;
+  return r;
+}
+
+export fn mp_insets(top: float64, right: float64, bottom: float64,
+                    left: float64) -> MpInsets {
+  var i: MpInsets;
+  i.top = top;
+  i.right = right;
+  i.bottom = bottom;
+  i.left = left;
+  return i;
+}
+
+export fn mp_rect_shrink(r: MpRect, ins: MpInsets) -> MpRect {
+  return mp_rect(r.x + ins.left, r.y + ins.top,
+                 r.w - ins.left - ins.right, r.h - ins.top - ins.bottom);
+}
+
+export fn mp_rect_contains(r: MpRect, px: float64, py: float64) -> bool {
+  if (px < r.x || py < r.y) { return false; }
+  if (px > r.x + r.w || py > r.y + r.h) { return false; }
+  return true;
+}
+
+export fn mp_rect_inside(r: MpRect, inset: float64) -> MpRect {
+  return mp_rect_shrink(r, mp_insets(inset, inset, inset, inset));
+}
+
+export fn mp_insets_h(ins: MpInsets) -> float64 {
+  return ins.left + ins.right;
+}
+
+export fn mp_insets_v(ins: MpInsets) -> float64 {
+  return ins.top + ins.bottom;
+}
+
+export fn mp_clamp01(v: float64) -> float64 {
+  if (v < 0.0) { return 0.0; }
+  if (v > 1.0) { return 1.0; }
+  return v;
+}

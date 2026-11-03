@@ -1,0 +1,177 @@
+// core/buf — error codes and the growable byte buffer that owns every
+// emitted string (scene text, SVG, ASCII, export payloads).
+//
+// Dependencies: core/color (mp_buf_put_color) and core/format
+// (mp_buf_put_i64 / _f64); std/mem, std/conv. Nothing imports buf except the
+// modules above it in docs/01-architecture.md §4, so the error constants live
+// here and are the lowest thing in the graph.
+//
+// Ownership: mp_buf_new returns a buffer owned by the caller; mp_buf_free
+// releases the bytes and the struct. Every put_* either appends fully or
+// changes nothing (growth is attempted before any byte is written).
+//
+// Capacity invariant: cap >= len + 1 always, so mp_buf_cstr can write a NUL at
+// data[len] without advancing len.
+
+import "std/mem";
+import "std/conv";
+import "core/color";
+import "core/format";
+
+export const MP_OK: int32 = 0;
+export const MP_ERR_ARG: int32 = 1;
+export const MP_ERR_ALLOC: int32 = 2;
+export const MP_ERR_STATE: int32 = 3;
+export const MP_ERR_IO: int32 = 4;
+
+export struct MpBuf { data: uint8*; len: int64; cap: int64; }
+
+export fn mp_buf_new(cap: int64) -> MpBuf* {
+  var b: MpBuf* = (MpBuf*)malloc(sizeof(MpBuf));
+  if (b == 0) { return 0; }
+  var c: int64 = cap;
+  if (c < 64) { c = 64; }
+  var d: uint8* = (uint8*)malloc(c);
+  if (d == 0) {
+    free(b);
+    return 0;
+  }
+  b->data = d;
+  b->len = 0;
+  b->cap = c;
+  return b;
+}
+
+export fn mp_buf_free(b: MpBuf*) {
+  if (b == 0) { return; }
+  if (b->data != 0) { free(b->data); }
+  free(b);
+}
+
+export fn mp_buf_clear(b: MpBuf*) {
+  if (b == 0) { return; }
+  b->len = 0;
+}
+
+export fn mp_buf_len(b: MpBuf*) -> int64 {
+  if (b == 0) { return 0; }
+  return b->len;
+}
+
+export fn mp_buf_ok(b: MpBuf*) -> bool {
+  if (b == 0) { return false; }
+  if (b->data == 0) { return false; }
+  return true;
+}
+
+export fn mp_buf_reserve(b: MpBuf*, extra: int64) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  if (extra < 0) { return MP_ERR_ARG; }
+  var need: int64 = b->len + extra + 1;
+  if (need <= b->cap) { return MP_OK; }
+  var ncap: int64 = b->cap;
+  if (ncap < 64) { ncap = 64; }
+  while (ncap < need) { ncap = ncap * 2; }
+  var p: uint8* = (uint8*)realloc((rawptr)b->data, ncap);
+  if (p == 0) { return MP_ERR_ALLOC; }
+  b->data = p;
+  b->cap = ncap;
+  return MP_OK;
+}
+
+export fn mp_buf_put(b: MpBuf*, p: uint8*, n: int64) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  if (n < 0) { return MP_ERR_ARG; }
+  if (n == 0) { return MP_OK; }
+  if (p == 0) { return MP_ERR_ARG; }
+  var rc: int32 = mp_buf_reserve(b, n);
+  if (rc != MP_OK) { return rc; }
+  var i: int64 = 0;
+  while (i < n) {
+    b->data[b->len + i] = p[i];
+    i = i + 1;
+  }
+  b->len = b->len + n;
+  return MP_OK;
+}
+
+export fn mp_buf_putc(b: MpBuf*, c: int32) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var rc: int32 = mp_buf_reserve(b, 1);
+  if (rc != MP_OK) { return rc; }
+  b->data[b->len] = (uint8)(c & 0xFF);
+  b->len = b->len + 1;
+  return MP_OK;
+}
+
+export fn mp_buf_puts(b: MpBuf*, s: string) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var n: int64 = (int64)s.length;
+  if (n == 0) { return MP_OK; }
+  return mp_buf_put(b, s.chars, n);
+}
+
+export fn mp_buf_put_i64(b: MpBuf*, v: int64) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var tmp: uint8[40];
+  var s: string = mp_fmt_int(v, &tmp[0], 40);
+  if (s.length == 0) { return MP_ERR_STATE; }
+  return mp_buf_put(b, s.chars, (int64)s.length);
+}
+
+export fn mp_buf_put_f64(b: MpBuf*, v: float64, decimals: int32) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var tmp: uint8[64];
+  var s: string = mp_fmt_fixed(v, decimals, &tmp[0], 64);
+  if (s.length == 0) { return MP_ERR_STATE; }
+  return mp_buf_put(b, s.chars, (int64)s.length);
+}
+
+// XML/HTML escaping for the web backend: & < > " ' -> entities (§1).
+export fn mp_buf_put_esc(b: MpBuf*, s: string) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var i: int64 = 0;
+  var n: int64 = (int64)s.length;
+  while (i < n) {
+    var c: uint8 = s.chars[i];
+    var rc: int32 = MP_OK;
+    var ch: int32 = (int32)c;
+    switch (ch) {
+      case 38: { rc = mp_buf_puts(b, "&amp;"); }
+      case 60: { rc = mp_buf_puts(b, "&lt;"); }
+      case 62: { rc = mp_buf_puts(b, "&gt;"); }
+      case 34: { rc = mp_buf_puts(b, "&quot;"); }
+      case 39: { rc = mp_buf_puts(b, "&#39;"); }
+      default: { rc = mp_buf_putc(b, (int32)c); }
+    }
+    if (rc != MP_OK) { return rc; }
+    i = i + 1;
+  }
+  return MP_OK;
+}
+
+// Borrowed view of the bytes; not NUL-terminated.
+export fn mp_buf_str(b: MpBuf*) -> string {
+  if (b == 0) { return ""; }
+  if (b->data == 0) { return ""; }
+  return str_from_bytes((cstring)b->data, b->len);
+}
+
+// Borrowed NUL-terminated view. Writes data[len] = 0 without advancing len and
+// returns data; 0 when the one-byte reserve fails.
+export fn mp_buf_cstr(b: MpBuf*) -> cstring {
+  if (b == 0) { return 0; }
+  if (b->data == 0) { return 0; }
+  var rc: int32 = mp_buf_reserve(b, 0);
+  if (rc != MP_OK) { return 0; }
+  b->data[b->len] = 0;
+  return (cstring)b->data;
+}
+
+export fn mp_buf_put_color(b: MpBuf*, c: MpColor) -> int32 {
+  if (b == 0) { return MP_ERR_ARG; }
+  var tmp: uint8[48];
+  var s: string = mp_color_css(c, &tmp[0], 48);
+  if (s.length == 0) { return MP_ERR_STATE; }
+  return mp_buf_put(b, s.chars, (int64)s.length);
+}

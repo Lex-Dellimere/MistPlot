@@ -1,0 +1,52 @@
+// harness: the whole test vocabulary. Pure — no externs, no files, no threads,
+// so every test file that imports it runs in the compile-time interpreter too.
+//
+// A test file exports `main` (so the compiled gate can run it) and declares
+// `@test fn` wrappers that call the same `check_*` functions (so `mettle test`
+// runs it in the interpreter). See tests/t_scale.mettle for the shape.
+
+import "std/io";
+
+export var mp_checks: int32 = 0;
+export var mp_fails: int32 = 0;
+
+export fn mp_expect(name: string, cond: bool) {
+  mp_checks = mp_checks + 1;
+  if (!cond) {
+    mp_fails = mp_fails + 1;
+    println("FAIL {name}");
+  }
+}
+
+export fn mp_expect_i64(name: string, got: int64, want: int64) {
+  mp_checks = mp_checks + 1;
+  if (got != want) {
+    mp_fails = mp_fails + 1;
+    println("FAIL {name}: got {got} want {want}");
+  }
+}
+
+export fn mp_expect_str(name: string, got: string, want: string) {
+  mp_checks = mp_checks + 1;
+  if (got != want) {
+    mp_fails = mp_fails + 1;
+    println("FAIL {name}: got [{got}] want [{want}]");
+  }
+}
+
+export fn mp_expect_near(name: string, got: float64, want: float64, eps: float64) {
+  mp_checks = mp_checks + 1;
+  var d: float64 = got - want;
+  if (d < 0.0) { d = -d; }
+  if (d > eps) {
+    mp_fails = mp_fails + 1;
+    println("FAIL {name}: got {got} want {want} eps {eps}");
+  }
+}
+
+// Returns the process exit code: 0 when every expectation held.
+export fn mp_summary() -> int32 {
+  println("{mp_checks} checks, {mp_fails} failed");
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

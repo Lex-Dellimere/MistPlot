@@ -1,0 +1,89 @@
+// backends/web/page — the two symbols a web handler calls: chart -> SVG bytes,
+// and chart -> an HTML <figure> fragment.
+//
+// Dependencies (docs/02-seams.md §5, docs/04-integration.md §8): this is the
+// only module allowed to import both chart/{spec,resolve} and backends/web/svg.
+// It owns no rendering logic of its own: mp_chart_render fills a scene,
+// mp_svg_render serializes it, and this file only adds the <figure> wrapper.
+//
+// Ownership: both entry points clear `out` and write only into it. The scene
+// and the intermediate SVG buffer are allocated here and freed here (one owner
+// each, `defer` right after the null check), so a handler only owns `out` and
+// gets a borrowed `string` back (docs/04-integration.md §1: a template that
+// keeps the bytes copies them). On failure the return is the failing step's
+// error code with a partial or empty `out`; nothing is leaked.
+//
+// Fragment shape (docs/03-phase1.md §7 indentation, extended one level):
+//   <figure class="mp-figure">
+//     <svg ...>            <- the standalone document, every line +2 spaces
+//       <rect ... />
+//     </svg>
+//     <figcaption>Title</figcaption>
+//   </figure>
+// The <figcaption> is omitted when spec->title is empty. The title is escaped
+// (& < > " ') exactly like the SVG's text nodes, so a title is never markup.
+
+import "core/buf";
+import "renderer/scene";
+import "renderer/backend";
+import "chart/spec";
+import "chart/resolve";
+import "backends/web/svg";
+
+// Writes each line of `s` prefixed with two spaces. The final newline of `s`
+// does not open a phantom indented line.
+fn page_put_svg(out: MpBuf*, s: string) -> int32 {
+  var n: int64 = (int64)s.length;
+  var rc: int32 = mp_buf_puts(out, "  ");
+  if (rc != MP_OK) { return rc; }
+  var i: int64 = 0;
+  while (i < n) {
+    var c: uint8 = s.chars[i];
+    rc = mp_buf_putc(out, (int32)c);
+    if (rc != MP_OK) { return rc; }
+    if (c == 10 && i + 1 < n) {
+      rc = mp_buf_puts(out, "  ");
+      if (rc != MP_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  return MP_OK;
+}
+
+export fn mp_chart_svg(spec: MpChartSpec*, o: MpRenderOpts*,
+                       out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (spec == 0 || o == 0) { return MP_ERR_ARG; }
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) { return MP_ERR_ALLOC; }
+  defer mp_scene_free(sc);
+  var rc: int32 = mp_chart_render(spec, sc);
+  if (rc != MP_OK) { return rc; }
+  return mp_svg_render(sc, o, out);
+}
+
+export fn mp_chart_figure(spec: MpChartSpec*, o: MpRenderOpts*,
+                          out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (spec == 0 || o == 0) { return MP_ERR_ARG; }
+  var svg: MpBuf* = mp_buf_new(4096);
+  if (svg == 0) { return MP_ERR_ALLOC; }
+  defer mp_buf_free(svg);
+  var rc: int32 = mp_chart_svg(spec, o, svg);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(out, "<figure class=\"mp-figure\">\n");
+  if (rc != MP_OK) { return rc; }
+  rc = page_put_svg(out, mp_buf_str(svg));
+  if (rc != MP_OK) { return rc; }
+  if (spec->title.length > 0) {
+    rc = mp_buf_puts(out, "  <figcaption>");
+    if (rc != MP_OK) { return rc; }
+    rc = mp_buf_put_esc(out, spec->title);
+    if (rc != MP_OK) { return rc; }
+    rc = mp_buf_puts(out, "</figcaption>\n");
+    if (rc != MP_OK) { return rc; }
+  }
+  return mp_buf_puts(out, "</figure>\n");
+}

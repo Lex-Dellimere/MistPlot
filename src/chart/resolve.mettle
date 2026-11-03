@@ -1,0 +1,408 @@
+// chart/resolve — the one chart entry point: a spec in, a scene out.
+//
+// Dependencies: chart/{spec,layout,axis} + core/{buf,color,data,format,geom,
+// scale,text,ticks} + renderer/scene. No backend import, ever
+// (docs/01-architecture.md §4) and no std/io: the library never prints.
+//
+// Ownership: `out` is the caller's scene; mp_chart_render clears it and writes
+// only into it. Two float64 arrays per line series are allocated and freed
+// before returning. The scene owns its text, so the spec's strings may die as
+// soon as the call returns.
+//
+// Pipeline (docs/03-phase1.md §6): validate -> union extents -> tick *values*
+// from the data domain (pass 1) -> measured layout -> final pixel scales over
+// frame.plot (pass 2) -> emit in painter's order: background, plot, grid, axes,
+// series, legend, title. Empty but valid data is not an error: it renders the
+// background and the title and returns MP_OK.
+
+import "std/math";
+import "std/mem";
+import "core/buf";
+import "core/color";
+import "core/data";
+import "core/format";
+import "core/geom";
+import "core/scale";
+import "core/text";
+import "core/ticks";
+import "renderer/scene";
+import "chart/spec";
+import "chart/layout";
+import "chart/axis";
+
+fn chart_none() -> MpColor {
+  return mp_color_a(0, 0, 0, 0);
+}
+
+// A log axis needs a positive domain; anything else degrades to linear instead
+// of collapsing every series onto one line (the log scale would report
+// valid = false and map to r0).
+fn chart_wants_log(kind: int32, d0: float64, d1: float64) -> bool {
+  if (kind != MP_SCALE_LOG) { return false; }
+  if (!(d0 > 0.0) || !(d1 > d0)) { return false; }
+  if (is_finite(d0) == 0 || is_finite(d1) == 0) { return false; }
+  return true;
+}
+
+fn chart_scale(xlog: bool, d0: float64, d1: float64, r0: float64,
+               r1: float64) -> MpScale {
+  if (xlog) { return mp_scale_log(d0, d1, r0, r1); }
+  return mp_scale_linear(d0, d1, r0, r1);
+}
+
+fn chart_ticks(xlog: bool, d0: float64, d1: float64, out: float64*,
+               cap: int32) -> int32 {
+  if (xlog) { return mp_ticks_log(d0, d1, out, cap); }
+  return mp_ticks_linear(d0, d1, MP_CHART_TICK_TARGET, out, cap);
+}
+
+// One polyline per series. A non-finite x or y is skipped (the point is
+// dropped, the path is not split — Phase 1, docs/03-phase1.md §6). A series
+// with no finite point emits no node.
+fn chart_line(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
+              ys: MpScale) -> int32 {
+  var i: int32 = 0;
+  while (i < spec->n_series) {
+    var ser: MpSeries* = &spec->series[(int64)i];
+    var n: int64 = ser->n;
+    if (n > 0) {
+      var px: float64[] = new float64[n];
+      var py: float64[] = new float64[n];
+      if (px.data == 0 || py.data == 0) {
+        if (px.data != 0) { free(px.data); }
+        if (py.data != 0) { free(py.data); }
+        return MP_ERR_ALLOC;
+      }
+      var m: int64 = 0;
+      var j: int64 = 0;
+      while (j < n) {
+        var x: float64 = ser->xs[j];
+        var y: float64 = ser->ys[j];
+        if (is_finite(x) != 0 && is_finite(y) != 0) {
+          px[m] = mp_scale_map(xs, x);
+          py[m] = mp_scale_map(ys, y);
+          m = m + 1;
+        }
+        j = j + 1;
+      }
+      var rc: int32 = MP_OK;
+      if (m > 0) {
+        rc = mp_scene_poly(s, px.data, py.data, m, mp_palette_color(i),
+                           MP_CHART_LINE_W, MP_CLS_SERIES + i);
+      }
+      free(px.data);
+      free(py.data);
+      if (rc != MP_OK) { return rc; }
+    }
+    i = i + 1;
+  }
+  return MP_OK;
+}
+
+// Bars: series i of k gets sub-band i of every band,
+//   bw = band_width/k, x = band_start + i*bw, w = bw*(1-bar_gap),
+//   y = map(max(y,0)), h = |map(y)-map(0)|  (docs/03-phase1.md §6).
+fn chart_bar(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
+             ys: MpScale) -> int32 {
+  var k: int32 = spec->n_series;
+  var gap: float64 = spec->bar_gap;
+  if (!(gap > 0.0)) { gap = 0.0; }
+  if (gap > 0.9) { gap = 0.9; }
+  var bw: float64 = mp_scale_band_width(xs) / (float64)k;
+  var w: float64 = bw * (1.0 - gap);
+  if (!(w > 0.0)) { w = 0.0; }
+  var y0: float64 = mp_scale_map(ys, 0.0);
+  var i: int32 = 0;
+  while (i < k) {
+    var ser: MpSeries* = &spec->series[(int64)i];
+    var col: MpColor = mp_palette_color(i);
+    var j: int32 = 0;
+    while (j < xs.n_bands) {
+      if ((int64)j < ser->n) {
+        var y: float64 = ser->ys[(int64)j];
+        if (is_finite(y) != 0) {
+          var ytop: float64 = mp_scale_map(ys, fmax(y, 0.0));
+          var h: float64 = fabs(mp_scale_map(ys, y) - y0);
+          var bx: float64 = mp_scale_band_start(xs, j) + (float64)i * bw;
+          var rc: int32 = mp_scene_rect(s, mp_rect(bx, ytop, w, h), col,
+                                        chart_none(), 0.0,
+                                        MP_CLS_SERIES + i);
+          if (rc != MP_OK) { return rc; }
+        }
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return MP_OK;
+}
+
+// Scatter: one circle per point, palette fill at alpha 200 so overlap reads.
+fn chart_scatter(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
+                 ys: MpScale) -> int32 {
+  var r: float64 = spec->point_radius;
+  if (!(r > 0.0)) { r = 0.0; }
+  var i: int32 = 0;
+  while (i < spec->n_series) {
+    var ser: MpSeries* = &spec->series[(int64)i];
+    var c: MpColor = mp_palette_color(i);
+    var fill: MpColor = mp_color_a(c.r, c.g, c.b, MP_CHART_POINT_ALPHA);
+    var j: int64 = 0;
+    while (j < ser->n) {
+      var x: float64 = ser->xs[j];
+      var y: float64 = ser->ys[j];
+      if (is_finite(x) != 0 && is_finite(y) != 0) {
+        var rc: int32 = mp_scene_circle(s, mp_scale_map(xs, x),
+                                        mp_scale_map(ys, y), r, fill,
+                                        chart_none(), 0.0,
+                                        MP_CLS_SERIES + i);
+        if (rc != MP_OK) { return rc; }
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return MP_OK;
+}
+
+// Item width of one legend entry: swatch + gap + label.
+fn chart_legend_item_w(spec: MpChartSpec*, i: int32) -> float64 {
+  var nm: string = spec->series[(int64)i].name;
+  return MP_CHART_LEGEND_LABEL + mp_text_width(nm, MP_CHART_TEXT_SIZE);
+}
+
+// Top edge of the swatch for a legend row whose top is `y`. The clamp and the
+// drawing read this one expression, so a guard can never drift from the shape
+// it guards (wave-5 B3: the clamp used to test `y + SWATCH` while the swatch
+// was drawn 3 px lower, letting the last row leave the canvas).
+fn chart_legend_swatch_y(y: float64) -> float64 {
+  return y + 3.0;
+}
+
+// Swatch at `x`, label at `x + 16`, both vertically centred in an 18 px row.
+fn chart_legend_item(s: MpScene*, spec: MpChartSpec*, x: float64, y: float64,
+                     i: int32) -> int32 {
+  var rc: int32 = mp_scene_rect(s, mp_rect(x, chart_legend_swatch_y(y),
+                                           MP_CHART_LEGEND_SWATCH,
+                                           MP_CHART_LEGEND_SWATCH),
+                                mp_palette_color(i), chart_none(), 0.0,
+                                MP_CLS_LEGEND);
+  if (rc != MP_OK) { return rc; }
+  var nm: string = spec->series[(int64)i].name;
+  if ((int64)nm.length == 0) { return MP_OK; }
+  return mp_axis_emit_text(s, x + MP_CHART_LEGEND_LABEL, y + 1.8, nm,
+                           MP_CHART_TEXT_SIZE, spec->theme.fg,
+                           MP_ALIGN_START, MP_CLS_LEGEND, spec->width,
+                           spec->height);
+}
+
+fn chart_legend(s: MpScene*, spec: MpChartSpec*, f: MpFrame*) -> int32 {
+  if (spec->legend == MP_LEGEND_NONE) { return MP_OK; }
+  if (spec->legend != MP_LEGEND_RIGHT && spec->legend != MP_LEGEND_BOTTOM) {
+    // An unknown placement draws nothing (layout already reserved no band for
+    // it, so "none" is the only consistent reading).
+    return MP_OK;
+  }
+  if (spec->legend == MP_LEGEND_RIGHT) {
+    var i: int32 = 0;
+    while (i < spec->n_series) {
+      var y: float64 = f->legend.y + (float64)i * MP_CHART_LEGEND_ROW;
+      // Both guards test the box actually drawn: the swatch sits at
+      // chart_legend_swatch_y(y), the left inset is the 4 px chart_legend_item
+      // shifts by. Entries that would leave the canvas are dropped (Phase 1).
+      if (chart_legend_swatch_y(y) + MP_CHART_LEGEND_SWATCH > spec->height) {
+        return MP_OK;
+      }
+      if (f->legend.x + 4.0 + MP_CHART_LEGEND_SWATCH > spec->width) {
+        return MP_OK;
+      }
+      var rc: int32 = chart_legend_item(s, spec, f->legend.x + 4.0, y, i);
+      if (rc != MP_OK) { return rc; }
+      i = i + 1;
+    }
+    return MP_OK;
+  }
+  // Bottom legend: one centred row; entries that would leave the canvas are
+  // dropped (Phase 1 has no wrapping — docs/02-seams.md §8 keeps it Phase 2).
+  var total: float64 = 0.0;
+  var i2: int32 = 0;
+  while (i2 < spec->n_series) {
+    total = total + chart_legend_item_w(spec, i2);
+    if (i2 + 1 < spec->n_series) { total = total + MP_CHART_LEGEND_GAP; }
+    i2 = i2 + 1;
+  }
+  var x: float64 = f->legend.x + (f->legend.w - total) * 0.5;
+  if (x < 0.0) { x = 0.0; }
+  i2 = 0;
+  while (i2 < spec->n_series) {
+    var iw: float64 = chart_legend_item_w(spec, i2);
+    if (x + iw > spec->width) { return MP_OK; }
+    var rc: int32 = chart_legend_item(s, spec, x, f->legend.y, i2);
+    if (rc != MP_OK) { return rc; }
+    x = x + iw + MP_CHART_LEGEND_GAP;
+    i2 = i2 + 1;
+  }
+  return MP_OK;
+}
+
+fn chart_title(s: MpScene*, spec: MpChartSpec*, f: MpFrame*) -> int32 {
+  var rc: int32 = MP_OK;
+  if ((int64)spec->title.length > 0) {
+    rc = mp_axis_emit_text(s, f->title.x + f->title.w * 0.5, f->title.y,
+                           spec->title, MP_CHART_TITLE_SIZE, spec->theme.fg,
+                           MP_ALIGN_CENTER, MP_CLS_TITLE, spec->width,
+                           spec->height);
+    if (rc != MP_OK) { return rc; }
+  }
+  if ((int64)spec->subtitle.length > 0) {
+    rc = mp_axis_emit_text(s, f->title.x + f->title.w * 0.5,
+                           f->title.y + mp_layout_title_h(spec),
+                           spec->subtitle, MP_CHART_SUBTITLE_SIZE,
+                           spec->theme.muted, MP_ALIGN_CENTER, MP_CLS_TITLE,
+                           spec->width, spec->height);
+  }
+  return rc;
+}
+
+export fn mp_chart_render(spec: MpChartSpec*, out: MpScene*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_scene_clear(out);
+  if (spec == 0) { return MP_ERR_ARG; }
+  if (!mp_chart_kind_valid(spec->kind)) { return MP_ERR_ARG; }
+  if (spec->n_series < 1 || spec->n_series > MP_CHART_MAX_SERIES) {
+    return MP_ERR_ARG;
+  }
+  if (spec->series == 0) { return MP_ERR_ARG; }
+  if (is_finite(spec->width) == 0 || is_finite(spec->height) == 0) {
+    return MP_ERR_ARG;
+  }
+  if (!(spec->width > 0.0) || !(spec->height > 0.0)) { return MP_ERR_ARG; }
+
+  // 1. union of the series extents; nothing copied, the spec is borrowed.
+  // `bands` is the longest series: bars split every band across the series and
+  // a bar chart's x axis is a band scale of that length.
+  var ext: MpExtent = mp_extent_empty();
+  var bands: int32 = 0;
+  var i: int32 = 0;
+  while (i < spec->n_series) {
+    var ser: MpSeries = spec->series[(int64)i];
+    ext = mp_extent_union(ext, mp_series_extent(&spec->series[(int64)i]));
+    var n: int64 = ser.n;
+    if (n > (int64)MP_CHART_MAX_BANDS) { n = (int64)MP_CHART_MAX_BANDS; }
+    if ((int32)n > bands) { bands = (int32)n; }
+    i = i + 1;
+  }
+
+  // 2. background first; an empty chart is background + title, not an error.
+  var rc: int32 = mp_scene_rect(out,
+                                mp_rect(0.0, 0.0, spec->width, spec->height),
+                                spec->theme.bg, chart_none(), 0.0,
+                                MP_CLS_BG);
+  if (rc != MP_OK) { return rc; }
+  var frame: MpFrame;
+  if (!ext.valid) {
+    frame.plot = mp_rect(0.0, 0.0, 0.0, 0.0);
+    frame.legend = mp_rect(0.0, 0.0, 0.0, 0.0);
+    frame.x_label = mp_rect(0.0, 0.0, 0.0, 0.0);
+    frame.y_label = mp_rect(0.0, 0.0, 0.0, 0.0);
+    frame.title = mp_rect(0.0, 0.0, spec->width,
+                          mp_layout_title_h(spec) +
+                          mp_layout_subtitle_h(spec));
+    return chart_title(out, spec, &frame);
+  }
+
+  // 3. domain fixups, decided on the *data* domain before any pixel exists:
+  //   * a log axis needs a positive domain; anything else degrades to linear
+  //     rather than collapsing every series onto one line;
+  //   * bars force a zero baseline, and a zero baseline is not a log domain, so
+  //     a bar chart is always linear;
+  //   * a degenerate span is opened up by one unit so the scale keeps a usable
+  //     pixel range instead of mapping everything to the midpoint.
+  var bar: bool = (spec->kind == MP_CHART_BAR);
+  var ylog: bool = chart_wants_log(spec->y_kind, ext.min_y, ext.max_y);
+  if (bar) { ylog = false; }
+  var zero: bool = bar || (spec->y_start_at_zero && !ylog);
+  if (zero && ext.min_y > 0.0) { ext.min_y = 0.0; }
+  if (zero && ext.max_y < 0.0) { ext.max_y = 0.0; }
+  if (ext.max_y == ext.min_y) {
+    if (zero) {
+      ext.max_y = ext.min_y + 1.0;
+    } else {
+      ext.min_y = ext.min_y - 1.0;
+      ext.max_y = ext.max_y + 1.0;
+    }
+  }
+  if (ext.max_x == ext.min_x) {
+    ext.min_x = ext.min_x - 1.0;
+    ext.max_x = ext.max_x + 1.0;
+  }
+
+  // 4. pass 1: tick *values* from the data domain only. No pixel range is
+  // involved, so no label is ever measured with a plot-dependent value.
+  var xv: float64[MP_CHART_TICK_MAX];
+  var yv: float64[MP_CHART_TICK_MAX];
+  var nx: int32 = 0;
+  var xlog: bool = false;
+  if (bar) {
+    // Every band is a category; only the first MP_CHART_TICK_MAX of them get a
+    // tick label (the labels are the band index: a spec carries no category
+    // strings yet, docs/02-seams.md §8).
+    nx = bands;
+    if (nx > MP_CHART_TICK_MAX) { nx = MP_CHART_TICK_MAX; }
+    var j: int32 = 0;
+    while (j < nx) {
+      xv[(int64)j] = (float64)j;
+      j = j + 1;
+    }
+  } else {
+    xlog = chart_wants_log(spec->x_kind, ext.min_x, ext.max_x);
+    nx = chart_ticks(xlog, ext.min_x, ext.max_x, &xv[0], MP_CHART_TICK_MAX);
+  }
+  var ny: int32 = chart_ticks(ylog, ext.min_y, ext.max_y, &yv[0],
+                              MP_CHART_TICK_MAX);
+
+  var xs_prov: MpScale;
+  if (bar) {
+    xs_prov = mp_scale_band(0.0, spec->width, bands, 0.0);
+  } else {
+    xs_prov = chart_scale(xlog, ext.min_x, ext.max_x, 0.0, spec->width);
+  }
+  var ys_prov: MpScale = chart_scale(ylog, ext.min_y, ext.max_y,
+                                     spec->height, 0.0);
+
+  // 5. layout from measured text (pass 1 values, provisional scales).
+  rc = mp_layout_compute(spec, &xv[0], nx, &yv[0], ny, xs_prov, ys_prov,
+                         &frame);
+  if (rc != MP_OK) { return rc; }
+  var plot: MpRect = frame.plot;
+
+  // 6. pass 2: the real scales live inside the plot rect.
+  var xs: MpScale;
+  if (bar) {
+    xs = mp_scale_band(plot.x, plot.x + plot.w, bands, 0.0);
+  } else {
+    xs = chart_scale(xlog, ext.min_x, ext.max_x, plot.x, plot.x + plot.w);
+  }
+  var ys: MpScale = chart_scale(ylog, ext.min_y, ext.max_y,
+                                plot.y + plot.h, plot.y);
+
+  // 7. plot background (after the canvas background, before every mark).
+  rc = mp_scene_rect(out, plot, spec->theme.bg, spec->theme.grid, 1.0,
+                     MP_CLS_PLOT);
+  if (rc != MP_OK) { return rc; }
+
+  // 8. axes, series, legend, title — painter's order is the only z-order.
+  rc = mp_axis_draw(out, spec, &frame, xs, ys, &xv[0], nx, &yv[0], ny);
+  if (rc != MP_OK) { return rc; }
+  if (spec->kind == MP_CHART_LINE) {
+    rc = chart_line(out, spec, xs, ys);
+  } else if (spec->kind == MP_CHART_BAR) {
+    rc = chart_bar(out, spec, xs, ys);
+  } else {
+    rc = chart_scatter(out, spec, xs, ys);
+  }
+  if (rc != MP_OK) { return rc; }
+  rc = chart_legend(out, spec, &frame);
+  if (rc != MP_OK) { return rc; }
+  return chart_title(out, spec, &frame);
+}

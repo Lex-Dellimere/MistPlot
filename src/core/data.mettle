@@ -1,0 +1,215 @@
+// core/data — MpSeries (numeric columns) and MpExtent (bounding box).
+//
+// Dependencies: core/buf for the MP_* error codes; std/mem, std/conv.
+// Data borrows nothing: the series *copies* its name at construction so a
+// temporary label cannot dangle (docs/02-seams.md §2).
+//
+// Contract: mp_extent_add ignores non-finite pairs (docs/02-seams.md §2 +
+// docs/03-phase1.md:128: a NaN/inf sample is skipped, not stored), so one bad
+// sample cannot turn a domain into NaN and collapse every mark onto the range
+// midpoint. A series of only non-finite pairs therefore has no valid extent.
+//
+// Ownership: mp_series_new returns a series owned by the caller; mp_series_free
+// releases xs, ys, the name copy and the struct. mp_series_free_all releases
+// the contents of a caller-owned array of MpSeries *values* and does not free
+// the array itself. push/set never leave a partially grown series behind.
+// s->xs and s->ys are borrowed column views: a push that grows the series
+// reallocates them, so a caller must re-read them after every push (the values
+// are preserved; the pointers are not).
+
+import "std/mem";
+import "std/conv";
+import "core/buf";
+
+export struct MpSeries { name: string; xs: float64*; ys: float64*;
+                         n: int64; cap: int64; }
+
+export struct MpExtent { min_x: float64; max_x: float64; min_y: float64;
+                         max_y: float64; valid: bool; }
+
+const MP_SERIES_DEFAULT_CAP: int64 = 16;
+
+export fn mp_series_new(name: string, cap: int64) -> MpSeries* {
+  var c: int64 = cap;
+  if (c <= 0) { c = MP_SERIES_DEFAULT_CAP; }
+  var s: MpSeries* = (MpSeries*)malloc(sizeof(MpSeries));
+  if (s == 0) { return 0; }
+  var xs: float64* = (float64*)malloc(c * 8);
+  if (xs == 0) {
+    free(s);
+    return 0;
+  }
+  var ys: float64* = (float64*)malloc(c * 8);
+  if (ys == 0) {
+    free(xs);
+    free(s);
+    return 0;
+  }
+  s->xs = xs;
+  s->ys = ys;
+  s->n = 0;
+  s->cap = c;
+  var len: int64 = (int64)name.length;
+  if (len == 0) {
+    s->name = "";
+  } else {
+    var nb: uint8* = (uint8*)malloc(len);
+    if (nb == 0) {
+      free(xs);
+      free(ys);
+      free(s);
+      return 0;
+    }
+    var i: int64 = 0;
+    while (i < len) {
+      nb[i] = name.chars[i];
+      i = i + 1;
+    }
+    s->name = str_from_bytes((cstring)nb, len);
+  }
+  return s;
+}
+
+export fn mp_series_free(s: MpSeries*) {
+  if (s == 0) { return; }
+  if (s->xs != 0) { free(s->xs); }
+  if (s->ys != 0) { free(s->ys); }
+  if ((int64)s->name.length > 0) { free(s->name.chars); }
+  free(s);
+}
+
+export fn mp_series_free_all(list: MpSeries*, n: int32) {
+  if (list == 0) { return; }
+  var i: int32 = 0;
+  while (i < n) {
+    var it: MpSeries = list[(int64)i];
+    if (it.xs != 0) { free(it.xs); }
+    if (it.ys != 0) { free(it.ys); }
+    if ((int64)it.name.length > 0) { free(it.name.chars); }
+    i = i + 1;
+  }
+}
+
+// Grows to hold `need` more points. Two `realloc`s would leave the series half
+// grown when the second column fails, so both columns are allocated with
+// malloc first and the old ones are released only after both succeeded: a
+// failed push leaves n, cap and both column contents exactly as they were.
+fn mp_series_grow(s: MpSeries*, need: int64) -> int32 {
+  if (s->n + need <= s->cap) { return MP_OK; }
+  var ncap: int64 = s->cap;
+  if (ncap < MP_SERIES_DEFAULT_CAP) { ncap = MP_SERIES_DEFAULT_CAP; }
+  while (ncap < s->n + need) { ncap = ncap * 2; }
+  var nx: float64* = (float64*)malloc(ncap * 8);
+  if (nx == 0) { return MP_ERR_ALLOC; }
+  var ny: float64* = (float64*)malloc(ncap * 8);
+  if (ny == 0) {
+    free(nx);
+    return MP_ERR_ALLOC;
+  }
+  var i: int64 = 0;
+  while (i < s->n) {
+    nx[i] = s->xs[i];
+    ny[i] = s->ys[i];
+    i = i + 1;
+  }
+  if (s->xs != 0) { free(s->xs); }
+  if (s->ys != 0) { free(s->ys); }
+  s->xs = nx;
+  s->ys = ny;
+  s->cap = ncap;
+  return MP_OK;
+}
+
+export fn mp_series_push(s: MpSeries*, x: float64, y: float64) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  var rc: int32 = mp_series_grow(s, 1);
+  if (rc != MP_OK) { return rc; }
+  s->xs[s->n] = x;
+  s->ys[s->n] = y;
+  s->n = s->n + 1;
+  return MP_OK;
+}
+
+export fn mp_series_set(s: MpSeries*, i: int64, x: float64,
+                        y: float64) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  if (i < 0 || i >= s->n) { return MP_ERR_ARG; }
+  s->xs[i] = x;
+  s->ys[i] = y;
+  return MP_OK;
+}
+
+export fn mp_extent_empty() -> MpExtent {
+  var e: MpExtent;
+  e.min_x = 0.0;
+  e.max_x = 0.0;
+  e.min_y = 0.0;
+  e.max_y = 0.0;
+  e.valid = false;
+  return e;
+}
+
+export fn mp_extent_add(e: MpExtent*, x: float64, y: float64) {
+  if (e == 0) { return; }
+  // §2 + docs/03-phase1.md:128: a non-finite sample is not a data point. It is
+  // dropped here, not in the chart layer, so one bad sample cannot turn the
+  // domain into NaN and collapse every mark onto the range midpoint.
+  if (x != x || y != y) { return; }
+  if (x > 1e308 || x < 0.0 - 1e308) { return; }
+  if (y > 1e308 || y < 0.0 - 1e308) { return; }
+  if (!e->valid) {
+    e->min_x = x;
+    e->max_x = x;
+    e->min_y = y;
+    e->max_y = y;
+    e->valid = true;
+    return;
+  }
+  if (x < e->min_x) { e->min_x = x; }
+  if (x > e->max_x) { e->max_x = x; }
+  if (y < e->min_y) { e->min_y = y; }
+  if (y > e->max_y) { e->max_y = y; }
+}
+
+export fn mp_extent_union(a: MpExtent, b: MpExtent) -> MpExtent {
+  if (!a.valid) { return b; }
+  if (!b.valid) { return a; }
+  var e: MpExtent;
+  e.min_x = a.min_x;
+  if (b.min_x < e.min_x) { e.min_x = b.min_x; }
+  e.max_x = a.max_x;
+  if (b.max_x > e.max_x) { e.max_x = b.max_x; }
+  e.min_y = a.min_y;
+  if (b.min_y < e.min_y) { e.min_y = b.min_y; }
+  e.max_y = a.max_y;
+  if (b.max_y > e.max_y) { e.max_y = b.max_y; }
+  e.valid = true;
+  return e;
+}
+
+export fn mp_extent_pad(e: MpExtent, frac: float64) -> MpExtent {
+  var r: MpExtent = e;
+  if (!e.valid) { return r; }
+  var sx: float64 = e.max_x - e.min_x;
+  var sy: float64 = e.max_y - e.min_y;
+  if (sx > 0.0) {
+    r.min_x = e.min_x - frac * sx;
+    r.max_x = e.max_x + frac * sx;
+  }
+  if (sy > 0.0) {
+    r.min_y = e.min_y - frac * sy;
+    r.max_y = e.max_y + frac * sy;
+  }
+  return r;
+}
+
+export fn mp_series_extent(s: MpSeries*) -> MpExtent {
+  var e: MpExtent = mp_extent_empty();
+  if (s == 0) { return e; }
+  var i: int64 = 0;
+  while (i < s->n) {
+    mp_extent_add(&e, s->xs[i], s->ys[i]);
+    i = i + 1;
+  }
+  return e;
+}

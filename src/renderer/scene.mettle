@@ -1,0 +1,378 @@
+// renderer/scene — the backend contract: a flat, heap-owned display
+// list of primitives.
+//
+// Dependencies: core/{buf,color,geom,text} plus std/mem and std/conv
+// (for the borrowed string views). Nothing chart-shaped may ever be added here
+// (docs/01-architecture.md D1); backends walk arrays and do no arithmetic
+// (D2).
+//
+// Ownership: mp_scene_new returns a scene owned by the caller; mp_scene_free
+// releases the node array, the point array, the text buffer and the struct.
+// The scene OWNS its text: mp_scene_text copies the bytes into scene->text and
+// nodes store (offset, length) — a rendered scene outlives the spec that built
+// it (D4). mp_scene_node / _node_text / _node_pts return borrowed views.
+//
+// Invariants:
+//   * nodes are in painter's order (background first);
+//   * a LINE node stores both endpoints in the point array (pts_len == 4), so a
+//     backend has exactly one segment code path; x/y/w/h hold the bbox;
+//   * a TEXT node's y is the TOP of the text box (`y + size` is the baseline);
+//     w/h are the measured width/height at build time;
+//   * a circle uses x/y for its centre, r for its radius;
+//   * every add returns MP_ERR_ALLOC on failure and leaves the scene
+//     consistent: growth is attempted before any byte or count changes;
+//   * node pointers and point pointers are borrowed from the scene's arrays:
+//     any further add may `realloc` them, so a caller must re-fetch
+//     mp_scene_node / mp_scene_node_pts after adding (offsets stay valid, raw
+//     pointers do not);
+//   * node text/point ranges are int32 offsets, so a scene that would exceed
+//     2^31 bytes of text or points is refused with MP_ERR_STATE instead of
+//     wrapping a slice.
+
+import "std/mem";
+import "std/conv";
+import "core/buf";
+import "core/color";
+import "core/geom";
+import "core/text";
+
+export const MP_NODE_RECT: int32 = 0;
+export const MP_NODE_LINE: int32 = 1;
+export const MP_NODE_CIRCLE: int32 = 2;
+export const MP_NODE_TEXT: int32 = 3;
+export const MP_NODE_POLY: int32 = 4;
+
+export const MP_ALIGN_START: int32 = 0;
+export const MP_ALIGN_CENTER: int32 = 1;
+export const MP_ALIGN_END: int32 = 2;
+
+export const MP_CLS_BG: int32 = 0;
+export const MP_CLS_PLOT: int32 = 1;
+export const MP_CLS_GRID: int32 = 2;
+export const MP_CLS_AXIS: int32 = 3;
+export const MP_CLS_TICK: int32 = 4;
+export const MP_CLS_LABEL: int32 = 5;
+export const MP_CLS_TITLE: int32 = 6;
+export const MP_CLS_LEGEND: int32 = 7;
+export const MP_CLS_SERIES: int32 = 8;   // + series index appended by chart
+
+export struct MpNode {
+  kind: int32; cls: int32; align: int32;
+  x: float64; y: float64; w: float64; h: float64;
+  size: float64;
+  r: float64;
+  opacity: float64;
+  stroke_w: float64;
+  fill: MpColor; stroke: MpColor;
+  pts_off: int32; pts_len: int32;
+  text_off: int32; text_len: int32;
+}
+
+export struct MpScene { nodes: MpNode*; n: int64; cap: int64;
+                        pts: float64*; npts: int64; cappts: int64;
+                        text: MpBuf*; }
+
+const MP_SCENE_MIN_NODES: int64 = 16;
+const MP_SCENE_MIN_PTS: int64 = 32;
+const MP_SCENE_MAX_OFF: int64 = 2147483647;
+
+export fn mp_scene_new() -> MpScene* {
+  var s: MpScene* = (MpScene*)malloc(sizeof(MpScene));
+  if (s == 0) { return 0; }
+  var nodes: MpNode* = (MpNode*)malloc(MP_SCENE_MIN_NODES * sizeof(MpNode));
+  if (nodes == 0) {
+    free(s);
+    return 0;
+  }
+  var pts: float64* = (float64*)malloc(MP_SCENE_MIN_PTS * 8);
+  if (pts == 0) {
+    free(nodes);
+    free(s);
+    return 0;
+  }
+  var t: MpBuf* = mp_buf_new(128);
+  if (t == 0) {
+    free(nodes);
+    free(pts);
+    free(s);
+    return 0;
+  }
+  s->nodes = nodes;
+  s->n = 0;
+  s->cap = MP_SCENE_MIN_NODES;
+  s->pts = pts;
+  s->npts = 0;
+  s->cappts = MP_SCENE_MIN_PTS;
+  s->text = t;
+  return s;
+}
+
+export fn mp_scene_free(s: MpScene*) {
+  if (s == 0) { return; }
+  if (s->nodes != 0) { free(s->nodes); }
+  if (s->pts != 0) { free(s->pts); }
+  if (s->text != 0) { mp_buf_free(s->text); }
+  free(s);
+}
+
+export fn mp_scene_clear(s: MpScene*) {
+  if (s == 0) { return; }
+  s->n = 0;
+  s->npts = 0;
+  mp_buf_clear(s->text);
+}
+
+export fn mp_scene_count(s: MpScene*) -> int64 {
+  if (s == 0) { return 0; }
+  return s->n;
+}
+
+fn scene_reserve_nodes(s: MpScene*, extra: int64) -> int32 {
+  if (s->n + extra <= s->cap) { return MP_OK; }
+  var ncap: int64 = s->cap;
+  if (ncap < MP_SCENE_MIN_NODES) { ncap = MP_SCENE_MIN_NODES; }
+  while (ncap < s->n + extra) { ncap = ncap * 2; }
+  var p: MpNode* = (MpNode*)realloc((rawptr)s->nodes,
+                                    ncap * sizeof(MpNode));
+  if (p == 0) { return MP_ERR_ALLOC; }
+  s->nodes = p;
+  s->cap = ncap;
+  return MP_OK;
+}
+
+fn scene_reserve_pts(s: MpScene*, extra: int64) -> int32 {
+  if (extra < 0) { return MP_ERR_ARG; }
+  // pts_off/pts_len are int32: refuse a range that cannot be addressed rather
+  // than truncating it into a wrong slice.
+  if (s->npts + extra > MP_SCENE_MAX_OFF) { return MP_ERR_STATE; }
+  if (s->npts + extra <= s->cappts) { return MP_OK; }
+  var ncap: int64 = s->cappts;
+  if (ncap < MP_SCENE_MIN_PTS) { ncap = MP_SCENE_MIN_PTS; }
+  while (ncap < s->npts + extra) { ncap = ncap * 2; }
+  var p: float64* = (float64*)realloc((rawptr)s->pts, ncap * 8);
+  if (p == 0) { return MP_ERR_ALLOC; }
+  s->pts = p;
+  s->cappts = ncap;
+  return MP_OK;
+}
+
+// A zeroed node with the defaults every primitive shares.
+fn scene_blank() -> MpNode {
+  var nd: MpNode;
+  nd.kind = MP_NODE_RECT;
+  nd.cls = MP_CLS_BG;
+  nd.align = MP_ALIGN_START;
+  nd.x = 0.0;
+  nd.y = 0.0;
+  nd.w = 0.0;
+  nd.h = 0.0;
+  nd.size = 0.0;
+  nd.r = 0.0;
+  nd.opacity = 1.0;
+  nd.stroke_w = 0.0;
+  nd.fill = mp_color_a(0, 0, 0, 0);
+  nd.stroke = mp_color_a(0, 0, 0, 0);
+  nd.pts_off = 0;
+  nd.pts_len = 0;
+  nd.text_off = 0;
+  nd.text_len = 0;
+  return nd;
+}
+
+export fn mp_scene_rect(s: MpScene*, r: MpRect, fill: MpColor,
+                        stroke: MpColor, stroke_w: float64,
+                        cls: int32) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  var rc: int32 = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  var nd: MpNode = scene_blank();
+  nd.kind = MP_NODE_RECT;
+  nd.cls = cls;
+  nd.x = r.x;
+  nd.y = r.y;
+  nd.w = r.w;
+  nd.h = r.h;
+  nd.fill = fill;
+  nd.stroke = stroke;
+  nd.stroke_w = stroke_w;
+  s->nodes[s->n] = nd;
+  s->n = s->n + 1;
+  return MP_OK;
+}
+
+export fn mp_scene_line(s: MpScene*, x0: float64, y0: float64, x1: float64,
+                        y1: float64, stroke: MpColor, stroke_w: float64,
+                        cls: int32) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  var rc: int32 = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  rc = scene_reserve_pts(s, 4);
+  if (rc != MP_OK) { return rc; }
+  var off: int64 = s->npts;
+  s->pts[off] = x0;
+  s->pts[off + 1] = y0;
+  s->pts[off + 2] = x1;
+  s->pts[off + 3] = y1;
+  s->npts = off + 4;
+  var nd: MpNode = scene_blank();
+  nd.kind = MP_NODE_LINE;
+  nd.cls = cls;
+  nd.x = fmin64(x0, x1);
+  nd.y = fmin64(y0, y1);
+  nd.w = fmax64(x0, x1) - nd.x;
+  nd.h = fmax64(y0, y1) - nd.y;
+  nd.stroke = stroke;
+  nd.stroke_w = stroke_w;
+  nd.pts_off = (int32)off;
+  nd.pts_len = 4;
+  s->nodes[s->n] = nd;
+  s->n = s->n + 1;
+  return MP_OK;
+}
+
+fn fmin64(a: float64, b: float64) -> float64 {
+  if (a < b) { return a; }
+  return b;
+}
+
+fn fmax64(a: float64, b: float64) -> float64 {
+  if (a > b) { return a; }
+  return b;
+}
+
+export fn mp_scene_circle(s: MpScene*, cx: float64, cy: float64, r: float64,
+                          fill: MpColor, stroke: MpColor, stroke_w: float64,
+                          cls: int32) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  var rc: int32 = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  var nd: MpNode = scene_blank();
+  nd.kind = MP_NODE_CIRCLE;
+  nd.cls = cls;
+  nd.x = cx;
+  nd.y = cy;
+  nd.w = r * 2.0;
+  nd.h = r * 2.0;
+  nd.r = r;
+  nd.fill = fill;
+  nd.stroke = stroke;
+  nd.stroke_w = stroke_w;
+  s->nodes[s->n] = nd;
+  s->n = s->n + 1;
+  return MP_OK;
+}
+
+export fn mp_scene_poly(s: MpScene*, xs: float64*, ys: float64*, n: int64,
+                        stroke: MpColor, stroke_w: float64,
+                        cls: int32) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  if (n < 0) { return MP_ERR_ARG; }
+  if (n > 0 && (xs == 0 || ys == 0)) { return MP_ERR_ARG; }
+  if (n > MP_SCENE_MAX_OFF / 2) { return MP_ERR_STATE; }
+  var rc: int32 = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  rc = scene_reserve_pts(s, n * 2);
+  if (rc != MP_OK) { return rc; }
+  var off: int64 = s->npts;
+  var i: int64 = 0;
+  while (i < n) {
+    s->pts[off + i * 2] = xs[i];
+    s->pts[off + i * 2 + 1] = ys[i];
+    i = i + 1;
+  }
+  s->npts = off + n * 2;
+  var nd: MpNode = scene_blank();
+  nd.kind = MP_NODE_POLY;
+  nd.cls = cls;
+  nd.stroke = stroke;
+  nd.stroke_w = stroke_w;
+  nd.pts_off = (int32)off;
+  nd.pts_len = (int32)(n * 2);
+  // Bbox from the copied points, so a backend can clip without the array.
+  var minx: float64 = 0.0;
+  var miny: float64 = 0.0;
+  var maxx: float64 = 0.0;
+  var maxy: float64 = 0.0;
+  var j: int64 = 0;
+  while (j < n) {
+    var px: float64 = xs[j];
+    var py: float64 = ys[j];
+    if (j == 0) {
+      minx = px;
+      miny = py;
+      maxx = px;
+      maxy = py;
+    } else {
+      if (px < minx) { minx = px; }
+      if (py < miny) { miny = py; }
+      if (px > maxx) { maxx = px; }
+      if (py > maxy) { maxy = py; }
+    }
+    j = j + 1;
+  }
+  if (n > 0) {
+    nd.x = minx;
+    nd.y = miny;
+    nd.w = maxx - minx;
+    nd.h = maxy - miny;
+  }
+  s->nodes[s->n] = nd;
+  s->n = s->n + 1;
+  return MP_OK;
+}
+
+export fn mp_scene_text(s: MpScene*, x: float64, y: float64, label: string,
+                        size: float64, color: MpColor, align: int32,
+                        cls: int32) -> int32 {
+  if (s == 0) { return MP_ERR_ARG; }
+  var off: int64 = mp_buf_len(s->text);
+  var tlen: int64 = (int64)label.length;
+  // text_off/text_len are int32; refuse the range before allocating anything
+  // or appending bytes, so the scene stays consistent.
+  if (off + tlen > MP_SCENE_MAX_OFF) { return MP_ERR_STATE; }
+  var rc: int32 = scene_reserve_nodes(s, 1);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(s->text, label);
+  if (rc != MP_OK) { return rc; }
+  var nd: MpNode = scene_blank();
+  nd.kind = MP_NODE_TEXT;
+  nd.cls = cls;
+  nd.align = align;
+  nd.x = x;
+  nd.y = y;
+  nd.w = mp_text_width(label, size);
+  nd.h = mp_text_height(size);
+  nd.size = size;
+  nd.fill = color;
+  nd.text_off = (int32)off;
+  nd.text_len = (int32)tlen;
+  s->nodes[s->n] = nd;
+  s->n = s->n + 1;
+  return MP_OK;
+}
+
+export fn mp_scene_node(s: MpScene*, i: int64) -> MpNode* {
+  if (s == 0) { return 0; }
+  if (i < 0 || i >= s->n) { return 0; }
+  return &s->nodes[i];
+}
+
+export fn mp_scene_node_text(s: MpScene*, node: MpNode*) -> string {
+  if (s == 0 || node == 0) { return ""; }
+  if (node->text_len <= 0) { return ""; }
+  if (s->text == 0) { return ""; }
+  if (s->text->data == 0) { return ""; }
+  var off: int64 = (int64)node->text_off;
+  var n: int64 = (int64)node->text_len;
+  if (off < 0 || off + n > s->text->len) { return ""; }
+  return str_from_bytes((cstring)(s->text->data + off), n);
+}
+
+export fn mp_scene_node_pts(s: MpScene*, node: MpNode*) -> float64* {
+  if (s == 0 || node == 0) { return 0; }
+  if (node->pts_len <= 0) { return 0; }
+  if (s->pts == 0) { return 0; }
+  var off: int64 = (int64)node->pts_off;
+  if (off < 0 || off + (int64)node->pts_len > s->npts) { return 0; }
+  return s->pts + off;
+}

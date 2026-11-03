@@ -1,0 +1,4 @@
+build/
+.mbuild/
+*.o
+*.svg.tmp

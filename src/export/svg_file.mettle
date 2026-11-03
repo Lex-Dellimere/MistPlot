@@ -1,0 +1,44 @@
+// export/svg_file — the one file-writing seam: render a scene to SVG and put
+// the bytes on disk.
+//
+// Dependencies (docs/02-seams.md §6): core/buf, renderer/{backend,scene},
+// backends/web/svg and std/io (fopen/fwrite/fclose). No `system()`, no shell,
+// no temporary file, no rename: the bytes go straight to `path`.
+//
+// Ownership: the temporary MpBuf is created and freed here; the scene, the
+// render options and `path` are borrowed. The file handle is closed on every
+// path after a successful open, including a short write.
+//
+// Errors: MP_ERR_ARG for a null scene/opts/path, MP_ERR_ALLOC when the buffer
+// cannot be created, whatever mp_svg_render returns, and MP_ERR_IO when the
+// open, the write or the close fails. A failed open leaves no file behind; a
+// failed write leaves a truncated file (there is no atomic-rename dance in
+// Phase 1) and still closes the handle.
+
+import "std/io";
+import "core/buf";
+import "renderer/backend";
+import "renderer/scene";
+import "backends/web/svg";
+
+export fn mp_export_svg(scene: MpScene*, o: MpRenderOpts*,
+                        path: cstring) -> int32 {
+  if (scene == 0 || o == 0 || path == 0) { return MP_ERR_ARG; }
+  var b: MpBuf* = mp_buf_new(4096);
+  if (b == 0) { return MP_ERR_ALLOC; }
+  defer mp_buf_free(b);
+  var rc: int32 = mp_svg_render(scene, o, b);
+  if (rc != MP_OK) { return rc; }
+  var n: int64 = mp_buf_len(b);
+  var mode: string = "wb";
+  var fp: cstring = fopen(path, mode.chars);
+  if (fp == 0) { return MP_ERR_IO; }
+  var wrote: int64 = 0;
+  if (n > 0) {
+    wrote = fwrite((cstring)b->data, 1, n, fp);
+  }
+  var closed: int32 = fclose(fp);
+  if (n > 0 && wrote != n) { return MP_ERR_IO; }
+  if (closed != 0) { return MP_ERR_IO; }
+  return MP_OK;
+}
