@@ -7,7 +7,7 @@
 //! and grid rules are drawn only into empty cells. Area fills, stroke-only rects and dash
 //! patterns are not drawn (dashed lines come out solid). Output is a pure function of the
 //! scene, the target and the mode; each row ends with a newline and trailing blank cells
-//! are trimmed.
+//! are trimmed. mp_chart_term lays a chart out on the cell grid (chart/frame) first.
 
 import "std/math";
 import "mistplot/core/error";
@@ -18,6 +18,8 @@ import "mistplot/core/str";
 import "mistplot/core/target";
 import "mistplot/scene/scene";
 import "mistplot/scene/path";
+import "mistplot/chart/chart";
+import "mistplot/chart/frame";
 
 /// Terminal mode: MP_TERM_BLOCKS when the scene is mostly bars (its series-class rects
 /// outnumber its other series-class non-text nodes), otherwise MP_TERM_BRAILLE.
@@ -913,5 +915,48 @@ export fn mp_term_scene(s: MpScene*, t: MpTarget*, mode: int32, out: MpBuf*) -> 
   if (g.cells == 0) { return MP_ERR_ALLOC; }
   rc = term_draw(&g, s, out);
   mp_free(g.cells);
+  return rc;
+}
+
+/// Renders a chart as terminal text of cols x rows cells, laid out on the cell grid
+/// (mp_target_cells). Without an explicit theme (mp_chart_set_theme) titles and labels use
+/// the terminal's own colours; with one, MP_TERM_THEME is added and the theme's colours and
+/// background are used. Area fills are skipped and dashes are drawn solid.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param cols Columns. Units: cells. Valid: 1 .. MP_TERM_MAX_COLS.
+/// @param rows Rows. Units: cells. Valid: 1 .. MP_TERM_MAX_ROWS.
+/// @param mode MP_TERM_AUTO, BRAILLE, BLOCKS or ASCII, plus MP_TERM_PLAIN and/or
+///   MP_TERM_HOME. Valid: as for mp_term_scene; a MP_TERM_THEME bit is ignored (the
+///   chart decides).
+/// @param out Receives the text. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code (also recorded as the chart's sticky error).
+/// @error MP_ERR_ARG c or out is 0, the mode is unknown or cols or rows is below 1; out is
+///   empty.
+/// @error MP_ERR_LIMIT cols or rows is above its maximum; out is empty.
+/// @error MP_ERR_ALLOC the frame, the cell grid or out could not grow; out is empty or
+///   partial.
+/// @mem out belongs to the caller. The cell grid is allocated and freed inside the call.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost The frame (cached per seq and size) plus O(nodes + points + cells).
+export fn mp_chart_term(c: MpChart*, cols: int32, rows: int32, mode: int32,
+                        out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (cols < 1 || rows < 1 || !term_mode_ok(mode)) {
+    rc = MP_ERR_ARG;
+  } else if (cols > MP_TERM_MAX_COLS || rows > MP_TERM_MAX_ROWS) {
+    rc = MP_ERR_LIMIT;
+  }
+  var t: MpTarget = mp_target_cells(cols, rows);
+  if (rc == MP_OK) { rc = mp_frame_scene(c, &t); }
+  var m: int32 = mode & ~MP_TERM_THEME;
+  if (c->theme_explicit) { m = m | MP_TERM_THEME; }
+  if (rc == MP_OK) { rc = mp_term_scene(c->scene, &t, m, out); }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
   return rc;
 }

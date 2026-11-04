@@ -1,5 +1,6 @@
-//! Serializes a scene into one standalone SVG document. Depends on core (error, buf,
-//! color, target) and scene/scene, scene/path. Output is a pure function of the scene,
+//! Serializes a scene into one standalone SVG document, and renders charts through it.
+//! Depends on core (error, buf, color, target), scene/scene, scene/path and chart/frame.
+//! Output is a pure function of the scene,
 //! the target size, the font and the label: no ids except colour-derived gradient ids,
 //! no <style> block (class rules would leak between charts inlined in one page), and
 //! coordinates written with mp_buf_put_num. The font family is set once on the root;
@@ -12,6 +13,8 @@ import "mistplot/core/color";
 import "mistplot/core/target";
 import "mistplot/scene/scene";
 import "mistplot/scene/path";
+import "mistplot/chart/chart";
+import "mistplot/chart/frame";
 
 // Gradient ids already written in this document; more distinct gradients than this are
 // written again before each use (same id, same definition, so still correct).
@@ -404,4 +407,96 @@ export fn mp_svg_scene(s: MpScene*, t: MpTarget*, font: string, label: string,
   }
   svg_s(&st, "</svg>\n");
   return st.rc;
+}
+
+fn svg_chart(c: MpChart*, t: MpTarget*, out: MpBuf*) -> int32 {
+  var rc: int32 = mp_frame_scene(c, t);
+  if (rc != MP_OK) { return rc; }
+  c->stats.svg_renders = c->stats.svg_renders + 1;
+  return mp_chart_fail(c, mp_svg_scene(c->scene, t, c->font, c->title, out));
+}
+
+/// Renders a chart as an SVG document of w x h px.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param w Width. Units: px. Valid: finite, in (0, 1e9).
+/// @param h Height. Units: px. Valid: finite, in (0, 1e9).
+/// @param out Receives the document. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code (also recorded as the chart's sticky error).
+/// @error MP_ERR_ARG c or out is 0, or the size is out of range; out is empty.
+/// @error MP_ERR_ALLOC the frame or out could not grow; out is empty or partial.
+/// @mem out belongs to the caller; nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost The frame (cached per seq and size) plus O(nodes + points).
+export fn mp_chart_svg(c: MpChart*, w: float64, h: float64, out: MpBuf*) -> int32 {
+  var t: MpTarget = mp_target(w, h);
+  return mp_chart_svg_target(c, &t, out);
+}
+
+/// Renders a chart as an SVG document for a target (its width and height; the device
+/// scale only moves the pixel snapping).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param t The target. Valid: non-zero, as for mp_chart_scene.
+/// @param out Receives the document. Valid: non-zero; cleared first.
+/// @return MP_OK, or an error code (also recorded as the chart's sticky error).
+/// @error MP_ERR_ARG c, t or out is 0, or the target is out of range; out is empty.
+/// @error MP_ERR_ALLOC the frame or out could not grow; out is empty or partial.
+/// @mem out belongs to the caller; nothing is retained from t.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost The frame (cached per seq and target) plus O(nodes + points).
+export fn mp_chart_svg_target(c: MpChart*, t: MpTarget*, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = svg_chart(c, t, out);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Makes the chart's SVG cache hold the document at w x h px (rebuilt when seq or the size
+/// changed), with the chart entered.
+///
+/// @param c The chart. Valid: non-zero, entered or locked.
+/// @param w Width. Units: px. Valid: finite, in (0, 1e9).
+/// @param h Height. Units: px. Valid: finite, in (0, 1e9).
+/// @return MP_OK (c->svg holds the document), or an error code (also recorded).
+/// @error MP_ERR_ARG the size is out of range.
+/// @error MP_ERR_ALLOC the frame or the cache could not grow.
+/// @mem The cache (c->svg) belongs to the chart and grows only.
+/// @thread Call with the chart entered or locked.
+/// @internal
+export fn mp_svg_cached(c: MpChart*, w: float64, h: float64) -> int32 {
+  if (c->svg_ok && c->svg_seq == c->seq && c->svg_w == w && c->svg_h == h) { return MP_OK; }
+  if (c->svg == 0) { c->svg = mp_buf_new(4096); }
+  if (c->svg == 0) { return mp_chart_fail(c, MP_ERR_ALLOC); }
+  var t: MpTarget = mp_target(w, h);
+  var rc: int32 = svg_chart(c, &t, c->svg);
+  c->svg_ok = rc == MP_OK;
+  c->svg_seq = c->seq;
+  c->svg_w = w;
+  c->svg_h = h;
+  return rc;
+}
+
+/// The chart's SVG at w x h px from a chart-owned cache keyed by (seq, w, h).
+///
+/// @param c The chart. Valid: non-zero.
+/// @param w Width. Units: px. Valid: finite, in (0, 1e9).
+/// @param h Height. Units: px. Valid: finite, in (0, 1e9).
+/// @return The document, or "" when c is 0 or rendering failed (see mp_chart_error).
+/// @error MP_ERR_ARG the size is out of range ("" returned, error recorded).
+/// @error MP_ERR_ALLOC the frame or the cache could not grow ("" returned, error recorded).
+/// @mem Borrowed from the chart: valid while you hold mp_chart_lock and until the next
+///   render call; copy it to keep it.
+/// @thread Call between mp_chart_lock and mp_chart_unlock when other threads use c.
+/// @cost O(1) when cached; otherwise as mp_chart_svg.
+export fn mp_chart_svg_view(c: MpChart*, w: float64, h: float64) -> string {
+  if (c == 0) { return ""; }
+  mp_chart_enter(c);
+  var v: string = "";
+  if (mp_svg_cached(c, w, h) == MP_OK) { v = mp_buf_str(c->svg); }
+  mp_chart_leave(c);
+  return v;
 }
