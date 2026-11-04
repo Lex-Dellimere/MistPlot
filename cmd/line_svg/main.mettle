@@ -1,0 +1,57 @@
+// cmd/line_svg — prints the line-chart fixture as SVG on stdout. check.sh
+// compares its debug and release output byte for byte with
+// tests/golden/line.svg, so the golden is enforced instead of documentary.
+// The fixture is the one src/integration_test.mettle renders (two series of 13
+// points, a title with `&` and `<`, both axis titles).
+//
+// Regenerate the golden only on purpose, after looking at the new chart:
+//   ../Mettle/bin/mettle --build cmd/line_svg/main.mettle -o build/line_svg
+//   build/line_svg > tests/golden/line.svg
+
+import "std/io";
+import "std/mem";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/data";
+import "mistplot/renderer/backend";
+import "mistplot/chart/spec";
+import "mistplot/backends/web/page";
+
+fn push(ser: MpSeries*, ys: float64*) {
+  var i: int32 = 0;
+  while (i < 13) { mp_series_push(ser, (float64)i, ys[(int64)i]); i = i + 1; }
+}
+
+// The names are literals, so only the columns are freed.
+fn drop(ser: MpSeries*) {
+  if (ser->xs != 0) { free(ser->xs); }
+  if (ser->ys != 0) { free(ser->ys); }
+}
+
+export fn main() -> int32 {
+  var api: float64[13] = [14.0, 22.0, 19.0, 31.0, 44.0, 39.0, 52.0, 63.0, 58.0,
+                          71.0, 84.0, 78.0, 93.0];
+  var cache: float64[13] = [9.0, 12.0, 17.0, 15.0, 24.0, 31.0, 28.0, 37.0, 45.0,
+                            41.0, 52.0, 61.0, 57.0];
+  var ser: MpSeries[] = new MpSeries[2];
+  ser[0].name = "api"; ser[0].xs = 0; ser[0].ys = 0; ser[0].n = 0; ser[0].cap = 0;
+  ser[1].name = "cache"; ser[1].xs = 0; ser[1].ys = 0; ser[1].n = 0; ser[1].cap = 0;
+  defer free(ser.data);
+  push(&ser[0], &api[0]);
+  push(&ser[1], &cache[0]);
+  defer drop(&ser[0]);
+  defer drop(&ser[1]);
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, &ser[0], 2);
+  spec.title = "Throughput & latency <budget>";
+  spec.subtitle = "13 samples, 2 series";
+  spec.x_label = "seconds";
+  spec.y_label = "req/s";
+  var o: MpRenderOpts = mp_render_opts(640.0, 400.0, spec.theme);
+  var b: MpBuf* = mp_buf_new(8192);
+  if (b == 0) { return 1; }
+  defer mp_buf_free(b);
+  if (mp_chart_svg(&spec, &o, b) != MP_OK) { return 1; }
+  var s: string = mp_buf_str(b);
+  print("{s}");
+  return 0;
+}
