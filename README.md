@@ -99,9 +99,14 @@ fn h_live(ctx: RzContext*) -> int32 { return mp_raize_live_serve(ctx, g_rl); }
 - To put a chart in a template, use a raw placeholder (`{{{chart}}}`) and
   `mp_raize_tpl_figure`. The buffer it fills must outlive
   `rz_template_render_into`.
-- RaizeWeb has no streaming, so live charts are polled. The page embeds the
-  current frame plus a small script (`mp_raize_tpl_live`) that polls with
-  `If-None-Match`. An unchanged chart costs a 304 and no render.
+- The page embeds the current frame plus a small script (`mp_raize_tpl_live`)
+  that polls with `If-None-Match`. An unchanged chart costs a 304 and no render.
+- With channels, the page is told about new frames instead:
+  `mp_raize_live_channel` registers the chart on a topic, `mp_raize_live_notify`
+  (after a batch of pushes) broadcasts the new ETag, and the page
+  (`mp_raize_tpl_live_ws`) fetches the frame through the same ETag route. The
+  socket carries only the tag because RaizeWeb's outgoing WebSocket data has no
+  backpressure. While the socket is down, the page polls.
 - `MpRaizeLive` wraps an `MpLive` with a lock and an SVG cache.
   `mp_raize_live_push` and `mp_raize_live_serve` lock for you. Anything else
   that touches the `MpLive` goes between `mp_raize_live_lock` and

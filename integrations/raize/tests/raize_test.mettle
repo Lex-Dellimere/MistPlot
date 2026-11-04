@@ -10,13 +10,19 @@
 // listed and `*` If-None-Match, 500 on a render failure), the template helper,
 // the live endpoint (gen-seq ETag, cached bytes reused per seq, one render per
 // push, generation mismatch after a restart), the embed snippet with the
-// current frame, and the generation stamp.
+// current frame (polling and channel variants), the generation stamp, and the
+// channel registry: registration errors, the join reply's tag, refusal of an
+// unregistered topic, handle_in, notice coalescing and a notice kept pending
+// while the hub's mailbox is full. The channel callbacks are called through
+// the router's definition table with a hand-built RzChanCtx; the hub is never
+// given a socket.
 //
 // Deterministic apart from the generation, which is read once from the clock
 // and compared only through mp_live_generation. Exit code 0 on pass.
 
 import "std/io";
 import "std/mem";
+import "std/thread";
 import "mistplot/harness";
 import "mistplot/core/buf";
 import "mistplot/core/color";
@@ -31,6 +37,7 @@ import "raize/framework/context/context";
 import "raize/framework/router/router";
 import "raize/framework/template/template";
 import "raize/framework/template/vars";
+import "raize/framework/channel/channel";
 import "../mp_raize";
 
 var g_rt: RzRouter* = 0;
@@ -480,6 +487,228 @@ fn main() -> int32 {
   check_template();
   check_live();
   check_generation();
+  check_channel();
   teardown();
   return mp_summary();
+}
+
+// ---------------------------------------------------------------------------
+// Channel push
+// ---------------------------------------------------------------------------
+
+// The router's definition for `topic`, or -1.
+fn def_for(chans: RzChanRouter*, topic: string) -> int32 {
+  var i: int32 = 0;
+  while (i < chans->ndefs) {
+    if (raize_str_eq(chans->defs[i].pattern, topic)) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+// `{"tag":"<gen>-<seq>"}` into out; returns the view.
+fn tag_json(gen: int64, seq: int64, out: uint8*) -> string {
+  var tb: uint8[64];
+  var t: string = seq_tag(gen, seq, &tb[0]);
+  var pre: string = "{{\"tag\":";
+  var n: int64 = (int64)pre.length;
+  var m: int64 = (int64)t.length;
+  var i: int64 = 0;
+  while (i < n) {
+    out[i] = pre.chars[i];
+    i = i + 1;
+  }
+  i = 0;
+  while (i < m) {
+    out[n + i] = t.chars[i];
+    i = i + 1;
+  }
+  out[n + m] = 125;
+  return str_from_bytes((cstring)out, n + m + 1);
+}
+
+// The registered callbacks, called the way the router calls them.
+fn call_join(chans: RzChanRouter*, d: int32, c: RzChanCtx*, payload: string) -> int32 {
+  return chans->defs[d].join(c, payload);
+}
+
+fn call_in(chans: RzChanRouter*, d: int32, c: RzChanCtx*, event: string,
+           payload: string) -> int32 {
+  return chans->defs[d].handle_in(c, event, payload);
+}
+
+fn call_leave(chans: RzChanRouter*, d: int32, c: RzChanCtx*) {
+  chans->defs[d].leave(c);
+}
+
+fn check_channel_embed(rl: MpRaizeLive*, lv: MpLive*) {
+  var want: MpBuf* = mp_buf_new(4096);
+  var frame: MpBuf* = mp_buf_new(4096);
+  var slot: MpBuf* = mp_buf_new(256);
+  defer mp_buf_free(want);
+  defer mp_buf_free(frame);
+  defer mp_buf_free(slot);
+  mp_expect("ws frame", mp_live_svg(lv, g_lopts, frame) == MP_OK);
+  mp_expect("ws embed ok", mp_live_embed_ws("/c.svg", "/socket/websocket", "chart:live",
+            500, mp_buf_str(frame), want) == MP_OK);
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  mp_expect("tpl_live_ws ok", mp_raize_tpl_live_ws(&vars, "live", rl, "/c.svg",
+            "/socket/websocket", "chart:live", 500, slot) == MP_OK);
+  mp_expect("tpl_live_ws == mp_live_embed_ws(current frame)",
+            rz_vars_get(&vars, "live") == mp_buf_str(want));
+  mp_expect("tpl_live_ws empty ws_url", mp_raize_tpl_live_ws(&vars, "x", rl, "/c.svg",
+            "", "chart:live", 500, slot) == MP_ERR_ARG);
+  mp_expect("tpl_live_ws empty topic", mp_raize_tpl_live_ws(&vars, "x", rl, "/c.svg",
+            "/socket/websocket", "", 500, slot) == MP_ERR_ARG);
+  var r0: int32 = mp_raize_live_renders(rl);
+  mp_expect("tpl_live_ws reuses the frame", mp_raize_tpl_live_ws(&vars, "y", rl,
+            "/c.svg", "/socket/websocket", "chart:live", 500, slot) == MP_OK);
+  mp_expect_i64("tpl_live_ws no extra render", (int64)mp_raize_live_renders(rl),
+                (int64)r0);
+}
+
+fn check_channel() {
+  var hub: RzHub* = rz_hub_new(rz_hub_opts_default());
+  mp_expect("hub", hub != 0);
+  if (hub == 0) { return; }
+  var chans: RzChanRouter* = rz_chan_router_new(hub, 0);
+  var lv: MpLive* = mp_live_new(MP_CHART_LINE, 1, 64);
+  mp_expect("chans + live", chans != 0 && lv != 0);
+  if (chans == 0 || lv == 0) {
+    rz_hub_free(hub);
+    rz_chan_router_free(chans);
+    mp_live_free(lv);
+    return;
+  }
+  mp_live_set_generation(lv, 77);
+  var rl: MpRaizeLive* = mp_raize_live_new(lv, g_lopts);
+  var other: MpRaizeLive* = mp_raize_live_new(lv, g_lopts);
+  mp_expect("channel rl", rl != 0 && other != 0);
+  if (rl == 0 || other == 0) { return; }
+  mp_raize_live_push(rl, 0, 0.0, 1.0);
+  mp_raize_live_push(rl, 0, 1.0, 2.0);
+
+  mp_expect_i64("notify unregistered", (int64)mp_raize_live_notify(rl),
+                (int64)MP_ERR_STATE);
+  mp_expect_i64("notify null", (int64)mp_raize_live_notify(0), (int64)MP_ERR_ARG);
+  mp_expect_i64("channel null rl", (int64)mp_raize_live_channel(0, chans, "t"),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("channel null router", (int64)mp_raize_live_channel(rl, 0, "t"),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("channel empty topic", (int64)mp_raize_live_channel(rl, chans, ""),
+                (int64)MP_ERR_ARG);
+  var long: uint8[300];
+  memset((rawptr)&long[0], 97, 300);
+  mp_expect_i64("channel topic over 256 bytes", (int64)mp_raize_live_channel(rl, chans,
+                str_from_bytes((cstring)&long[0], 257)), (int64)MP_ERR_ARG);
+  var topic: uint8[16];
+  var lit: string = "chart:live";
+  memcpy((rawptr)&topic[0], (rawptr)lit.chars, 10);
+  mp_expect_i64("channel ok", (int64)mp_raize_live_channel(rl, chans,
+                str_from_bytes((cstring)&topic[0], 10)), (int64)MP_OK);
+  // The topic was copied: the caller's bytes may change.
+  topic[0] = 88;
+  mp_expect_i64("channel twice", (int64)mp_raize_live_channel(rl, chans, "chart:b"),
+                (int64)MP_ERR_STATE);
+  mp_expect_i64("channel topic taken", (int64)mp_raize_live_channel(other, chans,
+                "chart:live"), (int64)MP_ERR_STATE);
+  var d: int32 = def_for(chans, "chart:live");
+  mp_expect("topic defined as a channel", d >= 0);
+  mp_expect_i64("one definition", (int64)chans->ndefs, (int64)1);
+  if (d < 0) { return; }
+
+  // Join: the reply carries the current tag.
+  var reply: RaizeBuf* = raize_buf_new();
+  var c: RzChanCtx;
+  c.router = chans;
+  c.hub = hub;
+  c.sock = 7;
+  c.topic = "chart:live";
+  c.join_ref = "\"1\"";
+  c.state = 0;
+  c.reply = reply;
+  var jb: uint8[96];
+  var want: string = tag_json(77, mp_raize_live_seq(rl), &jb[0]);
+  mp_expect_i64("join accepted", (int64)call_join(chans, d, &c, "{{}"), 0);
+  mp_expect_str("join reply is the tag", raize_buf_str(reply), want);
+  mp_expect("join leaves no state", c.state == 0);
+  // The ETag the route sends for this seq is the same string as the tag.
+  var tb: uint8[64];
+  mp_expect("join tag == route etag", raize_str_contains(want,
+            seq_tag(77, mp_raize_live_seq(rl), &tb[0])));
+
+  // A topic that reaches the callback without a registration is refused.
+  reply->len = 0;
+  c.topic = "chart:gone";
+  mp_expect("unknown topic refused", call_join(chans, d, &c, "{{}") != 0);
+  mp_expect_str("refusal reason", raize_buf_str(reply), "{{\"reason\":\"unknown chart\"}");
+  c.topic = "chart:live";
+
+  reply->len = 0;
+  mp_expect_i64("heartbeat ok", (int64)call_in(chans, d, &c, "heartbeat", "{{}"), 0);
+  mp_expect_str("heartbeat reply", raize_buf_str(reply), "{{}");
+  reply->len = 0;
+  mp_expect("other event refused", call_in(chans, d, &c, "set", "{{}") != 0);
+  mp_expect_str("other event reason", raize_buf_str(reply),
+                "{{\"reason\":\"unknown event\"}");
+  call_leave(chans, d, &c);
+  raize_buf_free(reply);
+
+  // Notices: one per moved seq, coalesced across pushes.
+  mp_expect_i64("first notify", (int64)mp_raize_live_notify(rl), (int64)MP_OK);
+  mp_expect_i64("one notice", (int64)mp_raize_live_notices(rl), 1);
+  mp_expect_i64("unchanged notify", (int64)mp_raize_live_notify(rl), (int64)MP_OK);
+  mp_expect_i64("no notice without a change", (int64)mp_raize_live_notices(rl), 1);
+  var i: int32 = 0;
+  while (i < 5) {
+    mp_raize_live_push(rl, 0, 2.0 + (float64)i, 3.0);
+    i = i + 1;
+  }
+  mp_expect_i64("notify after 5 pushes", (int64)mp_raize_live_notify(rl), (int64)MP_OK);
+  mp_expect_i64("5 pushes, one notice", (int64)mp_raize_live_notices(rl), 2);
+  mp_expect_i64("other rl unregistered", (int64)mp_raize_live_notify(other),
+                (int64)MP_ERR_STATE);
+
+  check_channel_embed(rl, lv);
+
+  // Mailbox full: the notice stays pending and goes out once there is room.
+  var filled: int32 = 0;
+  while (filled < 100000 && rz_hub_post_close(hub, 0, 1000)) { filled = filled + 1; }
+  mp_expect("mailbox filled", filled > 0 && filled < 100000);
+  mp_raize_live_push(rl, 0, 9.0, 1.0);
+  mp_expect_i64("notify into a full mailbox", (int64)mp_raize_live_notify(rl),
+                (int64)MP_ERR_IO);
+  mp_expect_i64("still pending", (int64)mp_raize_live_notify(rl), (int64)MP_ERR_IO);
+  mp_expect_i64("no notice counted", (int64)mp_raize_live_notices(rl), 2);
+  mp_expect("hub starts", rz_hub_start(hub) == 0);
+  var rc: int32 = MP_ERR_IO;
+  var tries: int32 = 0;
+  while (rc == MP_ERR_IO && tries < 200) {
+    thread_sleep_ms((uint32)10);
+    rc = mp_raize_live_notify(rl);
+    tries = tries + 1;
+  }
+  mp_expect_i64("pending notice posted once drained", (int64)rc, (int64)MP_OK);
+  mp_expect_i64("pending notice counted", (int64)mp_raize_live_notices(rl), 3);
+  mp_expect_i64("then nothing pending", (int64)mp_raize_live_notify(rl), (int64)MP_OK);
+  mp_expect_i64("still three notices", (int64)mp_raize_live_notices(rl), 3);
+
+  rz_hub_free(hub);
+  rz_chan_router_free(chans);
+  mp_raize_live_free(other);
+  mp_raize_live_free(rl);
+
+  // Freeing dropped the registration: the topic is free on a new router.
+  var hub2: RzHub* = rz_hub_new(rz_hub_opts_default());
+  var chans2: RzChanRouter* = rz_chan_router_new(hub2, 0);
+  var rl2: MpRaizeLive* = mp_raize_live_new(lv, g_lopts);
+  if (hub2 != 0 && chans2 != 0 && rl2 != 0) {
+    mp_expect_i64("topic reusable after free", (int64)mp_raize_live_channel(rl2, chans2,
+                  "chart:live"), (int64)MP_OK);
+  }
+  rz_hub_free(hub2);
+  rz_chan_router_free(chans2);
+  mp_raize_live_free(rl2);
+  mp_live_free(lv);
 }

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Builds the RaizeWeb integration's test and example in debug and release, runs
-# the test in both modes, smoke-tests the example server with curl and checks
-# its embed script with node. Prints PASS or FAIL.
+# the test in both modes, smoke-tests the example server with curl, checks
+# channel push end to end with python (RaizeWeb's ws_client.py, imported from
+# ../raize_web) and checks both embed scripts with node. Prints PASS or FAIL.
 #
 # Needs ../raize_web next to this repo (mettle.deps maps raize=../raize_web).
 # Env: METTLE (compiler, default ../Mettle/bin/mettle next to this repo),
-#      SMOKE_PORT (default 18088).
+#      SMOKE_PORT (default 18088; the push check uses SMOKE_PORT + 1).
 
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -47,7 +48,7 @@ for mode in debug release; do
 done
 
 # Starts the release dashboard with --run-for (it stops itself), probes the
-# three routes and the 304 path, then waits for a clean exit.
+# routes and the 304 path, then waits for a clean exit.
 smoke() {
   local bin="$OUT/dashboard.release" base="http://127.0.0.1:$SMOKE_PORT"
   [ -x "$bin" ] || return 1
@@ -63,6 +64,7 @@ smoke() {
   code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
   [ "$(code "$base/")" = 200 ] || ok=1
   curl -s -o "$OUT/page.html" "$base/" || ok=1
+  curl -s -o "$OUT/fragment.html" "$base/chart/live.html" || ok=1
   [ "$(code "$base/chart/static.svg")" = 200 ] || ok=1
   local etag
   etag="$(curl -s -D - -o /dev/null "$base/chart/live.svg" | tr -d '\r' |
@@ -82,8 +84,36 @@ else
   echo "skip  smoke-example-release (no curl)"
 fi
 
+# A second dashboard for the channel check, so its timing does not depend on
+# the smoke run.
+push() {
+  local bin="$OUT/dashboard.release" port=$((SMOKE_PORT + 1))
+  [ -x "$bin" ] || return 1
+  "$bin" --port "$port" --run-for 6 > "$OUT/push-server.log" 2>&1 &
+  local pid=$!
+  local up=0
+  for _ in $(seq 1 30); do
+    if curl -s -o /dev/null "http://127.0.0.1:$port/chart/static.svg"; then up=1; break; fi
+    sleep 0.1
+  done
+  [ "$up" = 1 ] || { kill "$pid" 2>/dev/null; wait "$pid"; return 1; }
+  local ok=0
+  python3 integrations/raize/tests/push_check.py "$port" ../raize_web || ok=1
+  wait "$pid" || ok=1
+  return $ok
+}
+if command -v python3 > /dev/null && command -v curl > /dev/null &&
+   [ -f ../raize_web/tests/integration/ws_client.py ]; then
+  step "push-example-release" push
+  grep -E '^(PASS|FAIL)  |^push ' "$OUT/push-example-release.log" | sed 's/^/      /'
+else
+  echo "skip  push-example-release (no python3, curl or ws_client.py)"
+fi
+
 if command -v node > /dev/null && [ -s "$OUT/page.html" ]; then
-  step "node-embed-check" node integrations/raize/tests/embed_check.js "$OUT/page.html"
+  step "node-embed-check" node integrations/raize/tests/embed_check.js "$OUT/page.html" \
+    "$OUT/fragment.html"
+  echo "      $(tail -n 1 "$OUT/node-embed-check.log")"
 else
   echo "skip  node-embed-check (no node or no page)"
 fi

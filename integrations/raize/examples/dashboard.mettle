@@ -4,12 +4,18 @@
 //   GET /                  HTML page with the bar chart <figure> ({{{bar}}})
 //                          and the live-chart embed ({{{live}}})
 //   GET /chart/static.svg  the bar chart as image/svg+xml
-//   GET /chart/live.svg    the live line chart, polled by the embed
+//   GET /chart/live.svg    the live line chart, fetched by the embed
+//   GET /chart/live.html   the polling embed alone, as an HTML fragment
+//   GET /socket/websocket  the channel socket; topic "chart:live" announces
+//                          each new frame's tag
 //
-// A producer thread pushes a 10 s sine plus noise four times a second; x is
+// A producer thread pushes a 10 s sine plus noise four times a second and
+// calls mp_raize_live_notify after each push, so joined pages fetch the new
+// frame at once; a page whose socket is down polls every second instead. x is
 // seconds since start and the chart shows the last 60 s. All MpLive access
-// goes through MpRaizeLive's lock. The static spec and the template are built
-// before the server starts and are read-only afterwards.
+// goes through MpRaizeLive's lock. The static spec, the template and the
+// channel registration are set up before the server starts and are read-only
+// afterwards.
 //
 // Build and run from the mistplot repo root:
 //   mettle --build integrations/raize/examples/dashboard.mettle \
@@ -19,7 +25,8 @@
 //   ./build/integrations/raize/dashboard --run-for 10    # stop cleanly after 10 s
 //
 // With --run-for N a stopper thread calls rz_server_stop after N seconds; the
-// workers and the producer are joined and everything is freed before exit.
+// workers and the producer are joined and everything is freed before exit, in
+// RaizeWeb's order: server, producer, hub, channel router, then MistPlot.
 
 import "std/io";
 import "std/mem";
@@ -35,6 +42,7 @@ import "raize/framework/middleware/logging";
 import "raize/framework/middleware/recover";
 import "raize/framework/template/template";
 import "raize/framework/template/vars";
+import "raize/framework/channel/channel";
 import "mistplot/core/buf";
 import "mistplot/core/color";
 import "mistplot/core/data";
@@ -48,6 +56,8 @@ const DASH_INTERVAL_MS: int32 = 1000;
 const DASH_PUSH_MS: uint32 = 250;
 const DASH_WINDOW_S: float64 = 60.0;
 const DASH_RING: int64 = 4096;
+const DASH_TOPIC: string = "chart:live";
+const DASH_SOCKET: string = "/socket/websocket";
 
 // Embedded at compile time (no cwd-relative path at run time). import_str
 // bytes are not interpolated, so the template's `{{name}}` is written as is.
@@ -68,6 +78,8 @@ var g_bar_opts: MpRenderOpts* = 0;
 var g_lv: MpLive* = 0;
 var g_live_opts: MpRenderOpts* = 0;
 var g_rl: MpRaizeLive* = 0;
+var g_hub: RzHub* = 0;
+var g_chans: RzChanRouter* = 0;
 var g_srv: RzServer* = 0;
 var g_stop: int32 = 0;        // producer stop flag (atomic)
 var g_run_for: int32 = 0;     // seconds; 0 = run until killed
@@ -93,8 +105,8 @@ fn h_index(ctx: RzContext*) -> int32 {
   rz_vars_set(&vars, "interval", raize_int_buf((int64)DASH_INTERVAL_MS, &ibuf[0], 24));
   var r1: int32 = mp_raize_tpl_figure(&vars, "bar", g_bar, g_bar_opts, bar);
   // The embed carries the current frame, so the page paints immediately.
-  var r2: int32 = mp_raize_tpl_live(&vars, "live", g_rl, "/chart/live.svg",
-                                    DASH_INTERVAL_MS, live);
+  var r2: int32 = mp_raize_tpl_live_ws(&vars, "live", g_rl, "/chart/live.svg",
+                                       DASH_SOCKET, DASH_TOPIC, DASH_INTERVAL_MS, live);
   if (r1 != MP_OK || r2 != MP_OK) {
     rz_ctx_text(ctx, 500, "chart render failed\n");
     return 500;
@@ -116,6 +128,14 @@ fn h_static_svg(ctx: RzContext*) -> int32 {
 
 fn h_live_svg(ctx: RzContext*) -> int32 {
   return mp_raize_live_serve(ctx, g_rl);
+}
+
+fn h_live_html(ctx: RzContext*) -> int32 {
+  return mp_raize_live_embed(ctx, g_rl, "/chart/live.svg", DASH_INTERVAL_MS);
+}
+
+fn h_socket(ctx: RzContext*) -> int32 {
+  return rz_chan_upgrade(ctx, g_chans);
 }
 
 fn handle_route(ctx: RzContext*) -> int32 {
@@ -148,6 +168,8 @@ export fn dash_producer_main(arg: cstring) -> uint32 {
     var u: float64 = (float64)xorshift32(&rng) / 4294967296.0;
     var y: float64 = sin(t * 6.283185307179586 / 10.0) + (u - 0.5) * 0.4;
     if (mp_raize_live_push(g_rl, 0, t, y) == MP_OK) { pushed = pushed + (uint32)1; }
+    // A full mailbox keeps the notice pending for the next tick.
+    mp_raize_live_notify(g_rl);
     thread_sleep_ms(DASH_PUSH_MS);
   }
   return pushed;
@@ -243,6 +265,16 @@ fn build_live() -> bool {
   return true;
 }
 
+// The hub thread runs from here on; it has no sockets until the server does.
+fn build_channels() -> bool {
+  g_hub = rz_hub_new(rz_hub_opts_default());
+  if (g_hub == 0) { return false; }
+  if (rz_hub_start(g_hub) != 0) { return false; }
+  g_chans = rz_chan_router_new(g_hub, 0);
+  if (g_chans == 0) { return false; }
+  return mp_raize_live_channel(g_rl, g_chans, DASH_TOPIC) == MP_OK;
+}
+
 fn build_web() -> int32 {
   g_tpl = rz_template_new();
   if (g_tpl == 0) { return 1; }
@@ -262,8 +294,10 @@ fn build_web() -> int32 {
   var a0: int32 = rz_router_add(g_router, "GET", "/", &h_index);
   var a1: int32 = rz_router_add(g_router, "GET", "/chart/static.svg", &h_static_svg);
   var a2: int32 = rz_router_add(g_router, "GET", "/chart/live.svg", &h_live_svg);
-  if (a0 != RZ_E_OK || a1 != RZ_E_OK || a2 != RZ_E_OK) {
-    println("dashboard: route registration failed {a0} {a1} {a2}");
+  var a3: int32 = rz_router_add(g_router, "GET", "/chart/live.html", &h_live_html);
+  var a4: int32 = rz_router_add(g_router, "GET", DASH_SOCKET, &h_socket);
+  if (a0 != RZ_E_OK || a1 != RZ_E_OK || a2 != RZ_E_OK || a3 != RZ_E_OK || a4 != RZ_E_OK) {
+    println("dashboard: route registration failed {a0} {a1} {a2} {a3} {a4}");
     return 4;
   }
   g_rec = rz_recover_new();
@@ -294,30 +328,37 @@ fn teardown() {
   mp_series_free(g_bar_series);
 }
 
+// A setup failure after the hub started: stop and join its thread first.
+fn dash_fail(msg: string) -> int32 {
+  println(msg);
+  rz_hub_free(g_hub);
+  rz_chan_router_free(g_chans);
+  return 1;
+}
+
 fn main(argc: int32, argv: cstring*) -> int32 {
   var port: int32 = DASH_PORT;
   parse_args(argc, argv, &port);
   if (!build_bar()) { println("dashboard: bar chart setup failed"); return 1; }
   if (!build_live()) { println("dashboard: live chart setup failed"); return 1; }
+  if (!build_channels()) { return dash_fail("dashboard: channel setup failed"); }
   var wrc: int32 = build_web();
-  if (wrc != 0) { println("dashboard: web setup failed ({wrc})"); return 1; }
+  if (wrc != 0) { return dash_fail("dashboard: web setup failed ({wrc})"); }
   var handler: fn(RzContext*) -> int32 = rz_chain_handler(g_chain);
   if (handler == (fn(RzContext*) -> int32)0) {
-    println("dashboard: chain mount failed");
-    return 1;
+    return dash_fail("dashboard: chain mount failed");
   }
 
   var opts: RzServerOpts = rz_server_opts_default();
   opts.port = port;
   g_srv = rz_server_new(opts);
-  if (g_srv == 0) { println("dashboard: server_new failed"); return 1; }
+  if (g_srv == 0) { return dash_fail("dashboard: server_new failed"); }
   if (rz_server_set_handler(g_srv, handler) != 0) {
-    println("dashboard: set_handler failed");
-    return 1;
+    return dash_fail("dashboard: set_handler failed");
   }
 
   var producer: int64 = CreateThread(0, 0, &dash_producer_main, 0, 0, 0);
-  if (producer <= 0) { println("dashboard: producer thread failed"); return 1; }
+  if (producer <= 0) { return dash_fail("dashboard: producer thread failed"); }
   var stopper: int64 = 0;
   if (g_run_for > 0) {
     stopper = CreateThread(0, 0, &dash_stopper_main, 0, 0, 0);
@@ -339,7 +380,12 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   thread_close(producer);
   var seq: int64 = mp_raize_live_seq(g_rl);
   var renders: int32 = mp_raize_live_renders(g_rl);
-  println("dashboard: stopped; live seq={seq} renders={renders}");
+  var notices: int32 = mp_raize_live_notices(g_rl);
+  println("dashboard: stopped; live seq={seq} renders={renders} notices={notices}");
+  // The hub runs notices still queued against the router, so it goes first;
+  // the router borrows the MpRaizeLive's topic, so it goes before teardown.
+  rz_hub_free(g_hub);
+  rz_chan_router_free(g_chans);
   rz_server_free(g_srv);
   teardown();
   if (rc != 0) { return 1; }
