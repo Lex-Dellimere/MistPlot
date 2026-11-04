@@ -1,182 +1,121 @@
-// integrations/mythic/mp_mythic — MistPlot charts inside MythicUI.
-//
-// A scene painter (every MpNode -> MythicUI paint calls inside a layout rect,
-// clipped to it, scene coords 1:1 with logical px), MythicUI's real text
-// measurement installed through mp_text_set_measure while a chart renders, and
-// two widget entry points that cache the rendered scene in a caller-owned
-// MpMythicChart: a static spec (mp_mythic_chart) and a live MpLive
-// (mp_mythic_live).
-//
-// Semantics follow backends/web/svg: fill is skipped when fill.a == 0, stroke
-// when stroke_w <= 0, node opacity multiplies the alpha, a TEXT node's y is the
-// top of its box and its baseline sits at y + size * 0.8, align start / center
-// / end is relative to x. MythicUI strokes are inside strokes, so a RECT stroke
-// is drawn on the rect grown by stroke_w / 2 (centred, like SVG).
-//
-// Naming follows MythicUI: callbacks are mp_mythic_*_cb and every export is
-// mp_mythic_ / MpMythic / MP_MYTHIC_.
-//
-// Geometry: hover reads the frame's MpChartInfo (plot rect, final scales,
-// resolved domains, effective label formats) — mp_mythic_render_info for the
-// static widget, mp_live_info / mp_live_view for the live one — so nothing
-// here re-derives chart/resolve's domain rules or reads MpLive internals.
-//
-// Measurement: every render saves core/text's current measurer
-// (mp_text_measure_fn / _ctx), installs MythicUI's, and restores the saved
-// one afterwards, so an app's own measurer survives a MythicUI chart.
-//
-// Lifetimes: the paint callbacks run after the frame callback's passes, so the
-// widget copies the caller's MpChartSpec into the state object. The spec's
-// series arrays and strings stay borrowed and must be alive until the end of
-// the frame in which mp_mythic_chart was called.
+//! MistPlot charts inside MythicUI: a stateless widget for static and live charts, a scene
+//! painter, the MythicUI theme as a chart theme, and HiDPI PNG export through the headless
+//! platform. Depends on mythic/mythic and the MistPlot chart, frame, pick and scene modules.
+//! The widget keeps no state: the chart caches its scene per target (logical box size,
+//! device scale and a measurer key over MythicUI's fonts), so a frame rebuilds the scene
+//! only when the chart's seq, the box size or the scale changed. Scene px are logical px;
+//! painting snaps axis-aligned lines to whole device px and keeps data lines anti-aliased.
 
-import "std/mem";
 import "std/math";
 import "mythic/mythic";
-import "mistplot/core/buf";
+import "mistplot/core/error";
 import "mistplot/core/color";
-import "mistplot/core/data";
-import "mistplot/core/format";
 import "mistplot/core/geom";
-import "mistplot/core/scale";
-import "mistplot/core/text";
-import "mistplot/renderer/scene";
-import "mistplot/chart/spec";
-import "mistplot/chart/resolve";
-import "mistplot/live/stream";
+import "mistplot/core/target";
+import "mistplot/scene/scene";
+import "mistplot/scene/path";
+import "mistplot/chart/chart";
+import "mistplot/chart/config";
+import "mistplot/chart/frame";
+import "mistplot/chart/pick";
 
-// Caller-owned widget state: the cached scene and what it was built for.
-export struct MpMythicChart {
-  scene: MpScene*;          // owned; the last rendered scene
-  spec: MpChartSpec;        // static widget: copy of the caller's spec
-  has_spec: bool;
-  live: MpLive*;            // live widget: borrowed MpLive (set by mp_mythic_live)
-  w: float32; h: float32;   // logical size the cached scene was rendered at
-  scale: float32;           // painter scale it was measured at
-  key: uint64;              // static: fingerprint of the spec at the last render
-  live_seq: int64;          // live: mp_live_seq at the last paint
-  renders: int64;           // number of times a scene was (re)built
-  paints: int64;            // number of paint callbacks
-  last_rc: int32;           // MP_* code of the last render
-  dirty: bool;              // force a re-render at the next paint
-  auto_theme: bool;         // follow the MythicUI theme (default true)
-  hover: bool;              // hover guide + readout (default: false static, true live)
-  frame_ms: int32;          // live: next frame requested this many ms ahead (0 = none)
-  hover_on: bool;           // a hover guide was drawn in the last paint
-  hover_x: float32;         // its x, logical px
-  hover_xv: float64;        // data x shown in the readout (nearest sample)
-  rect: MythicRect;         // the box's rect at the last paint (logical px)
-  info: MpChartInfo;        // static widget: geometry of the cached scene
-}
+/// Live charts (mp_chart_keep or mp_chart_window set) ask MythicUI for the next frame this
+/// many milliseconds ahead. Units: ms.
+export const MP_MYTHIC_FRAME_MS: int32 = 16;
 
-// Context of mp_mythic_text_measure_cb: MythicUI fonts at a device scale.
-export struct MpMythicMeasure { fonts: MythicFonts*; scale: float32; }
+const MM_FLATTEN_PX: float64 = 0.25;   // cubic flattening tolerance, logical px
+const MM_TIP_SIZE: float64 = 12.0;     // hover readout text size
+const MM_TIP_ROW: float64 = 18.0;
+const MM_TIP_PAD: float64 = 8.0;
+const MM_TIP_SW: float64 = 8.0;        // readout swatch
 
-const MM_BASELINE: float64 = 0.8;   // same em-box baseline as backends/web/svg
-const MM_MAX_SERIES: int32 = 32;    // MP_CHART_MAX_SERIES
+// ---------------------------------------------------------------- colours and theme
 
-// ---------------------------------------------------------------- colors and theme
-
-fn mm_argb(c: MpColor, opacity: float64) -> uint32 {
-  var o: float64 = opacity;
-  if (o != o) { o = 1.0; }
-  if (o < 0.0) { o = 0.0; }
-  if (o > 1.0) { o = 1.0; }
-  var a: int32 = (int32)((float64)c.a * o + 0.5);
-  if (a > 255) { a = 255; }
-  return ((uint32)a << 24) | ((uint32)c.r << 16) | ((uint32)c.g << 8) | (uint32)c.b;
+fn mm_argb(c: MpColor) -> uint32 {
+  return ((uint32)c.a << 24) | ((uint32)c.r << 16) | ((uint32)c.g << 8) | (uint32)c.b;
 }
 
 fn mm_color(argb: uint32) -> MpColor {
-  return mp_color_a((uint8)((argb >> 16) & (uint32)255),
-                    (uint8)((argb >> 8) & (uint32)255),
-                    (uint8)(argb & (uint32)255),
-                    (uint8)((argb >> 24) & (uint32)255));
+  return mp_rgba((uint8)((argb >> 16) & (uint32)255), (uint8)((argb >> 8) & (uint32)255),
+                 (uint8)(argb & (uint32)255), (uint8)((argb >> 24) & (uint32)255));
 }
 
-// MpTheme mapped from the active MythicUI theme: chart background = surface,
-// text = primary, tick labels = secondary, grid = subtle border, axes = strong
-// border.
+// Channel-wise mean of two colours: MythicUI has no gradient path fill.
+fn mm_mean(a: MpColor, b: MpColor) -> MpColor {
+  return mp_rgba((uint8)(((int32)a.r + (int32)b.r + 1) / 2), (uint8)(((int32)a.g + (int32)b.g + 1) / 2),
+                 (uint8)(((int32)a.b + (int32)b.b + 1) / 2), (uint8)(((int32)a.a + (int32)b.a + 1) / 2));
+}
+
+/// The active MythicUI theme as a chart theme: background = surface, title and text =
+/// primary text, ticks and subtitle = secondary text, grid = subtle border, baseline =
+/// strong border; the palette is MistPlot's (Observable-10).
+///
+/// @param ui The MythicUI context. Valid: any; 0 gives mp_theme_light().
+/// @return The theme (name "light" or "dark", following the MythicUI theme).
+/// @mem ui is only read.
+/// @thread The UI thread.
 export fn mp_mythic_theme(ui: MythicUi*) -> MpTheme {
-  var t: MythicTheme* = mythic_theme(ui);
-  var o: MpTheme;
-  if (t->dark) { o.name = "mythic-dark"; } else { o.name = "mythic-light"; }
-  o.bg = mm_color(t->colors.bg_surface);
-  o.fg = mm_color(t->colors.text_primary);
-  o.muted = mm_color(t->colors.text_secondary);
-  o.grid = mm_color(t->colors.border_subtle);
-  o.axis = mm_color(t->colors.border_strong);
-  return o;
+  var t: MpTheme = mp_theme_light();
+  if (ui == 0) { return t; }
+  var m: MythicTheme* = mythic_theme(ui);
+  if (m == 0) { return t; }
+  if (m->dark) { t = mp_theme_dark(); }
+  t.bg = mm_color(m->colors.bg_surface);
+  t.title = mm_color(m->colors.text_primary);
+  t.text = mm_color(m->colors.text_primary);
+  t.muted = mm_color(m->colors.text_secondary);
+  t.grid = mm_color(m->colors.border_subtle);
+  t.axis = mm_color(m->colors.border_strong);
+  t.fg = t.title;
+  return t;
 }
 
-// ---------------------------------------------------------------- text measurement
+// ---------------------------------------------------------------- text
 
-fn mm_style(size: float64) -> MythicTextStyle {
-  var st: MythicTextStyle = { font: MYTHIC_FONT_REGULAR, size: (float32)size,
-                              line_height: (float32)(size * 1.2), tracking: 0.0, flags: 0 };
+struct MmMeasure {
+  fonts: MythicFonts*;
+  scale: float32;
+}
+
+fn mm_style(size: float64, flags: int32) -> MythicTextStyle {
+  var font: int32 = MYTHIC_FONT_REGULAR;
+  if ((flags & MP_NF_BOLD) != 0) { font = MYTHIC_FONT_SEMIBOLD; }
+  var tf: int32 = 0;
+  if ((flags & MP_NF_TABULAR) != 0) { tf = MYTHIC_TEXT_TABULAR; }
+  var st: MythicTextStyle = { font: font, size: (float32)size, line_height: (float32)(size * 1.2),
+                              tracking: 0.0, flags: tf };
   return st;
 }
 
-fn mm_text_w(fonts: MythicFonts*, scale: float32, s: string, size: float64) -> float64 {
+// Width in logical px of s in the style of a text node, measured at device scale.
+fn mm_text_w(fonts: MythicFonts*, scale: float32, s: string, size: float64, flags: int32) -> float64 {
   if (fonts == 0 || s.length == (uint64)0 || !(size > 0.0)) { return 0.0; }
   var sc: float32 = scale;
   if (sc <= 0.0) { sc = 1.0; }
-  var w: float32 = mythic_text_width(fonts, mythic_paint_text_spec(sc, mm_style(size)), s);
+  var w: float32 = mythic_text_width(fonts, mythic_paint_text_spec(sc, mm_style(size, flags)), s);
   return (float64)(w / sc);
 }
 
-// mp_text_set_measure callback: width in logical px of `s` in MythicUI's
-// regular font at `size`, measured at the device scale in `ctx` (an
-// MpMythicMeasure*). Deliberately not exported: an exported function receives
-// a string parameter differently from what an indirect call through a
-// fn(rawptr, string, float64) pointer supplies, so an exported callback gets a
-// garbage string (see README.md, Compiler issues). Use
-// mp_mythic_measure_install.
-fn mp_mythic_text_measure_cb(ctx: rawptr, s: string, size: float64) -> float64 {
-  var m: MpMythicMeasure* = (MpMythicMeasure*)ctx;
+// Target measurer: MythicUI's regular font at the context's device scale.
+fn mm_measure_cb(ctx: rawptr, s: string, size: float64) -> float64 {
+  var m: MmMeasure* = (MmMeasure*)ctx;
   if (m == 0 || m->fonts == 0) { return (float64)s.length * size * 0.58; }
-  return mm_text_w(m->fonts, m->scale, s, size);
+  return mm_text_w(m->fonts, m->scale, s, size, 0);
 }
 
-// Restores core/text's default heuristic.
-fn mm_measure_reset() {
-  mp_text_reset_measure();
-}
-
-// Installs MythicUI text measurement (the fonts and scale in `m`, which must
-// stay alive until mp_mythic_measure_reset) as core/text's measurer.
-export fn mp_mythic_measure_install(m: MpMythicMeasure*) {
-  if (m == 0) { mm_measure_reset(); return; }
-  mp_text_set_measure(&mp_mythic_text_measure_cb, (rawptr)m);
-}
-
-// Restores core/text's default width heuristic.
-export fn mp_mythic_measure_reset() { mm_measure_reset(); }
-
-// mp_chart_render_info with MythicUI text measurement installed for the
-// duration of the call (fonts and scale from the painter). The measurer that
-// was active before (the default or an app's own) is restored afterwards.
-// `info` may be 0.
-export fn mp_mythic_render_info(p: MythicPainter*, spec: MpChartSpec*,
-                                out: MpScene*, info: MpChartInfo*) -> int32 {
-  var mp_mythic_prev_cb: fn(rawptr, string, float64) -> float64 = mp_text_measure_fn();
-  var prev_ctx: rawptr = mp_text_measure_ctx();
-  var m: MpMythicMeasure = { fonts: p->fonts, scale: p->scale };
-  mp_text_set_measure(&mp_mythic_text_measure_cb, (rawptr)&m);
-  var rc: int32 = mp_chart_render_info(spec, out, info);
-  mp_text_set_measure(mp_mythic_prev_cb, prev_ctx);
-  return rc;
-}
-
-// mp_chart_render with MythicUI text measurement (see mp_mythic_render_info).
-export fn mp_mythic_render(p: MythicPainter*, spec: MpChartSpec*,
-                           out: MpScene*) -> int32 {
-  return mp_mythic_render_info(p, spec, out, (MpChartInfo*)0);
+// The target of a box: its logical size at the painter's scale, measured with m (which
+// must outlive every render with the target).
+fn mm_target(m: MmMeasure*, w: float64, h: float64) -> MpTarget {
+  var t: MpTarget = mp_target_hidpi(w, h, (float64)m->scale);
+  var key: uint64 = mythic_hash_u64((uint64)0x6D70, (uint64)m->fonts);
+  key = mythic_hash_u64(key, (uint64)(int64)mythic_iround(m->scale * 65536.0));
+  mp_target_set_measure(&t, &mm_measure_cb, (rawptr)m, key);
+  return t;
 }
 
 // ---------------------------------------------------------------- scene painter
 
-fn mm_zero_corners() -> MythicCorners {
+fn mm_zero() -> MythicCorners {
   var z: MythicCorners = { tl: 0.0, tr: 0.0, br: 0.0, bl: 0.0 };
   return z;
 }
@@ -187,122 +126,304 @@ fn mm_rect(x: float64, y: float64, w: float64, h: float64) -> MythicRect {
 }
 
 fn mm_paint_rect(p: MythicPainter*, nd: MpNode*, ox: float64, oy: float64) {
-  var z: MythicCorners = mm_zero_corners();
   if (nd->fill.a != (uint8)0) {
-    mythic_paint_fill(p, mm_rect(ox + nd->x, oy + nd->y, nd->w, nd->h), z,
-                      mm_argb(nd->fill, nd->opacity));
+    mythic_paint_fill(p, mm_rect(ox + nd->x, oy + nd->y, nd->w, nd->h), mm_zero(), mm_argb(nd->fill));
   }
   if (nd->stroke_w > 0.0 && nd->stroke.a != (uint8)0) {
+    // MythicUI strokes inside the rect; a scene stroke is centred on the edge
     var hw: float64 = nd->stroke_w * 0.5;
-    var r: MythicRect = mm_rect(ox + nd->x - hw, oy + nd->y - hw,
-                                nd->w + nd->stroke_w, nd->h + nd->stroke_w);
-    mythic_paint_stroke(p, r, z, (float32)nd->stroke_w, mm_argb(nd->stroke, nd->opacity));
+    var r: MythicRect = mm_rect(ox + nd->x - hw, oy + nd->y - hw, nd->w + nd->stroke_w,
+                                nd->h + nd->stroke_w);
+    mythic_paint_stroke(p, r, mm_zero(), (float32)nd->stroke_w, mm_argb(nd->stroke));
   }
 }
 
-// Axis-aligned segments are filled rects (crisp, whole device px, butt caps as
-// in SVG); anything else is a 2-point path stroke.
-fn mm_segment(p: MythicPainter*, x0: float64, y0: float64, x1: float64,
-              y1: float64, w: float64, c: uint32) {
-  var minw: float64 = 1.0 / (float64)p->scale;
-  var t: float64 = w;
-  if (t < minw) { t = minw; }
-  var z: MythicCorners = mm_zero_corners();
+// An axis-aligned segment as a filled rect on whole device px: the stroke width rounds to
+// at least one device px and the rect is centred on the (already snapped) line.
+fn mm_dev_segment(p: MythicPainter*, x0: float64, y0: float64, x1: float64, y1: float64,
+                  w: float64, col: uint32) {
+  var s: float64 = (float64)p->scale;
+  var dw: float64 = fmax(1.0, round(w * s));
+  var r: MythicRect = mm_rect(0.0, 0.0, 0.0, 0.0);
   if (y0 == y1) {
-    var a: float64 = x0; var b: float64 = x1;
-    if (b < a) { a = x1; b = x0; }
-    mythic_paint_fill(p, mm_rect(a, y0 - t * 0.5, b - a, t), z, c);
+    var a: float64 = round(fmin(x0, x1) * s);
+    var b: float64 = round(fmax(x0, x1) * s);
+    r = mm_rect(a, round(y0 * s - dw * 0.5), b - a, dw);
+  } else {
+    var c: float64 = round(fmin(y0, y1) * s);
+    var d: float64 = round(fmax(y0, y1) * s);
+    r = mm_rect(round(x0 * s - dw * 0.5), c, dw, d - c);
+  }
+  if (r.w <= 0.0 || r.h <= 0.0) { return; }
+  var cc: uint32 = mythic_paint_color(p, col);
+  if ((cc >> 24) == (uint32)0) { return; }
+  mythic_dl_fill(p->dl, r, mm_zero(), cc);
+}
+
+// Strokes one run of points, split into dashes by pat (npat 0 = solid). buf has room for
+// n + 2 points. The dash pattern restarts at the start of every run, as in SVG.
+fn mm_stroke_run(p: MythicPainter*, a: MythicVec2*, n: int32, w: float32, col: uint32,
+                 pat: float64*, npat: int32, buf: MythicVec2*) {
+  if (n < 2) { return; }
+  if (npat < 2 || buf == 0) {
+    mythic_paint_path_stroke(p, a, n, w, col, false, 0.0);
     return;
   }
-  if (x0 == x1) {
-    var a2: float64 = y0; var b2: float64 = y1;
-    if (b2 < a2) { a2 = y1; b2 = y0; }
-    mythic_paint_fill(p, mm_rect(x0 - t * 0.5, a2, t, b2 - a2), z, c);
+  var on: bool = true;
+  var left: float64 = pat[0];
+  buf[0] = a[0];
+  var k: int32 = 1;
+  var i: int32 = 1;
+  while (i < n) {
+    var x0: float64 = (float64)a[i - 1].x;
+    var y0: float64 = (float64)a[i - 1].y;
+    var dx: float64 = (float64)a[i].x - x0;
+    var dy: float64 = (float64)a[i].y - y0;
+    var seg: float64 = sqrt(dx * dx + dy * dy);
+    var t: float64 = 0.0;
+    while (seg - t > left) {
+      t = t + left;
+      var f: float64 = t / seg;
+      var q: MythicVec2 = { x: (float32)(x0 + dx * f), y: (float32)(y0 + dy * f) };
+      if (on) {
+        buf[k] = q;
+        k = k + 1;
+        mythic_paint_path_stroke(p, buf, k, w, col, false, 0.0);
+        k = 0;
+      } else {
+        buf[0] = q;
+        k = 1;
+      }
+      on = !on;
+      if (on) { left = pat[0]; } else { left = pat[1]; }
+    }
+    left = left - (seg - t);
+    if (on) {
+      buf[k] = a[i];
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  if (on && k >= 2) { mythic_paint_path_stroke(p, buf, k, w, col, false, 0.0); }
+}
+
+// Clips a polygon to x >= xc (keep_ge) or x <= xc into out (room for 2n points).
+fn mm_clip_x(a: MythicVec2*, n: int32, xc: float32, keep_ge: bool, out: MythicVec2*) -> int32 {
+  var m: int32 = 0;
+  var i: int32 = 0;
+  while (i < n) {
+    var u: MythicVec2 = a[i];
+    var v: MythicVec2 = a[(i + 1) % n];
+    var uin: bool = u.x >= xc;
+    var vin: bool = v.x >= xc;
+    if (!keep_ge) { uin = u.x <= xc; vin = v.x <= xc; }
+    if (uin) {
+      out[m] = u;
+      m = m + 1;
+    }
+    if (uin != vin) {
+      var f: float32 = (xc - u.x) / (v.x - u.x);
+      out[m].x = xc;
+      out[m].y = u.y + (v.y - u.y) * f;
+      m = m + 1;
+    }
+    i = i + 1;
+  }
+  return m;
+}
+
+// mythic_paint_path_fill, one piece per raster tile column: MythicUI's path fill clamps
+// edges that leave a tile sideways (which bends them), so a polygon crossing a tile
+// column boundary is cut at the boundaries first.
+fn mm_fill_poly(p: MythicPainter*, a: MythicVec2*, n: int32, col: uint32) {
+  if (n < 3) { return; }
+  var s: float32 = p->scale;
+  var tile: float32 = (float32)MYTHIC_TILE;
+  var lo: float32 = a[0].x;
+  var hi: float32 = a[0].x;
+  var i: int32 = 1;
+  while (i < n) {
+    if (a[i].x < lo) { lo = a[i].x; }
+    if (a[i].x > hi) { hi = a[i].x; }
+    i = i + 1;
+  }
+  var k0: int32 = (int32)mythic_floorf(lo * s / tile);
+  var k1: int32 = (int32)mythic_floorf(hi * s / tile);
+  if (k0 == k1 || k1 - k0 > 4096) {
+    mythic_paint_path_fill(p, a, n, col);
     return;
   }
-  var pts: MythicVec2[2];
-  pts[0].x = (float32)x0; pts[0].y = (float32)y0;
-  pts[1].x = (float32)x1; pts[1].y = (float32)y1;
-  mythic_paint_path_stroke(p, &pts[0], 2, (float32)w, c, false, 0.0);
+  var tmp: MythicVec2* = (MythicVec2*)mythic_arena_alloc(p->arena, (int64)(2 * n + 4) * 8);
+  var out: MythicVec2* = (MythicVec2*)mythic_arena_alloc(p->arena, (int64)(4 * n + 8) * 8);
+  if (tmp == 0 || out == 0) {
+    mythic_paint_path_fill(p, a, n, col);
+    return;
+  }
+  var k: int32 = k0;
+  while (k <= k1) {
+    var m: int32 = mm_clip_x(a, n, (float32)k * tile / s, true, tmp);
+    if (m >= 3) {
+      m = mm_clip_x(tmp, m, (float32)(k + 1) * tile / s, false, out);
+      if (m >= 3) { mythic_paint_path_fill(p, out, m, col); }
+    }
+    k = k + 1;
+  }
+}
+
+// Fills (fill = true) or strokes a LINE, POLY or PATH node: its points are flattened
+// into the frame arena, offset to the box, and each subpath is painted on its own.
+fn mm_paint_runs(p: MythicPainter*, s: MpScene*, nd: MpNode*, ox: float64, oy: float64,
+                 fill: bool, col: uint32) {
+  if (p->arena == 0) { return; }
+  var it: MpPathIter;
+  var x: float64 = 0.0;
+  var y: float64 = 0.0;
+  var n: int32 = 0;
+  if (mp_path_iter(s, nd, &it, MM_FLATTEN_PX) != MP_OK) { return; }
+  while (mp_path_next(&it, &x, &y) != 0) { n = n + 1; }
+  if (n < 2) { return; }
+  var pts: MythicVec2* = (MythicVec2*)mythic_arena_alloc(p->arena, (int64)n * 8);
+  if (pts == 0) { return; }
+  var pat: float64[2];
+  var npat: int32 = 0;
+  var buf: MythicVec2* = (MythicVec2*)0;
+  if (!fill) {
+    npat = mp_dash_pattern(nd->dash, nd->stroke_w, &pat[0]);
+    if (npat == 2) {
+      buf = (MythicVec2*)mythic_arena_alloc(p->arena, (int64)(n + 2) * 8);
+      if (buf == 0) { npat = 0; }
+    }
+  }
+  mp_path_iter(s, nd, &it, MM_FLATTEN_PX);
+  var start: int32 = 0;
+  var k: int32 = 0;
+  var cmd: int32 = mp_path_next(&it, &x, &y);
+  while (cmd != 0 && k < n) {
+    if (cmd == MP_PATH_MOVE && k > start) {
+      if (fill) { mm_fill_poly(p, &pts[start], k - start, col); }
+      else { mm_stroke_run(p, &pts[start], k - start, (float32)nd->stroke_w, col, &pat[0], npat, buf); }
+      start = k;
+    }
+    pts[k].x = (float32)(ox + x);
+    pts[k].y = (float32)(oy + y);
+    k = k + 1;
+    cmd = mp_path_next(&it, &x, &y);
+  }
+  if (k > start) {
+    if (fill) { mm_fill_poly(p, &pts[start], k - start, col); }
+    else { mm_stroke_run(p, &pts[start], k - start, (float32)nd->stroke_w, col, &pat[0], npat, buf); }
+  }
 }
 
 fn mm_paint_line(p: MythicPainter*, s: MpScene*, nd: MpNode*, ox: float64, oy: float64) {
   if (!(nd->stroke_w > 0.0) || nd->stroke.a == (uint8)0) { return; }
   var q: float64* = mp_scene_node_pts(s, nd);
   if (q == 0 || nd->pts_len < 4) { return; }
-  mm_segment(p, ox + q[0], oy + q[1], ox + q[2], oy + q[3], nd->stroke_w,
-             mm_argb(nd->stroke, nd->opacity));
+  var axis: bool = q[0] == q[2] || q[1] == q[3];
+  if (axis && nd->dash == MP_DASH_SOLID) {
+    mm_dev_segment(p, ox + q[0], oy + q[1], ox + q[2], oy + q[3], nd->stroke_w, mm_argb(nd->stroke));
+    return;
+  }
+  mm_paint_runs(p, s, nd, ox, oy, false, mm_argb(nd->stroke));
 }
 
-fn mm_paint_circle(p: MythicPainter*, nd: MpNode*, ox: float64, oy: float64) {
-  if (!(nd->r > 0.0)) { return; }
-  var c: MythicVec2 = { x: (float32)(ox + nd->x), y: (float32)(oy + nd->y) };
-  if (nd->fill.a != (uint8)0) {
-    mythic_paint_circle(p, c, (float32)nd->r, mm_argb(nd->fill, nd->opacity));
-  }
-  if (nd->stroke_w > 0.0 && nd->stroke.a != (uint8)0 && p->arena != 0) {
-    var n: int32 = 32;
-    if (nd->r > 16.0) { n = 64; }
-    var pts: MythicVec2* = (MythicVec2*)mythic_arena_alloc(p->arena, (int64)(n + 1) * 8);
-    if (pts == 0) { return; }
-    mythic_path_arc(pts, n, c.x, c.y, (float32)nd->r, 0.0, MYTHIC_TAU);
-    // n distinct points (the arc repeats the first one), closed
-    mythic_paint_path_stroke(p, pts, n, (float32)nd->stroke_w,
-                             mm_argb(nd->stroke, nd->opacity), true, 0.0);
-  }
-}
-
-fn mm_paint_poly(p: MythicPainter*, s: MpScene*, nd: MpNode*, ox: float64, oy: float64) {
-  var q: float64* = mp_scene_node_pts(s, nd);
-  var n: int32 = nd->pts_len / 2;
-  if (q == 0 || n < 2 || p->arena == 0) { return; }
-  var pts: MythicVec2* = (MythicVec2*)mythic_arena_alloc(p->arena, (int64)n * 8);
-  if (pts == 0) { return; }
-  var i: int32 = 0;
-  while (i < n) {
-    pts[i].x = (float32)(ox + q[(int64)i * 2]);
-    pts[i].y = (float32)(oy + q[(int64)i * 2 + 1]);
-    i = i + 1;
-  }
-  // SVG fills an open polyline's implied polygon when a fill is given
-  if (nd->fill.a != (uint8)0 && n >= 3) {
-    mythic_paint_path_fill(p, pts, n, mm_argb(nd->fill, nd->opacity));
+fn mm_paint_shape(p: MythicPainter*, s: MpScene*, nd: MpNode*, ox: float64, oy: float64) {
+  var grad: bool = (nd->flags & MP_NF_GRADIENT) != 0;
+  var fc: MpColor = nd->fill;
+  if (grad) { fc = mm_mean(nd->fill, nd->fill2); }
+  if (nd->kind == MP_NODE_PATH && fc.a != (uint8)0) {
+    mm_paint_runs(p, s, nd, ox, oy, true, mm_argb(fc));
   }
   if (nd->stroke_w > 0.0 && nd->stroke.a != (uint8)0) {
-    mythic_paint_path_stroke(p, pts, n, (float32)nd->stroke_w,
-                             mm_argb(nd->stroke, nd->opacity), false, 0.0);
+    mm_paint_runs(p, s, nd, ox, oy, false, mm_argb(nd->stroke));
   }
 }
 
-// Text at (x, baseline) in logical px, aligned like the scene node.
-fn mm_text_at(p: MythicPainter*, t: string, size: float64, align: int32,
-              x: float64, baseline: float64, c: uint32) {
+// A closed outline of n points from the frame arena, stroked centred like an SVG ring.
+fn mm_ring(p: MythicPainter*, pts: MythicVec2*, n: int32, w: float64, col: MpColor) {
+  if (!(w > 0.0) || col.a == (uint8)0) { return; }
+  mythic_paint_path_stroke(p, pts, n, (float32)w, mm_argb(col), true, 0.0);
+}
+
+fn mm_paint_marker(p: MythicPainter*, nd: MpNode*, ox: float64, oy: float64) {
+  var r: float64 = nd->r;
+  if (!(r > 0.0) || p->arena == 0) { return; }
+  var cx: float64 = ox + nd->x;
+  var cy: float64 = oy + nd->y;
+  if (nd->marker == MP_MARK_CIRCLE) {
+    var c: MythicVec2 = { x: (float32)cx, y: (float32)cy };
+    if (nd->fill.a != (uint8)0) { mythic_paint_circle(p, c, (float32)r, mm_argb(nd->fill)); }
+    var n: int32 = 32;
+    if (r > 16.0) { n = 64; }
+    var ap: MythicVec2* = (MythicVec2*)mythic_arena_alloc(p->arena, (int64)(n + 1) * 8);
+    if (ap == 0) { return; }
+    mythic_path_arc(ap, n, c.x, c.y, (float32)r, 0.0, MYTHIC_TAU);
+    mm_ring(p, ap, n, nd->stroke_w, nd->stroke);
+    return;
+  }
+  var q: MythicVec2* = (MythicVec2*)mythic_arena_alloc(p->arena, 32);
+  if (q == 0) { return; }
+  if (nd->marker == MP_MARK_SQUARE) {
+    if (nd->fill.a != (uint8)0) {
+      mythic_paint_fill_exact(p, mm_rect(cx - r, cy - r, r * 2.0, r * 2.0), mm_zero(), mm_argb(nd->fill));
+    }
+    q[0].x = (float32)(cx - r); q[0].y = (float32)(cy - r);
+    q[1].x = (float32)(cx + r); q[1].y = (float32)(cy - r);
+    q[2].x = (float32)(cx + r); q[2].y = (float32)(cy + r);
+    q[3].x = (float32)(cx - r); q[3].y = (float32)(cy + r);
+  } else if (nd->marker == MP_MARK_DIAMOND) {
+    q[0].x = (float32)cx; q[0].y = (float32)(cy - r);
+    q[1].x = (float32)(cx + r); q[1].y = (float32)cy;
+    q[2].x = (float32)cx; q[2].y = (float32)(cy + r);
+    q[3].x = (float32)(cx - r); q[3].y = (float32)cy;
+    if (nd->fill.a != (uint8)0) { mm_fill_poly(p, q, 4, mm_argb(nd->fill)); }
+  } else {
+    return;
+  }
+  mm_ring(p, q, 4, nd->stroke_w, nd->stroke);
+}
+
+// Text with its pen at x (aligned START / CENTER / END) and its baseline at logical y,
+// rounded to a whole device px.
+fn mm_text_at(p: MythicPainter*, t: string, size: float64, flags: int32, align: int32,
+              x: float64, baseline: float64, col: uint32) {
   if (t.length == (uint64)0 || p->fonts == 0 || !(size > 0.0)) { return; }
-  var w: float64 = mm_text_w(p->fonts, p->scale, t, size);
   var lx: float64 = x;
-  if (align == MP_ALIGN_CENTER) { lx = x - w * 0.5; }
-  else if (align == MP_ALIGN_END) { lx = x - w; }
+  if (align != MP_ALIGN_START) {
+    var w: float64 = mm_text_w(p->fonts, p->scale, t, size, flags);
+    if (align == MP_ALIGN_CENTER) { lx = x - w * 0.5; } else { lx = x - w; }
+  }
   var bdev: float32 = mythic_roundf((float32)baseline * p->scale);
-  mythic_paint_text_baseline(p, t, mm_style(size), (float32)lx, bdev, c);
+  mythic_paint_text_baseline(p, t, mm_style(size, flags), (float32)lx, bdev, col);
 }
 
 fn mm_paint_text(p: MythicPainter*, s: MpScene*, nd: MpNode*, ox: float64, oy: float64) {
   if (nd->fill.a == (uint8)0) { return; }
-  var t: string = mp_scene_node_text(s, nd);
-  mm_text_at(p, t, nd->size, nd->align, ox + nd->x,
-             oy + nd->y + nd->size * MM_BASELINE, mm_argb(nd->fill, nd->opacity));
+  mm_text_at(p, mp_scene_node_text(s, nd), nd->size, nd->flags, nd->align, ox + nd->x,
+             oy + nd->y, mm_argb(nd->fill));
 }
 
 fn mm_paint_node(p: MythicPainter*, s: MpScene*, nd: MpNode*, ox: float64, oy: float64) {
   if (nd->kind == MP_NODE_RECT) { mm_paint_rect(p, nd, ox, oy); }
   else if (nd->kind == MP_NODE_LINE) { mm_paint_line(p, s, nd, ox, oy); }
-  else if (nd->kind == MP_NODE_CIRCLE) { mm_paint_circle(p, nd, ox, oy); }
+  else if (nd->kind == MP_NODE_POLY || nd->kind == MP_NODE_PATH) { mm_paint_shape(p, s, nd, ox, oy); }
+  else if (nd->kind == MP_NODE_MARKER) { mm_paint_marker(p, nd, ox, oy); }
   else if (nd->kind == MP_NODE_TEXT) { mm_paint_text(p, s, nd, ox, oy); }
-  else if (nd->kind == MP_NODE_POLY) { mm_paint_poly(p, s, nd, ox, oy); }
 }
 
-// Paints every node of `s` offset to r's top-left, clipped to r (scene units =
-// logical px). Unknown node kinds are skipped.
+/// Paints every node of a scene with its origin at r's top-left, clipped to r.
+/// Axis-aligned solid lines become filled rects on whole device px; polylines and paths
+/// are flattened and stroked (dashes split by mp_dash_pattern); a gradient area fill is
+/// painted solid with the mean of its two colours; text is MythicUI's regular font
+/// (semibold when bold, tabular digits when tabular) with its baseline on a device px.
+/// Unknown node kinds are skipped.
+///
+/// @param p The painter of a MythicUI paint callback. Valid: any; 0 paints nothing.
+/// @param s The scene. Units: scene px = logical px. Valid: any; 0 paints nothing.
+/// @param r The box. Units: logical px. Valid: any; an empty box paints nothing.
+/// @mem s is only read; flattened points live in the painter's frame arena.
+/// @thread The UI thread, inside a paint callback; nothing may change s meanwhile.
+/// @cost O(nodes + flattened points).
 export fn mp_mythic_paint_scene(p: MythicPainter*, s: MpScene*, r: MythicRect) {
   if (p == 0 || s == 0 || r.w <= 0.0 || r.h <= 0.0) { return; }
   mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, r), 0.0);
@@ -318,155 +439,70 @@ export fn mp_mythic_paint_scene(p: MythicPainter*, s: MpScene*, r: MythicRect) {
   mythic_dl_pop_clip(p->dl);
 }
 
-// ---------------------------------------------------------------- hover guide
+// ---------------------------------------------------------------- hover
 
-fn mm_clampd(v: float64, lo: float64, hi: float64) -> float64 {
-  if (v < lo) { return lo; }
-  if (v > hi) { return hi; }
-  return v;
-}
-
-// Hover readout text for data x `x` of a frame described by `info`: a time
-// axis (MP_FMT_TIME / _TENTHS) shows tenths (mm:ss.t) when the x domain is
-// under a minute and whole seconds otherwise, rounded to the nearest second
-// (never truncated: 59.6 s reads 01:00); any other axis uses its label
-// format. Writes into `out` (cap >= 32) and returns a view of it.
-export fn mp_mythic_fmt_hover_x(info: MpChartInfo*, x: float64, out: uint8*,
-                                cap: int64) -> string {
-  var fmt: int32 = MP_FMT_AUTO;
-  var span: float64 = 0.0;
-  if (info != 0) { fmt = info->x_format; span = info->x1 - info->x0; }
-  if (fmt == MP_FMT_TIME || fmt == MP_FMT_TIME_TENTHS) {
-    if (span < 60.0) { return mp_fmt_clock_tenths(x, out, cap); }
-    if (is_finite(x) != 0 && fabs(x) < 1e15) { return mp_fmt_clock(round(x), out, cap); }
-    return mp_fmt_clock(x, out, cap);
-  }
-  return mp_chart_fmt_value(x, fmt, out, cap);
-}
-
-// Hover readout text for a y value of a frame described by `info`: a fixed
-// number of decimals chosen from the y domain, so every row of one readout
-// lines up (37.9 / 32.1, not 37.948 / 32.1343). With a tick step of about
-// span/MP_CHART_TICK_TARGET, decimals = 2 - floor(log10(step)), clamped to
-// 0..6: one digit finer than the axis labels. Without a valid domain, or for
-// a value too large for fixed notation, it falls back to mp_fmt_auto.
-export fn mp_mythic_fmt_hover_y(info: MpChartInfo*, y: float64, out: uint8*,
-                                cap: int64) -> string {
-  if (info == 0 || !info->valid) { return mp_fmt_auto(y, out, cap); }
-  var span: float64 = info->y1 - info->y0;
-  if (is_finite(span) == 0 || !(span > 0.0)) { return mp_fmt_auto(y, out, cap); }
-  if (is_finite(y) == 0 || fabs(y) >= 1e15) { return mp_fmt_auto(y, out, cap); }
-  var step: float64 = span / (float64)MP_CHART_TICK_TARGET;
-  var d: float64 = 2.0 - floor(log10(step));
-  if (d < 0.0) { d = 0.0; }
-  if (d > 6.0) { d = 6.0; }
-  return mp_fmt_fixed(y, (int32)d, out, cap);
-}
-
-// Nearest sample of `ser` to data x `xm` among the finite samples inside the
-// frame's resolved domains (what the frame actually shows).
-fn mm_nearest(info: MpChartInfo*, ser: MpSeries*, xm: float64, ox: float64*,
-              oy: float64*) -> bool {
-  var best: float64 = 0.0;
-  var found: bool = false;
-  if (ser == 0 || ser->xs == 0 || ser->ys == 0) { return false; }
-  var j: int64 = 0;
-  while (j < ser->n) {
-    var x: float64 = ser->xs[j];
-    var y: float64 = ser->ys[j];
-    var ok: bool = is_finite(x) != 0 && is_finite(y) != 0;
-    if (ok && (x < info->x0 || x > info->x1)) { ok = false; }
-    if (ok && (y < info->y0 || y > info->y1)) { ok = false; }
-    if (ok) {
-      var d: float64 = x - xm;
-      if (d < 0.0) { d = 0.0 - d; }
-      if (!found || d < best) { best = d; *ox = x; *oy = y; found = true; }
-    }
-    j = j + 1;
-  }
-  return found;
-}
-
-// Series i of the hovered frame: the live view (lv != 0) or the static spec's.
-fn mm_hover_series(spec: MpChartSpec*, lv: MpLive*, i: int32) -> MpSeries* {
-  if (lv != 0) { return mp_live_view(lv, i); }
-  if (spec == 0 || spec->series == 0 || i < 0 || i >= spec->n_series) {
-    return (MpSeries*)0;
-  }
-  return &spec->series[(int64)i];
-}
-
-const MM_TIP_SIZE: float64 = 12.0;   // readout text size
-const MM_TIP_ROW: float64 = 18.0;
-const MM_TIP_PAD: float64 = 8.0;
-const MM_TIP_SW: float64 = 8.0;      // swatch
-
-// Vertical guide at the mouse x, a dot on the nearest sample of each series and
-// a small readout box (x value, then swatch / name / value per series). The
-// geometry is the frame's MpChartInfo; series come from mm_hover_series (live
-// views when lv != 0); `spec` supplies the theme. Line and scatter only.
-fn mm_hover(ui: MythicUi*, p: MythicPainter*, st: MpMythicChart*,
-            spec: MpChartSpec*, lv: MpLive*, info: MpChartInfo*, r: MythicRect) {
-  st->hover_on = false;
-  if (!ui->in.mouse_inside) { return; }
-  if (info == 0 || !info->valid || info->kind == MP_CHART_BAR) { return; }
-  var plot: MpRect = info->plot;
+// Guide at the pointer, a dot on each series' picked sample (not on bars) and a readout
+// box: the x of the picked sample nearest the pointer, then swatch, name and y per
+// series. Called from the paint callback with the chart locked and its frame built.
+fn mm_hover(ui: MythicUi*, p: MythicPainter*, c: MpChart*, r: MythicRect) {
+  if (!c->hover || !ui->in.mouse_inside) { return; }
+  var info: MpChartInfo;
+  if (mp_chart_info(c, &info) != MP_OK || !info.valid) { return; }
+  var plot: MpRect = info.plot;
   var ox: float64 = (float64)r.x;
   var oy: float64 = (float64)r.y;
   var mx: float64 = (float64)ui->in.mouse.x - ox;
   var my: float64 = (float64)ui->in.mouse.y - oy;
   if (mx < plot.x || mx > plot.x + plot.w || my < plot.y || my > plot.y + plot.h) { return; }
-  var xs: MpScale = info->x;
-  var ys: MpScale = info->y;
-  var xm: float64 = mp_scale_invert(xs, mx);
   var th: MythicTheme* = mythic_theme(ui);
-  var z: MythicCorners = mm_zero_corners();
-
   mythic_dl_push_clip(p->dl, mythic_paint_dev_rect(p, r), 0.0);
-  mythic_paint_fill(p, mm_rect(ox + mx - 0.5, oy + plot.y, 1.0, plot.h), z,
+  mythic_paint_fill(p, mm_rect(ox + mx - 0.5, oy + plot.y, 1.0, plot.h), mm_zero(),
                     th->colors.text_tertiary);
-  st->hover_on = true;
-  st->hover_x = (float32)(ox + mx);
 
   var vx: float64[32];
   var vy: float64[32];
   var has: bool[32];
-  var n: int32 = 0;
-  while (n < MM_MAX_SERIES && mm_hover_series(spec, lv, n) != 0) { n = n + 1; }
+  var n: int32 = mp_chart_series_count(c);
+  if (n > MP_MAX_SERIES) { n = MP_MAX_SERIES; }
   var any: bool = false;
   var hx: float64 = 0.0;
   var bestd: float64 = 0.0;
+  var bg: uint32 = mm_argb(c->theme.bg);
   var i: int32 = 0;
   while (i < n) {
-    has[(int64)i] = mm_nearest(info, mm_hover_series(spec, lv, i), xm,
-                               &vx[(int64)i], &vy[(int64)i]);
+    var pt: MpPickPoint;
+    has[(int64)i] = mp_chart_pick(c, i, mx, &pt);
     if (has[(int64)i]) {
-      var d: float64 = vx[(int64)i] - xm;
-      if (d < 0.0) { d = 0.0 - d; }
-      if (!any || d < bestd) { bestd = d; hx = vx[(int64)i]; }
+      vx[(int64)i] = pt.x;
+      vy[(int64)i] = pt.y;
+      var d: float64 = fabs(pt.px - mx);
+      if (!any || d < bestd) { bestd = d; hx = pt.x; }
       any = true;
-      var px: float64 = mm_clampd(mp_scale_map(xs, vx[(int64)i]), plot.x, plot.x + plot.w);
-      var py: float64 = mm_clampd(mp_scale_map(ys, vy[(int64)i]), plot.y, plot.y + plot.h);
-      var cc: MythicVec2 = { x: (float32)(ox + px), y: (float32)(oy + py) };
-      mythic_paint_circle(p, cc, 5.0, mm_argb(spec->theme.bg, 1.0));
-      mythic_paint_circle(p, cc, 3.5, mm_argb(mp_palette_color(i), 1.0));
+      if (info.kind != MP_BAR) {
+        var cc: MythicVec2 = { x: (float32)(ox + pt.px), y: (float32)(oy + pt.py) };
+        mythic_paint_circle(p, cc, 5.0, bg);
+        mythic_paint_circle(p, cc, 3.5, mm_argb(mp_series_color(c, i)));
+      }
     }
     i = i + 1;
   }
-  if (!any) { mythic_dl_pop_clip(p->dl); return; }
-  st->hover_xv = hx;
+  if (!any) {
+    mythic_dl_pop_clip(p->dl);
+    return;
+  }
 
-  var b: uint8[64];
-  var hdr: string = mp_mythic_fmt_hover_x(info, hx, &b[0], 64);
-  var w: float64 = mm_text_w(p->fonts, p->scale, hdr, MM_TIP_SIZE);
+  var hb: uint8[64];
+  var vb: uint8[64];
+  var w: float64 = mm_text_w(p->fonts, p->scale, mp_chart_readout_x(c, hx, &hb[0], 64), MM_TIP_SIZE,
+                             MP_NF_TABULAR);
   var rows: int32 = 1;
   i = 0;
   while (i < n) {
     if (has[(int64)i]) {
-      var v: string = mp_mythic_fmt_hover_y(info, vy[(int64)i], &b[0], 64);
-      var name: string = mm_hover_series(spec, lv, i)->name;
-      var rw: float64 = MM_TIP_SW + 6.0 + mm_text_w(p->fonts, p->scale, name, MM_TIP_SIZE)
-                        + 12.0 + mm_text_w(p->fonts, p->scale, v, MM_TIP_SIZE);
+      var rw: float64 = MM_TIP_SW + 6.0 +
+        mm_text_w(p->fonts, p->scale, c->series[(int64)i].name, MM_TIP_SIZE, 0) + 12.0 +
+        mm_text_w(p->fonts, p->scale, mp_chart_readout_y(c, vy[(int64)i], &vb[0], 64), MM_TIP_SIZE,
+                  MP_NF_TABULAR);
       if (rw > w) { w = rw; }
       rows = rows + 1;
     }
@@ -486,23 +522,20 @@ fn mm_hover(ui: MythicUi*, p: MythicPainter*, st: MpMythicChart*,
 
   var tx: float64 = ox + bx + MM_TIP_PAD;
   var ty: float64 = oy + by + MM_TIP_PAD - 2.0;
-  hdr = mp_mythic_fmt_hover_x(info, hx, &b[0], 64);
-  mm_text_at(p, hdr, MM_TIP_SIZE, MP_ALIGN_START, tx,
-             ty + 1.0 + MM_TIP_SIZE * MM_BASELINE + 2.0, th->colors.text_secondary);
+  var lift: float64 = 3.0 + MM_TIP_SIZE * 0.8;   // row top to baseline
+  mm_text_at(p, mp_chart_readout_x(c, hx, &hb[0], 64), MM_TIP_SIZE, MP_NF_TABULAR, MP_ALIGN_START,
+             tx, ty + lift, th->colors.text_secondary);
   var row: int32 = 1;
   i = 0;
   while (i < n) {
     if (has[(int64)i]) {
       var top: float64 = ty + (float64)row * MM_TIP_ROW;
-      var base: float64 = top + 1.0 + MM_TIP_SIZE * MM_BASELINE + 2.0;
-      var sw: MythicRect = mm_rect(tx, top + (MM_TIP_ROW - MM_TIP_SW) * 0.5,
-                                   MM_TIP_SW, MM_TIP_SW);
-      mythic_paint_fill(p, sw, mythic_radius(2.0), mm_argb(mp_palette_color(i), 1.0));
-      mm_text_at(p, mm_hover_series(spec, lv, i)->name, MM_TIP_SIZE, MP_ALIGN_START,
-                 tx + MM_TIP_SW + 6.0, base, th->colors.text_primary);
-      var v2: string = mp_mythic_fmt_hover_y(info, vy[(int64)i], &b[0], 64);
-      mm_text_at(p, v2, MM_TIP_SIZE, MP_ALIGN_END, ox + bx + bw - MM_TIP_PAD, base,
-                 th->colors.text_primary);
+      var sw: MythicRect = mm_rect(tx, top + (MM_TIP_ROW - MM_TIP_SW) * 0.5, MM_TIP_SW, MM_TIP_SW);
+      mythic_paint_fill(p, sw, mythic_radius(2.0), mm_argb(mp_series_color(c, i)));
+      mm_text_at(p, c->series[(int64)i].name, MM_TIP_SIZE, 0, MP_ALIGN_START,
+                 tx + MM_TIP_SW + 6.0, top + lift, th->colors.text_primary);
+      mm_text_at(p, mp_chart_readout_y(c, vy[(int64)i], &vb[0], 64), MM_TIP_SIZE, MP_NF_TABULAR,
+                 MP_ALIGN_END, ox + bx + bw - MM_TIP_PAD, top + lift, th->colors.text_primary);
       row = row + 1;
     }
     i = i + 1;
@@ -510,213 +543,113 @@ fn mm_hover(ui: MythicUi*, p: MythicPainter*, st: MpMythicChart*,
   mythic_dl_pop_clip(p->dl);
 }
 
-// ---------------------------------------------------------------- widget state
+// ---------------------------------------------------------------- widget
 
-// New widget state: auto theme on, hover off, live frame interval 16 ms.
-export fn mp_mythic_chart_new() -> MpMythicChart* {
-  var st: MpMythicChart* = (MpMythicChart*)malloc(sizeof(MpMythicChart));
-  if (st == 0) { return 0; }
-  memset((rawptr)st, 0, sizeof(MpMythicChart));
-  st->scene = mp_scene_new();
-  if (st->scene == 0) { free((rawptr)st); return 0; }
-  st->spec = mp_chart_spec(MP_CHART_LINE, (MpSeries*)0, 0);
-  st->has_spec = false;
-  st->live = (MpLive*)0;
-  st->live_seq = -1;
-  st->auto_theme = true;
-  st->hover = false;
-  st->frame_ms = 16;
-  st->info = mp_chart_info_empty();
-  st->dirty = true;
-  st->last_rc = MP_OK;
-  return st;
-}
-
-export fn mp_mythic_chart_free(st: MpMythicChart*) {
-  if (st == 0) { return; }
-  if (st->scene != 0) { mp_scene_free(st->scene); }
-  free((rawptr)st);
-}
-
-// Forces a re-render at the next paint. Use after editing series values in
-// place: the static widget's change detection sees pointers, lengths, the last
-// sample and the spec's own fields, not every value.
-export fn mp_mythic_chart_invalidate(st: MpMythicChart*) {
-  if (st != 0) { st->dirty = true; }
-}
-
-fn mm_mix(h: uint64, v: uint64) -> uint64 {
-  return mythic_hash_u64(h, v);
-}
-
-fn mm_mixf(h: uint64, v: float64) -> uint64 {
-  return mythic_hash_u64(h, (uint64)f64_bits(v));
-}
-
-fn mm_mixs(h: uint64, s: string) -> uint64 {
-  return mythic_hash_str(mm_mix(h, (uint64)s.length), s);
-}
-
-fn mm_mixc(h: uint64, c: MpColor) -> uint64 {
-  return mm_mix(h, (uint64)mm_argb(c, 1.0));
-}
-
-// Fingerprint of everything in a spec that changes the scene, except width and
-// height (the widget sets those from its rect).
-fn mm_spec_key(sp: MpChartSpec*) -> uint64 {
-  var h: uint64 = (uint64)1469598103;
-  h = mm_mix(h, (uint64)sp->kind);
-  h = mm_mixs(h, sp->title); h = mm_mixs(h, sp->subtitle);
-  h = mm_mixs(h, sp->x_label); h = mm_mixs(h, sp->y_label);
-  h = mm_mixf(h, sp->margins.top); h = mm_mixf(h, sp->margins.right);
-  h = mm_mixf(h, sp->margins.bottom); h = mm_mixf(h, sp->margins.left);
-  var flags: uint64 = 0;
-  if (sp->margin_auto) { flags = flags | (uint64)1; }
-  if (sp->y_start_at_zero) { flags = flags | (uint64)2; }
-  if (sp->grid) { flags = flags | (uint64)4; }
-  if (sp->x_fixed) { flags = flags | (uint64)8; }
-  if (sp->y_fixed) { flags = flags | (uint64)16; }
-  h = mm_mix(h, flags);
-  h = mm_mix(h, (uint64)sp->x_kind); h = mm_mix(h, (uint64)sp->y_kind);
-  h = mm_mix(h, (uint64)sp->legend);
-  h = mm_mix(h, (uint64)sp->x_format); h = mm_mix(h, (uint64)sp->y_format);
-  h = mm_mixf(h, sp->point_radius); h = mm_mixf(h, sp->bar_gap);
-  h = mm_mixf(h, sp->x_min); h = mm_mixf(h, sp->x_max);
-  h = mm_mixf(h, sp->y_min); h = mm_mixf(h, sp->y_max);
-  h = mm_mixc(h, sp->theme.bg); h = mm_mixc(h, sp->theme.fg);
-  h = mm_mixc(h, sp->theme.muted); h = mm_mixc(h, sp->theme.grid);
-  h = mm_mixc(h, sp->theme.axis);
-  h = mm_mix(h, (uint64)sp->series);
-  h = mm_mix(h, (uint64)sp->n_series);
-  if (sp->series != 0) {
-    var i: int32 = 0;
-    while (i < sp->n_series) {
-      var ser: MpSeries* = &sp->series[(int64)i];
-      h = mm_mixs(h, ser->name);
-      h = mm_mix(h, (uint64)ser->xs); h = mm_mix(h, (uint64)ser->ys);
-      h = mm_mix(h, (uint64)ser->n);
-      if (ser->n > 0 && ser->xs != 0 && ser->ys != 0) {
-        h = mm_mixf(h, ser->xs[ser->n - 1]);
-        h = mm_mixf(h, ser->ys[ser->n - 1]);
-      }
-      i = i + 1;
-    }
+fn mm_chart_paint_cb(ui: MythicUi*, p: MythicPainter*, r: MythicRect, ud: rawptr) {
+  var c: MpChart* = (MpChart*)ud;
+  if (c == 0 || p == 0 || r.w < 1.0 || r.h < 1.0) { return; }
+  var m: MmMeasure = { fonts: p->fonts, scale: p->scale };
+  var t: MpTarget = mm_target(&m, (float64)r.w, (float64)r.h);
+  mp_chart_lock(c);
+  var s: MpScene* = mp_chart_scene(c, &t);
+  if (s != 0) {
+    mp_mythic_paint_scene(p, s, r);
+    mm_hover(ui, p, c, r);
   }
-  return h;
+  mp_chart_unlock(c);
 }
 
-fn mm_reserve(ui: MythicUi*, width: MythicSize, height: MythicSize) {
+fn mm_live(c: MpChart*) -> bool {
+  mp_chart_lock(c);
+  var live: bool = c->keep > 0 || c->span > 0.0;
+  mp_chart_unlock(c);
+  return live;
+}
+
+/// Reserves a box and paints chart c in it at the box's final size and the window's
+/// device scale, with MythicUI's fonts, the MythicUI theme (unless mp_chart_set_theme set
+/// one) and, while mp_chart_set_hover is on, a guide and value readout under the pointer.
+/// The scene is rebuilt only when c's seq, the box size or the scale changed. For a live
+/// chart (mp_chart_keep or mp_chart_window set) it requests the next frame
+/// MP_MYTHIC_FRAME_MS ahead. Call it on every pass; push samples on ui->pass == 0 only.
+///
+/// @param ui The MythicUI context. Valid: non-zero; 0 does nothing.
+/// @param c The chart. Valid: any; 0 reserves an empty box.
+/// @param width Box width. Valid: any MythicSize (mythic_fixed, mythic_grow, ...).
+/// @param height Box height. Valid: any MythicSize.
+/// @mem c is borrowed by the frame's paint callback and must stay alive until the frame
+///   ends (free it only outside the frame callback). Nothing else is retained. Showing one
+///   chart in two boxes of different sizes rebuilds its scene twice per frame.
+/// @thread The UI thread. Other threads may push to c after mp_chart_share(c): the paint
+///   holds mp_chart_lock(c) while it builds and paints the frame.
+/// @cost O(1) when nothing changed; a rebuild costs as mp_chart_scene.
+export fn mp_mythic_chart(ui: MythicUi*, c: MpChart*, width: MythicSize, height: MythicSize) {
+  if (ui == 0) { return; }
   mythic_box_begin(ui, { width: width, height: height, clip: true });
+  mythic_end(ui);
+  if (c == 0) { return; }
+  var th: MpTheme = mp_mythic_theme(ui);
+  mp_chart_set_host_theme(c, th);
+  mythic_node_paint(ui, &mm_chart_paint_cb, (rawptr)c);
+  if (mm_live(c)) { mythic_request_frame_in(ui, MP_MYTHIC_FRAME_MS); }
+}
+
+// ---------------------------------------------------------------- PNG export
+
+fn mm_png_frame_cb(ui: MythicUi*, ud: rawptr) {
+  mythic_column_begin(ui, { width: mythic_grow(), height: mythic_grow() });
+  mp_mythic_chart(ui, (MpChart*)ud, mythic_grow(), mythic_grow());
   mythic_end(ui);
 }
 
-// ---------------------------------------------------------------- static widget
-
-fn mp_mythic_chart_paint_cb(ui: MythicUi*, p: MythicPainter*, r: MythicRect, ud: rawptr) {
-  var st: MpMythicChart* = (MpMythicChart*)ud;
-  if (st == 0 || !st->has_spec || st->scene == 0) { return; }
-  if (r.w < 1.0 || r.h < 1.0) { return; }
-  st->paints = st->paints + 1;
-  st->rect = r;
-  var key: uint64 = mm_spec_key(&st->spec);
-  if (st->dirty || r.w != st->w || r.h != st->h || p->scale != st->scale || key != st->key) {
-    st->spec.width = (float64)r.w;
-    st->spec.height = (float64)r.h;
-    st->last_rc = mp_mythic_render_info(p, &st->spec, st->scene, &st->info);
-    st->renders = st->renders + 1;
-    st->w = r.w; st->h = r.h; st->scale = p->scale;
-    st->key = key;
-    st->dirty = false;
-  }
-  mp_mythic_paint_scene(p, st->scene, r);
-  if (st->hover) {
-    mm_hover(ui, p, st, &st->spec, (MpLive*)0, &st->info, r);
-  } else {
-    st->hover_on = false;
-  }
+fn mm_dim_ok(v: float64, scale: float64) -> bool {
+  return v >= 1.0 && v <= 16384.0 && v * scale <= 16384.0;
 }
 
-// Static chart: reserves a box of width x height and paints `spec` rendered at
-// the box's final size. The scene is cached in `st` and rebuilt only when the
-// size, scale, theme or spec fingerprint changes (or after
-// mp_mythic_chart_invalidate). With st->auto_theme the chart takes
-// mp_mythic_theme(ui). Call on every pass.
-export fn mp_mythic_chart(ui: MythicUi*, st: MpMythicChart*, spec: MpChartSpec*,
-                          width: MythicSize, height: MythicSize) {
-  if (st == 0) { return; }
-  if (spec != 0) {
-    st->spec = *spec;
-    st->has_spec = true;
+/// Renders chart c through MythicUI's headless platform at w x h logical px and scale
+/// device px per logical px, and writes the framebuffer (round(w * scale) x
+/// round(h * scale) px) to a PNG file. The chart gets the light MythicUI theme unless it
+/// has an explicit theme, and no hover.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param w Width. Units: logical px. Valid: 1 .. 16384, and w * scale <= 16384.
+/// @param h Height. Units: logical px. Valid: 1 .. 16384, and h * scale <= 16384.
+/// @param scale Device px per logical px (e.g. 1, 1.5, 2). Valid: finite, in (0, 8].
+/// @param path PNG file path. Valid: non-empty.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG c is 0, path is empty or a size or the scale is out of range; nothing
+///   is written.
+/// @error MP_ERR_ALLOC the headless app or the frame could not be allocated (a frame
+///   failure is also the chart's sticky error); nothing is written.
+/// @error MP_ERR_STATE no frame was produced; nothing is written.
+/// @error MP_ERR_IO the PNG could not be written.
+/// @mem Creates and destroys a headless MythicUI app; nothing is retained. Applies the
+///   MythicUI host theme to c, which bumps its seq when the theme changes.
+/// @thread One thread at a time, outside every MythicUI frame and paint callback (MythicUI
+///   keeps a process-wide text cache); other threads may push to c after mp_chart_share(c).
+/// @cost One frame at the given size plus PNG encoding.
+export fn mp_mythic_save_png(c: MpChart*, w: float64, h: float64, scale: float64, path: string) -> int32 {
+  if (c == 0 || path.length == (uint64)0) { return MP_ERR_ARG; }
+  if (!(scale > 0.0) || scale > 8.0 || !mm_dim_ok(w, scale) || !mm_dim_ok(h, scale)) {
+    return MP_ERR_ARG;
   }
-  if (st->auto_theme) { st->spec.theme = mp_mythic_theme(ui); }
-  mm_reserve(ui, width, height);
-  mythic_node_paint(ui, &mp_mythic_chart_paint_cb, (rawptr)st);
-}
-
-// ---------------------------------------------------------------- live widget
-
-fn mm_theme_eq(a: MpTheme, b: MpTheme) -> bool {
-  return mm_argb(a.bg, 1.0) == mm_argb(b.bg, 1.0)
-      && mm_argb(a.fg, 1.0) == mm_argb(b.fg, 1.0)
-      && mm_argb(a.muted, 1.0) == mm_argb(b.muted, 1.0)
-      && mm_argb(a.grid, 1.0) == mm_argb(b.grid, 1.0)
-      && mm_argb(a.axis, 1.0) == mm_argb(b.axis, 1.0);
-}
-
-fn mp_mythic_live_paint_cb(ui: MythicUi*, p: MythicPainter*, r: MythicRect, ud: rawptr) {
-  var st: MpMythicChart* = (MpMythicChart*)ud;
-  if (st == 0 || st->live == 0) { return; }
-  if (r.w < 1.0 || r.h < 1.0) { return; }
-  st->paints = st->paints + 1;
-  st->rect = r;
-  var lv: MpLive* = st->live;
-  var sp: MpChartSpec* = mp_live_spec(lv);
-  if (sp == 0) { return; }
-  if (r.w != st->w || r.h != st->h || p->scale != st->scale || st->dirty) {
-    sp->width = (float64)r.w;
-    sp->height = (float64)r.h;
-    mp_live_touch(lv);
-    st->w = r.w; st->h = r.h; st->scale = p->scale;
-    st->dirty = false;
+  var app: MythicApp* = mythic_app_create_headless({ title: "mistplot", width: (float32)w,
+                                                     height: (float32)h }, (float32)scale);
+  if (app == 0) { return MP_ERR_ALLOC; }
+  mythic_app_step(app, &mm_png_frame_cb, (rawptr)c, false);
+  var rc: int32 = MP_OK;
+  if (mythic_app_frames(app) < 1) { rc = MP_ERR_STATE; }
+  if (rc == MP_OK) {
+    // the frame painted from the chart's cache; building it again with the same target is a
+    // cache hit that reports whether the build succeeded
+    var ui: MythicUi* = mythic_app_ui(app);
+    var m: MmMeasure = { fonts: ui->fonts, scale: ui->scale };
+    var t: MpTarget = mm_target(&m, w, h);
+    mp_chart_lock(c);
+    rc = mp_frame_scene(c, &t);
+    mp_chart_unlock(c);
   }
-  var mp_mythic_prev_cb: fn(rawptr, string, float64) -> float64 = mp_text_measure_fn();
-  var prev_ctx: rawptr = mp_text_measure_ctx();
-  var m: MpMythicMeasure = { fonts: p->fonts, scale: p->scale };
-  mp_text_set_measure(&mp_mythic_text_measure_cb, (rawptr)&m);
-  if (mp_live_update(lv)) { st->renders = st->renders + 1; }
-  mp_text_set_measure(mp_mythic_prev_cb, prev_ctx);
-  st->live_seq = mp_live_seq(lv);
-  var sc: MpScene* = mp_live_scene(lv);
-  if (sc == 0) { return; }
-  mp_mythic_paint_scene(p, sc, r);
-  if (st->hover) {
-    mm_hover(ui, p, st, sp, lv, mp_live_info(lv), r);
-  } else {
-    st->hover_on = false;
-  }
-}
-
-// Live chart: reserves a box and paints `lv`, re-rendering only when
-// mp_live_seq moved or the box size / scale changed. Requests the next frame
-// st->frame_ms ahead (0 = none). Push samples on ui->pass == 0 only. Binding
-// a new MpLive turns st->hover on (guide and value readout).
-export fn mp_mythic_live(ui: MythicUi*, st: MpMythicChart*, lv: MpLive*,
-                         width: MythicSize, height: MythicSize) {
-  if (st == 0 || lv == 0) { return; }
-  if (st->live != lv) {
-    st->live = lv;
-    st->dirty = true;
-    st->hover = true;
-  }
-  if (st->auto_theme) {
-    var sp: MpChartSpec* = mp_live_spec(lv);
-    var t: MpTheme = mp_mythic_theme(ui);
-    if (sp != 0 && !mm_theme_eq(sp->theme, t)) {
-      sp->theme = t;
-      mp_live_touch(lv);
-    }
-  }
-  mm_reserve(ui, width, height);
-  mythic_node_paint(ui, &mp_mythic_live_paint_cb, (rawptr)st);
-  if (st->frame_ms > 0) { mythic_request_frame_in(ui, st->frame_ms); }
+  if (rc == MP_OK && !mythic_app_save_png(app, path)) { rc = MP_ERR_IO; }
+  mythic_app_destroy(app);
+  return rc;
 }

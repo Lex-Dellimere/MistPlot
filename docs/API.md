@@ -407,66 +407,13 @@ The commit_seq of the last committed read (0 before the first).
 
 ## `integrations/mythic/mp_mythic.mettle`
 
-integrations/mythic/mp_mythic — MistPlot charts inside MythicUI.
+MistPlot charts inside MythicUI: a stateless widget for static and live charts, a scene painter, the MythicUI theme as a chart theme, and HiDPI PNG export through the headless platform. Depends on mythic/mythic and the MistPlot chart, frame, pick and scene modules. The widget keeps no state: the chart caches its scene per target (logical box size, device scale and a measurer key over MythicUI's fonts), so a frame rebuilds the scene only when the chart's seq, the box size or the scale changed. Scene px are logical px; painting snaps axis-aligned lines to whole device px and keeps data lines anti-aliased.
 
-A scene painter (every MpNode -> MythicUI paint calls inside a layout rect, clipped to it, scene coords 1:1 with logical px), MythicUI's real text measurement installed through mp_text_set_measure while a chart renders, and two widget entry points that cache the rendered scene in a caller-owned MpMythicChart: a static spec (mp_mythic_chart) and a live MpLive (mp_mythic_live).
+**Constants**
 
-Semantics follow backends/web/svg: fill is skipped when fill.a == 0, stroke when stroke_w <= 0, node opacity multiplies the alpha, a TEXT node's y is the top of its box and its baseline sits at y + size * 0.8, align start / center / end is relative to x. MythicUI strokes are inside strokes, so a RECT stroke is drawn on the rect grown by stroke_w / 2 (centred, like SVG).
-
-Naming follows MythicUI: callbacks are mp_mythic_*_cb and every export is mp_mythic_ / MpMythic / MP_MYTHIC_.
-
-Geometry: hover reads the frame's MpChartInfo (plot rect, final scales, resolved domains, effective label formats) — mp_mythic_render_info for the static widget, mp_live_info / mp_live_view for the live one — so nothing here re-derives chart/resolve's domain rules or reads MpLive internals.
-
-Measurement: every render saves core/text's current measurer (mp_text_measure_fn / _ctx), installs MythicUI's, and restores the saved one afterwards, so an app's own measurer survives a MythicUI chart.
-
-Lifetimes: the paint callbacks run after the frame callback's passes, so the widget copies the caller's MpChartSpec into the state object. The spec's series arrays and strings stay borrowed and must be alive until the end of the frame in which mp_mythic_chart was called.
-
-_Legacy module: its comments predate the doc rules._
-
-### `MpMythicChart`
-
-```mettle
-struct MpMythicChart
-```
-
-Caller-owned widget state: the cached scene and what it was built for.
-
-| Field | Type | Description |
-|---|---|---|
-| `scene` | `MpScene*` | owned; the last rendered scene |
-| `spec` | `MpChartSpec` | static widget: copy of the caller's spec |
-| `has_spec` | `bool` |  |
-| `live` | `MpLive*` | live widget: borrowed MpLive (set by mp_mythic_live) |
-| `w` | `float32` | logical size the cached scene was rendered at |
-| `h` | `float32` | logical size the cached scene was rendered at |
-| `scale` | `float32` | painter scale it was measured at |
-| `key` | `uint64` | static: fingerprint of the spec at the last render |
-| `live_seq` | `int64` | live: mp_live_seq at the last paint |
-| `renders` | `int64` | number of times a scene was (re)built |
-| `paints` | `int64` | number of paint callbacks |
-| `last_rc` | `int32` | MP_* code of the last render |
-| `dirty` | `bool` | force a re-render at the next paint |
-| `auto_theme` | `bool` | follow the MythicUI theme (default true) |
-| `hover` | `bool` | hover guide + readout (default: false static, true live) |
-| `frame_ms` | `int32` | live: next frame requested this many ms ahead (0 = none) |
-| `hover_on` | `bool` | a hover guide was drawn in the last paint |
-| `hover_x` | `float32` | its x, logical px |
-| `hover_xv` | `float64` | data x shown in the readout (nearest sample) |
-| `rect` | `MythicRect` | the box's rect at the last paint (logical px) |
-| `info` | `MpChartInfo` | static widget: geometry of the cached scene |
-
-### `MpMythicMeasure`
-
-```mettle
-struct MpMythicMeasure
-```
-
-Context of mp_mythic_text_measure_cb: MythicUI fonts at a device scale.
-
-| Field | Type | Description |
-|---|---|---|
-| `fonts` | `MythicFonts*` |  |
-| `scale` | `float32` |  |
+| Name | Type | Value | Description |
+|---|---|---|---|
+| `MP_MYTHIC_FRAME_MS` | `int32` | `16` | Live charts (mp_chart_keep or mp_chart_window set) ask MythicUI for the next frame this many milliseconds ahead. Units: ms. |
 
 ### `mp_mythic_theme`
 
@@ -474,65 +421,17 @@ Context of mp_mythic_text_measure_cb: MythicUI fonts at a device scale.
 fn mp_mythic_theme(ui: MythicUi*) -> MpTheme
 ```
 
-MpTheme mapped from the active MythicUI theme: chart background = surface, text = primary, tick labels = secondary, grid = subtle border, axes = strong border.
+The active MythicUI theme as a chart theme: background = surface, title and text = primary text, ticks and subtitle = secondary text, grid = subtle border, baseline = strong border; the palette is MistPlot's (Observable-10).
 
 | Parameter | Type | Meaning |
 |---|---|---|
-| `ui` | `MythicUi*` |  |
+| `ui` | `MythicUi*` | The MythicUI context. Valid: any; 0 gives mp_theme_light(). |
 
-### `mp_mythic_measure_install`
+**Returns:** The theme (name "light" or "dark", following the MythicUI theme).
 
-```mettle
-fn mp_mythic_measure_install(m: MpMythicMeasure*)
-```
+**Memory:** ui is only read.
 
-Installs MythicUI text measurement (the fonts and scale in `m`, which must stay alive until mp_mythic_measure_reset) as core/text's measurer.
-
-| Parameter | Type | Meaning |
-|---|---|---|
-| `m` | `MpMythicMeasure*` |  |
-
-### `mp_mythic_measure_reset`
-
-```mettle
-fn mp_mythic_measure_reset()
-```
-
-Restores core/text's default width heuristic.
-
-### `mp_mythic_render_info`
-
-```mettle
-fn mp_mythic_render_info(
-  p: MythicPainter*,
-  spec: MpChartSpec*,
-  out: MpScene*,
-  info: MpChartInfo*
-) -> int32
-```
-
-mp_chart_render_info with MythicUI text measurement installed for the duration of the call (fonts and scale from the painter). The measurer that was active before (the default or an app's own) is restored afterwards. `info` may be 0.
-
-| Parameter | Type | Meaning |
-|---|---|---|
-| `p` | `MythicPainter*` |  |
-| `spec` | `MpChartSpec*` |  |
-| `out` | `MpScene*` |  |
-| `info` | `MpChartInfo*` |  |
-
-### `mp_mythic_render`
-
-```mettle
-fn mp_mythic_render(p: MythicPainter*, spec: MpChartSpec*, out: MpScene*) -> int32
-```
-
-mp_chart_render with MythicUI text measurement (see mp_mythic_render_info).
-
-| Parameter | Type | Meaning |
-|---|---|---|
-| `p` | `MythicPainter*` |  |
-| `spec` | `MpChartSpec*` |  |
-| `out` | `MpScene*` |  |
+**Threads:** The UI thread.
 
 ### `mp_mythic_paint_scene`
 
@@ -540,119 +439,77 @@ mp_chart_render with MythicUI text measurement (see mp_mythic_render_info).
 fn mp_mythic_paint_scene(p: MythicPainter*, s: MpScene*, r: MythicRect)
 ```
 
-Paints every node of `s` offset to r's top-left, clipped to r (scene units = logical px). Unknown node kinds are skipped.
+Paints every node of a scene with its origin at r's top-left, clipped to r. Axis-aligned solid lines become filled rects on whole device px; polylines and paths are flattened and stroked (dashes split by mp_dash_pattern); a gradient area fill is painted solid with the mean of its two colours; text is MythicUI's regular font (semibold when bold, tabular digits when tabular) with its baseline on a device px. Unknown node kinds are skipped.
 
 | Parameter | Type | Meaning |
 |---|---|---|
-| `p` | `MythicPainter*` |  |
-| `s` | `MpScene*` |  |
-| `r` | `MythicRect` |  |
+| `p` | `MythicPainter*` | The painter of a MythicUI paint callback. Valid: any; 0 paints nothing. |
+| `s` | `MpScene*` | The scene. Units: scene px = logical px. Valid: any; 0 paints nothing. |
+| `r` | `MythicRect` | The box. Units: logical px. Valid: any; an empty box paints nothing. |
 
-### `mp_mythic_fmt_hover_x`
+**Memory:** s is only read; flattened points live in the painter's frame arena.
 
-```mettle
-fn mp_mythic_fmt_hover_x(info: MpChartInfo*, x: float64, out: uint8*, cap: int64) -> string
-```
+**Threads:** The UI thread, inside a paint callback; nothing may change s meanwhile.
 
-Hover readout text for data x `x` of a frame described by `info`: a time axis (MP_FMT_TIME / _TENTHS) shows tenths (mm:ss.t) when the x domain is under a minute and whole seconds otherwise, rounded to the nearest second (never truncated: 59.6 s reads 01:00); any other axis uses its label format. Writes into `out` (cap >= 32) and returns a view of it.
-
-| Parameter | Type | Meaning |
-|---|---|---|
-| `info` | `MpChartInfo*` |  |
-| `x` | `float64` |  |
-| `out` | `uint8*` |  |
-| `cap` | `int64` |  |
-
-### `mp_mythic_fmt_hover_y`
-
-```mettle
-fn mp_mythic_fmt_hover_y(info: MpChartInfo*, y: float64, out: uint8*, cap: int64) -> string
-```
-
-Hover readout text for a y value of a frame described by `info`: a fixed number of decimals chosen from the y domain, so every row of one readout lines up (37.9 / 32.1, not 37.948 / 32.1343). With a tick step of about span/MP_CHART_TICK_TARGET, decimals = 2 - floor(log10(step)), clamped to 0..6: one digit finer than the axis labels. Without a valid domain, or for a value too large for fixed notation, it falls back to mp_fmt_auto.
-
-| Parameter | Type | Meaning |
-|---|---|---|
-| `info` | `MpChartInfo*` |  |
-| `y` | `float64` |  |
-| `out` | `uint8*` |  |
-| `cap` | `int64` |  |
-
-### `mp_mythic_chart_new`
-
-```mettle
-fn mp_mythic_chart_new() -> MpMythicChart*
-```
-
-New widget state: auto theme on, hover off, live frame interval 16 ms.
-
-### `mp_mythic_chart_free`
-
-```mettle
-fn mp_mythic_chart_free(st: MpMythicChart*)
-```
-
-_Undocumented._
-
-| Parameter | Type | Meaning |
-|---|---|---|
-| `st` | `MpMythicChart*` |  |
-
-### `mp_mythic_chart_invalidate`
-
-```mettle
-fn mp_mythic_chart_invalidate(st: MpMythicChart*)
-```
-
-Forces a re-render at the next paint. Use after editing series values in place: the static widget's change detection sees pointers, lengths, the last sample and the spec's own fields, not every value.
-
-| Parameter | Type | Meaning |
-|---|---|---|
-| `st` | `MpMythicChart*` |  |
+**Cost:** O(nodes + flattened points).
 
 ### `mp_mythic_chart`
 
 ```mettle
-fn mp_mythic_chart(
-  ui: MythicUi*,
-  st: MpMythicChart*,
-  spec: MpChartSpec*,
-  width: MythicSize,
-  height: MythicSize
-)
+fn mp_mythic_chart(ui: MythicUi*, c: MpChart*, width: MythicSize, height: MythicSize)
 ```
 
-Static chart: reserves a box of width x height and paints `spec` rendered at the box's final size. The scene is cached in `st` and rebuilt only when the size, scale, theme or spec fingerprint changes (or after mp_mythic_chart_invalidate). With st->auto_theme the chart takes mp_mythic_theme(ui). Call on every pass.
+Reserves a box and paints chart c in it at the box's final size and the window's device scale, with MythicUI's fonts, the MythicUI theme (unless mp_chart_set_theme set one) and, while mp_chart_set_hover is on, a guide and value readout under the pointer. The scene is rebuilt only when c's seq, the box size or the scale changed. For a live chart (mp_chart_keep or mp_chart_window set) it requests the next frame MP_MYTHIC_FRAME_MS ahead. Call it on every pass; push samples on ui->pass == 0 only.
 
 | Parameter | Type | Meaning |
 |---|---|---|
-| `ui` | `MythicUi*` |  |
-| `st` | `MpMythicChart*` |  |
-| `spec` | `MpChartSpec*` |  |
-| `width` | `MythicSize` |  |
-| `height` | `MythicSize` |  |
+| `ui` | `MythicUi*` | The MythicUI context. Valid: non-zero; 0 does nothing. |
+| `c` | `MpChart*` | The chart. Valid: any; 0 reserves an empty box. |
+| `width` | `MythicSize` | Box width. Valid: any MythicSize (mythic_fixed, mythic_grow, ...). |
+| `height` | `MythicSize` | Box height. Valid: any MythicSize. |
 
-### `mp_mythic_live`
+**Memory:** c is borrowed by the frame's paint callback and must stay alive until the frame ends (free it only outside the frame callback). Nothing else is retained. Showing one chart in two boxes of different sizes rebuilds its scene twice per frame.
+
+**Threads:** The UI thread. Other threads may push to c after mp_chart_share(c): the paint holds mp_chart_lock(c) while it builds and paints the frame.
+
+**Cost:** O(1) when nothing changed; a rebuild costs as mp_chart_scene.
+
+### `mp_mythic_save_png`
 
 ```mettle
-fn mp_mythic_live(
-  ui: MythicUi*,
-  st: MpMythicChart*,
-  lv: MpLive*,
-  width: MythicSize,
-  height: MythicSize
-)
+fn mp_mythic_save_png(
+  c: MpChart*,
+  w: float64,
+  h: float64,
+  scale: float64,
+  path: string
+) -> int32
 ```
 
-Live chart: reserves a box and paints `lv`, re-rendering only when mp_live_seq moved or the box size / scale changed. Requests the next frame st->frame_ms ahead (0 = none). Push samples on ui->pass == 0 only. Binding a new MpLive turns st->hover on (guide and value readout).
+Renders chart c through MythicUI's headless platform at w x h logical px and scale device px per logical px, and writes the framebuffer (round(w * scale) x round(h * scale) px) to a PNG file. The chart gets the light MythicUI theme unless it has an explicit theme, and no hover.
 
 | Parameter | Type | Meaning |
 |---|---|---|
-| `ui` | `MythicUi*` |  |
-| `st` | `MpMythicChart*` |  |
-| `lv` | `MpLive*` |  |
-| `width` | `MythicSize` |  |
-| `height` | `MythicSize` |  |
+| `c` | `MpChart*` | The chart. Valid: non-zero. |
+| `w` | `float64` | Width. Units: logical px. Valid: 1 .. 16384, and w * scale <= 16384. |
+| `h` | `float64` | Height. Units: logical px. Valid: 1 .. 16384, and h * scale <= 16384. |
+| `scale` | `float64` | Device px per logical px (e.g. 1, 1.5, 2). Valid: finite, in (0, 8]. |
+| `path` | `string` | PNG file path. Valid: non-empty. |
+
+**Returns:** MP_OK, or an error code.
+
+**Errors:**
+
+- `MP_ERR_ARG` c is 0, path is empty or a size or the scale is out of range; nothing is written.
+- `MP_ERR_ALLOC` the headless app or the frame could not be allocated (a frame failure is also the chart's sticky error); nothing is written.
+- `MP_ERR_STATE` no frame was produced; nothing is written.
+- `MP_ERR_IO` the PNG could not be written.
+
+**Memory:** Creates and destroys a headless MythicUI app; nothing is retained. Applies the MythicUI host theme to c, which bumps its seq when the theme changes.
+
+**Threads:** One thread at a time, outside every MythicUI frame and paint callback (MythicUI keeps a process-wide text cache); other threads may push to c after mp_chart_share(c).
+
+**Cost:** One frame at the given size plus PNG encoding.
 
 ## `integrations/raize/mp_raize.mettle`
 

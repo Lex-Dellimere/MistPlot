@@ -1,6 +1,8 @@
 // integrations/mythic/examples/live_dashboard — a MythicUI window with a live
-// line chart fed by a synthetic signal, a static bar chart beside it and a
-// light/dark switch that re-themes both charts.
+// area chart fed by a synthetic signal, a static bar chart beside it, a light/dark
+// switch that re-themes both charts and a button that saves the live chart as a
+// 2x PNG. The app runs its own loop (mythic_app_step) because mp_mythic_save_png
+// must be called outside MythicUI's frame callbacks.
 //
 // Build from the mistplot repo root:
 //   mettle --build integrations/mythic/examples/live_dashboard.mettle \
@@ -13,9 +15,7 @@
 import "std/mem";
 import "std/math";
 import "mythic/mythic";
-import "mistplot/core/data";
-import "mistplot/chart/spec";
-import "mistplot/live/stream";
+import "mistplot/mistplot";
 import "../mp_mythic";
 
 const SAMPLE_DT: float64 = 0.01;     // 100 Hz synthetic signal
@@ -24,13 +24,13 @@ const WINDOW_S: float64 = 30.0;
 struct App {
   dark: bool;
   paused: bool;
-  lv: MpLive*;
-  live: MpMythicChart*;
-  bars: MpMythicChart*;
-  sales: MpSeries*;
+  load: MpChart*;
+  regions: MpChart*;
   t0: int64;
   last_x: float64;
   rng: uint32;
+  save_req: bool;        // the Save PNG button was clicked this frame
+  saved: int32;          // MP_* code of the last PNG save, -1 before the first
 }
 
 fn noise(app: App*) -> float64 {
@@ -50,8 +50,8 @@ fn ingest(ui: MythicUi*, app: App*) {
   while (t <= x) {
     var cpu: float64 = 50.0 + 25.0 * sin(t * 1.3) + 8.0 * sin(t * 7.1) + 3.0 * noise(app);
     var mem: float64 = 62.0 + 12.0 * sin(t * 0.21) + 0.4 * noise(app);
-    mp_live_push(app->lv, 0, t, cpu);
-    mp_live_push(app->lv, 1, t, mem);
+    mp_chart_push(app->load, 0, t, cpu);
+    mp_chart_push(app->load, 1, t, mem);
     app->last_x = t;
     t = t + SAMPLE_DT;
   }
@@ -65,6 +65,14 @@ fn header(ui: MythicUi*, app: App*) {
                       { role: MYTHIC_TYPE_BODY, tone: MYTHIC_TONE_SECONDARY });
     mythic_end(ui);
     mythic_spacer(ui);
+    if (app->saved == MP_OK) {
+      mythic_label_ex(ui, "Saved load.png", { role: MYTHIC_TYPE_BODY, tone: MYTHIC_TONE_SECONDARY });
+    } else if (app->saved > 0) {
+      mythic_label_ex(ui, mp_error_str(app->saved), { role: MYTHIC_TYPE_BODY, tone: MYTHIC_TONE_SECONDARY });
+    }
+    if (mythic_button(ui, "Save PNG")) {
+      app->save_req = true;
+    }
     mythic_switch(ui, "Pause", &app->paused);
     if (mythic_switch(ui, "Dark mode", &app->dark)) {
       if (app->dark) {
@@ -79,19 +87,15 @@ fn header(ui: MythicUi*, app: App*) {
 fn frame(ui: MythicUi*, ud: rawptr) {
   var app: App* = (App*)ud;
   ingest(ui, app);
-  var bs: MpChartSpec = mp_chart_spec(MP_CHART_BAR, app->sales, 1);
-  bs.title = "Requests per region";
-  bs.legend = MP_LEGEND_BOTTOM;
-  bs.y_format = MP_FMT_SI;
   mythic_column_begin(ui, { width: mythic_grow(), height: mythic_grow(),
                             pad: mythic_pad(24), gap: 16 });
     header(ui, app);
     mythic_row_begin(ui, { width: mythic_grow(), height: mythic_grow(), gap: 16 });
       mythic_card_begin(ui, { width: mythic_grow(), height: mythic_grow() });
-        mp_mythic_live(ui, app->live, app->lv, mythic_grow(), mythic_grow());
+        mp_mythic_chart(ui, app->load, mythic_grow(), mythic_grow());
       mythic_end(ui);
       mythic_card_begin(ui, { width: mythic_fixed(380), height: mythic_grow() });
-        mp_mythic_chart(ui, app->bars, &bs, mythic_grow(), mythic_grow());
+        mp_mythic_chart(ui, app->regions, mythic_grow(), mythic_grow());
       mythic_end(ui);
     mythic_end(ui);
   mythic_end(ui);
@@ -101,34 +105,48 @@ fn main() -> int32 {
   var app: App* = (App*)malloc(sizeof(App));
   memset((rawptr)app, 0, sizeof(App));
   app->rng = (uint32)12345;
-  app->lv = mp_live_new(MP_CHART_LINE, 2, 8192);
-  mp_live_series_name(app->lv, 0, "cpu %");
-  mp_live_series_name(app->lv, 1, "mem %");
-  mp_live_window(app->lv, WINDOW_S);
-  var sp: MpChartSpec* = mp_live_spec(app->lv);
-  sp->title = "System load";
-  sp->x_format = MP_FMT_TIME;
-  sp->y_fixed = true;
-  sp->y_min = 0.0;
-  sp->y_max = 100.0;
-  sp->legend = MP_LEGEND_BOTTOM;
-  mp_live_touch(app->lv);
-  app->live = mp_mythic_chart_new();
-  app->live->frame_ms = 16;
-  app->bars = mp_mythic_chart_new();
-  app->sales = mp_series_new("requests", 8);
-  var vals: float64[6] = [12400.0, 9800.0, 15100.0, 7300.0, 11900.0, 4200.0];
-  var i: int32 = 0;
-  while (i < 6) {
-    mp_series_push(app->sales, (float64)i, vals[(int64)i]);
-    i = i + 1;
+  app->saved = -1;
+
+  app->load = mp_chart_new(MP_AREA);
+  mp_chart_set_title(app->load, "System load");
+  mp_chart_set_x_format(app->load, MP_FMT_TIME);
+  mp_chart_set_y_range(app->load, 0.0, 100.0);
+  mp_chart_set_legend(app->load, MP_LEGEND_BOTTOM);
+  mp_chart_keep(app->load, 8192);
+  mp_chart_window(app->load, WINDOW_S);
+  mp_chart_series(app->load, "cpu %");
+  var mem: int32 = mp_chart_series(app->load, "mem %");
+  mp_series_set_fill(app->load, mem, false);
+  mp_series_set_dash(app->load, mem, MP_DASH_DASHED);
+
+  app->regions = mp_chart_new(MP_BAR);
+  mp_chart_set_title(app->regions, "Requests per region");
+  mp_chart_set_y_format(app->regions, MP_FMT_SI);
+  var s: int32 = mp_chart_series(app->regions, "requests");
+  mp_chart_set_value(app->regions, s, "north", 12400.0);
+  mp_chart_set_value(app->regions, s, "south", 9800.0);
+  mp_chart_set_value(app->regions, s, "east", 15100.0);
+  mp_chart_set_value(app->regions, s, "west", 7300.0);
+  mp_chart_set_value(app->regions, s, "central", 11900.0);
+  mp_chart_set_value(app->regions, s, "remote", 4200.0);
+
+  var rc: int32 = 1;
+  if (mp_chart_error(app->load) == MP_OK && mp_chart_error(app->regions) == MP_OK) {
+    var win: MythicApp* = mythic_app_create({ title: "MistPlot live dashboard", width: 1120.0,
+                                              height: 640.0 });
+    if (win != 0) {
+      while (mythic_app_step(win, &frame, (rawptr)app, true)) {
+        if (app->save_req) {
+          app->save_req = false;
+          app->saved = mp_mythic_save_png(app->load, 1200.0, 500.0, 2.0, "load.png");
+        }
+      }
+      rc = win->exit_code;
+      mythic_app_destroy(win);
+    }
   }
-  var rc: int32 = mythic_run({ title: "MistPlot live dashboard", width: 1120.0, height: 640.0 },
-                             &frame, (rawptr)app);
-  mp_mythic_chart_free(app->live);
-  mp_mythic_chart_free(app->bars);
-  mp_live_free(app->lv);
-  mp_series_free(app->sales);
+  mp_chart_free(app->load);
+  mp_chart_free(app->regions);
   free((rawptr)app);
   return rc;
 }
