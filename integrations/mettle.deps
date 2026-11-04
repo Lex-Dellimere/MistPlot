@@ -4,4 +4,4 @@
 mistplot=../src
 raize=../../raize_web
 mythic=../../mythic_ui/src
-meosql=../../meosql
+meodb=../../meodb

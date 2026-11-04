@@ -13,7 +13,7 @@ src/chart/       spec -> layout -> scene
 src/live/        ring buffers, min/max decimation, MpLive
 src/backends/    web (SVG, figure, live embed) and terminal
 src/export/      write an SVG file
-integrations/    raize (RaizeWeb), mythic (MythicUI), meosql (MeoSQL)
+integrations/    raize (RaizeWeb), mythic (MythicUI), meodb (MeoDB)
 cmd/golden/      prints the tests/golden/ fixtures (tools/golden.sh --update rewrites them)
 ```
 
@@ -28,8 +28,8 @@ v0.17.0 release.
 
 `check.sh` runs every test in the interpreter, builds and runs each test in
 debug and release, compares `cmd/golden` with every file in `tests/golden/`, and
-runs the RaizeWeb, MythicUI and MeoSQL integration builds. It prints `PASS`.
-`MEOSQL_DIR` picks the MeoSQL checkout (default `../meosql`); an
+runs the RaizeWeb, MythicUI and MeoDB integration builds. It prints `PASS`.
+`MEODB_DIR` picks the MeoDB checkout (default `../meodb`); an
 integration whose library isn't on disk is skipped.
 
 To use MistPlot from an app, add it to the app's `mbuild.mettle`:
@@ -139,10 +139,10 @@ widgets on every pass. A producer thread pushes under a lock the UI also takes.
 
 Example: `integrations/mythic/examples/live_dashboard.mettle`.
 
-## MeoSQL
+## MeoDB
 
-`integrations/meosql/mp_meo.mettle`, on MeoSQL's committed-change feed. Your
-app maps MeoSQL as `meosql`.
+`integrations/meodb/mp_meo.mettle`, on MeoDB's committed-change feed. Your
+app maps MeoDB as `meodb`.
 
 ```mettle
 var w: MpMeoWatch* = mp_meo_watch_new(feed);
@@ -158,14 +158,14 @@ fn reload_readings(ctx: rawptr, table_id: uint32, lv: MpLive*) -> int32 {
 ```
 
 Only committed changes count: a rolled-back transaction reloads nothing, and
-a reader that fell behind the feed reloads everything. MeoSQL rows have no
-values yet, so the chart re-queries instead of reading values from events.
+a reader that fell behind the feed reloads everything. The watcher doesn't read
+row values from events yet, so the chart re-queries the table on each change.
 `mp_meo_table_stats` says when a table last changed and at which commit, and
 `mp_meo_fmt_subtitle` formats that as `updated 10:42:07 · commit 57`. When the
 writer is another process, `mp_meo_probe_check` watches the file's commit
 counter instead.
 
-Example: `integrations/meosql/examples/meo_live_chart.mettle`.
+Example: `integrations/meodb/examples/meo_live_chart.mettle`.
 
 ## Compiler issues
 

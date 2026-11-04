@@ -1,7 +1,7 @@
-// integrations/meosql/examples/meo_live_chart — a live MistPlot chart that
-// follows a MeoSQL table and redraws only on committed data.
+// integrations/meodb/examples/meo_live_chart — a live MistPlot chart that
+// follows a MeoDB table and redraws only on committed data.
 //
-// A writer thread inserts sensor "readings" into a MeoSQL database and commits
+// A writer thread inserts sensor "readings" into a MeoDB database and commits
 // a transaction every ~200 ms (one reading per sensor). The main thread polls
 // an MpMeoWatch over the database's change feed; when the readings table had a
 // committed change, the watch calls the reload callback, which re-scans the
@@ -9,7 +9,7 @@
 // the chart is written to an SVG file and drawn in the terminal, with the
 // subtitle "updated hh:mm:ss · commit N" taken from the watch's stats.
 //
-// MeoSQL maps key -> rowid and stores no row values, so this example encodes
+// MeoDB maps key -> rowid and stores no row values, so this example encodes
 // a reading as
 //   key   = meo_key_int(sensor) ++ meo_key_int(ts_micros)
 //   rowid = the reading in milli-degrees, as an unsigned integer
@@ -24,7 +24,7 @@
 //   * The MpLives are touched only by the main thread (poll callbacks and
 //     renders run there), so mp_meo_poll needs no MpLive lock. With RaizeWeb
 //     workers rendering, use mp_meo_poll_locked(w, &rl->lock) instead.
-//   * The feed is read lock-free by the watch (MeoSQL's feed takes its own
+//   * The feed is read lock-free by the watch (MeoDB's feed takes its own
 //     spin lock for the copy only).
 //
 // Usage (from the mistplot repo root):
@@ -32,12 +32,12 @@
 //                  [--quiet]
 //   --run-for S     run S seconds (default 10), then stop the writer, join it,
 //                   poll and render one last time, and exit 0
-//   --db PATH       database file (default build/integrations/meosql/live.db);
+//   --db PATH       database file (default build/integrations/meodb/live.db);
 //                   it is recreated empty at startup
 //   --svg PATH      the SVG rewritten every second
-//                   (default build/integrations/meosql/live.svg)
+//                   (default build/integrations/meodb/live.svg)
 //   --first-svg P   a copy of the first second's SVG, to compare against the
-//                   final one (default build/integrations/meosql/live.first.svg)
+//                   final one (default build/integrations/meodb/live.first.svg)
 //   --quiet         print the terminal chart only once, at the end
 //
 // Exit codes: 0 ok, 1 setup failed, 2 the writer or a render failed.
@@ -47,15 +47,15 @@ import "std/mem";
 import "std/math";
 import "std/conv";
 import "std/thread";
-import "meosql/src/error/status";
-import "meosql/src/platform/file";
-import "meosql/src/platform/file_linux";
-import "meosql/src/platform/clock_linux";
-import "meosql/src/pager/pager";
-import "meosql/src/types/key";
-import "meosql/src/btree/node";
-import "meosql/src/btree/btree";
-import "meosql/src/feed/feed";
+import "meodb/src/error/status";
+import "meodb/src/platform/file";
+import "meodb/src/platform/file_linux";
+import "meodb/src/platform/clock_linux";
+import "meodb/src/pager/pager";
+import "meodb/src/types/key";
+import "meodb/src/btree/node";
+import "meodb/src/btree/btree";
+import "meodb/src/feed/feed";
 import "mistplot/core/buf";
 import "mistplot/core/color";
 import "mistplot/renderer/backend";
@@ -155,7 +155,7 @@ fn demo_writer(arg: cstring) -> uint32 {
 // --- reload: re-scan the table ---------------------------------------------
 
 // Decode one meo_key_int field at p (9 bytes: tag, then big-endian with the
-// sign bit flipped). MeoSQL has no decoder for it.
+// sign bit flipped). MeoDB has no decoder for it.
 fn demo_key_int(p: uint8*) -> int64 {
   var x: uint64 = 0;
   var i: int32 = 1;
@@ -252,7 +252,7 @@ fn demo_live(width: float64, height: float64) -> MpLive* {
   mp_live_series_name(lv, 2, "sensor 2");
   mp_live_window(lv, DEMO_WINDOW_S);
   var sp: MpChartSpec* = mp_live_spec(lv);
-  sp->title = "Sensor readings (MeoSQL)";
+  sp->title = "Sensor readings (MeoDB)";
   sp->x_label = "since start";
   sp->y_label = "deg C";
   sp->x_format = MP_FMT_TIME;
@@ -321,9 +321,9 @@ fn demo_free(d: Demo*) {
 
 fn main(argc: int32, argv: cstring*) -> int32 {
   var run_for: int32 = 10;
-  var db: cstring = "build/integrations/meosql/live.db";
-  var svg: cstring = "build/integrations/meosql/live.svg";
-  var first_svg: cstring = "build/integrations/meosql/live.first.svg";
+  var db: cstring = "build/integrations/meodb/live.db";
+  var svg: cstring = "build/integrations/meodb/live.svg";
+  var first_svg: cstring = "build/integrations/meodb/live.first.svg";
   var quiet: bool = false;
   var i: int32 = 1;
   while (i < argc) {

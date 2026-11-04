@@ -1,8 +1,8 @@
-// integrations/meosql/tests/meosql_test — mp_meo against a real MeoSQL pager
+// integrations/meodb/tests/meodb_test — mp_meo against a real MeoDB pager
 // file, feed and (for the probe) a second database file.
 //
 // A compiled program, not @test functions: every case needs files under
-// build/integrations/meosql/, a pager and (t9) a thread, none of which the
+// build/integrations/meodb/, a pager and (t9) a thread, none of which the
 // compile-time interpreter provides. Run from the mistplot repo root.
 //
 //   t1 commit     a committed txn of inserts reaches the right table's
@@ -38,24 +38,24 @@
 import "std/io";
 import "std/mem";
 import "std/thread";
-import "meosql/src/error/status";
-import "meosql/src/platform/file";
-import "meosql/src/platform/file_linux";
-import "meosql/src/platform/clock_linux";
-import "meosql/src/pager/pager";
-import "meosql/src/types/key";
-import "meosql/src/btree/btree";
-import "meosql/src/feed/feed";
+import "meodb/src/error/status";
+import "meodb/src/platform/file";
+import "meodb/src/platform/file_linux";
+import "meodb/src/platform/clock_linux";
+import "meodb/src/pager/pager";
+import "meodb/src/types/key";
+import "meodb/src/btree/btree";
+import "meodb/src/feed/feed";
 import "mistplot/test/harness";
 import "mistplot/core/buf";
 import "mistplot/chart/spec";
 import "mistplot/live/stream";
 import "../mp_meo";
 
-const T_DB: string = "build/integrations/meosql/meosql_test.dat";
-const T_DB_GAP: string = "build/integrations/meosql/meosql_test_gap.dat";
-const T_DB_PROBE: string = "build/integrations/meosql/meosql_test_probe.dat";
-const T_DB_THR: string = "build/integrations/meosql/meosql_test_thr.dat";
+const T_DB: string = "build/integrations/meodb/meodb_test.dat";
+const T_DB_GAP: string = "build/integrations/meodb/meodb_test_gap.dat";
+const T_DB_PROBE: string = "build/integrations/meodb/meodb_test_probe.dat";
+const T_DB_THR: string = "build/integrations/meodb/meodb_test_thr.dat";
 const T_A: uint32 = 7;
 const T_B: uint32 = 8;
 const T_C: uint32 = 9;
@@ -474,7 +474,7 @@ fn t7_reload_error() {
 }
 
 fn t8_probe() {
-  var missing: MpMeoProbe* = mp_meo_probe_new("build/integrations/meosql/no_such.dat");
+  var missing: MpMeoProbe* = mp_meo_probe_new("build/integrations/meodb/no_such.dat");
   mp_expect("t8 missing file is an error", mp_meo_probe_check(missing) < 0);
   mp_meo_probe_free(missing);
 

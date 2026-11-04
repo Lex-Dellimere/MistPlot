@@ -1,17 +1,17 @@
-// integrations/meosql/mp_meo — MistPlot live charts driven by MeoSQL's
+// integrations/meodb/mp_meo — MistPlot live charts driven by MeoDB's
 // committed-change feed: the chart knows WHAT changed (which table, which keys,
 // INSERT or REPLACE) and WHEN (commit_seq and commit time), and it reacts only
 // to data whose transaction committed durably.
 //
-// Dependencies: meosql/src/feed/feed (MeoFeed, MeoFeedCursor, MeoChange,
-// meo_feed_read, meo_feed_cursor_end, MEO_CHANGE_*), meosql/src/pager/pager
-// (meo_peek_commit_seq), meosql/src/error/status (MEO_* codes),
+// Dependencies: meodb/src/feed/feed (MeoFeed, MeoFeedCursor, MeoChange,
+// meo_feed_read, meo_feed_cursor_end, MEO_CHANGE_*), meodb/src/pager/pager
+// (meo_peek_commit_seq), meodb/src/error/status (MEO_* codes),
 // mistplot/live/stream (MpLive, mp_live_seq, mp_live_touch), mistplot/core/buf
 // (MP_* codes), std/mem, std/thread (spin_lock), std/conv (str_from_bytes).
 // The core library under src/ never imports this file, so it builds without
-// MeoSQL on disk.
+// MeoDB on disk.
 //
-// Reload model: MeoSQL maps key -> rowid and has no row payloads, so an event
+// Reload model: MeoDB maps key -> rowid and has no row payloads, so an event
 // cannot carry a value to plot and MistPlot does not decode values from
 // events. A watched table is bound to an MpLive and an app-supplied reload
 // callback; when the table had at least one committed change in a poll (or
@@ -47,7 +47,7 @@
 //
 // Threads and locking:
 //   * A watch is polled by ONE thread at a time (a UI frame, e.g. MythicUI
-//     pass 0, or a producer thread). The MeoSQL writer may run on any other
+//     pass 0, or a producer thread). The MeoDB writer may run on any other
 //     thread: meo_feed_read takes only the feed's spin lock for the copy.
 //   * The callbacks run on the polling thread and touch the MpLive. The MpLive
 //     is not thread-safe, so when another thread renders it (RaizeWeb workers
@@ -56,7 +56,7 @@
 //     std/thread spin lock around each callback invocation and the touch (not
 //     around the feed read): pass &rl->lock of an MpRaizeLive. A
 //     single-threaded MythicUI app polls with plain mp_meo_poll.
-//   * A reload that re-queries MeoSQL must not use the writer's pager
+//   * A reload that re-queries MeoDB must not use the writer's pager
 //     concurrently with the writer (the pager is not thread-safe). Run reads
 //     on the writer's thread, or serialize them with the writer under an app
 //     "db lock" (as examples/meo_live_chart.mettle does).
@@ -64,7 +64,7 @@
 // "When": per table MpMeoTableStats (mp_meo_table_stats) and watch-wide
 // MpMeoWatchStats (mp_meo_watch_stats). Times are the feed's commit times
 // (CLOCK_REALTIME microseconds, nondecreasing). A GAP caused by this reader
-// falling behind the ring carries time_us 0 in MeoSQL, so such a GAP updates
+// falling behind the ring carries time_us 0 in MeoDB, so such a GAP updates
 // commit_seq but not the time. mp_meo_fmt_updated / mp_meo_fmt_subtitle turn
 // them into "hh:mm:ss" (UTC) and "updated hh:mm:ss · commit N" with integer
 // arithmetic only (no float interpolation).
@@ -84,9 +84,9 @@
 import "std/mem";
 import "std/conv";
 import "std/thread";
-import "meosql/src/error/status";
-import "meosql/src/pager/pager";
-import "meosql/src/feed/feed";
+import "meodb/src/error/status";
+import "meodb/src/pager/pager";
+import "meodb/src/feed/feed";
 import "mistplot/core/buf";
 import "mistplot/live/stream";
 
@@ -250,7 +250,7 @@ fn meo_find(w: MpMeoWatch*, table_id: uint32) -> int32 {
   return -1;
 }
 
-// Watch `table_id` (the MeoSQL writer's table_id, as passed to
+// Watch `table_id` (the MeoDB writer's table_id, as passed to
 // meo_feed_insert): bind it to `lv` (borrowed; may be 0 for a table tracked
 // only for its stats) and the reload callback, called as
 // mp_meo_reload_cb(ctx, table_id, lv) -> MP_OK or an MP_* code. The first
@@ -602,7 +602,7 @@ export fn mp_meo_probe_free(pr: MpMeoProbe*) {
 
 // 1 when the persisted commit_seq moved since the last successful check (and
 // on the first successful check: nothing has been loaded yet), 0 when it did
-// not or when MeoSQL says "not yet" (a journal exists: status 1; a page 0
+// not or when MeoDB says "not yet" (a journal exists: status 1; a page 0
 // caught mid-write: -MEO_ERR_BUSY; a transient -MEO_ERR_CORRUPT, retried up to
 // MP_MEO_PROBE_CORRUPT_RETRIES consecutive times), negative MEO code on a hard
 // error (missing file, foreign file, persistent corruption). last_seq only

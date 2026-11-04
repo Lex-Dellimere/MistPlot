@@ -7,9 +7,9 @@
 #      (release builds have miscompiles, so both run)
 #   4. tools/golden.sh: cmd/golden in debug and release, byte-compared with
 #      every file in tests/golden/
-#   5. the raize, mythic and meosql integration builds (each skipped when
-#      ../raize_web, ../mythic_ui or the MeoSQL checkout is missing;
-#      MEOSQL_DIR picks the checkout, default ../meosql)
+#   5. the raize, mythic and meodb integration builds (each skipped when
+#      ../raize_web, ../mythic_ui or the MeoDB checkout is missing;
+#      MEODB_DIR picks the checkout, default ../meodb)
 #   6. no memory-analyser warning (warning[M01..]) for a MistPlot file in any
 #      build log of this run
 #
@@ -87,11 +87,11 @@ else
   echo "skip  integration-mythic (no ../mythic_ui)"
 fi
 
-MEOSQL_DIR="${MEOSQL_DIR:-$ROOT/../meosql}"
-if [ -f "$MEOSQL_DIR/src/feed/feed.mettle" ]; then
-  step integration-meosql env MEOSQL_DIR="$MEOSQL_DIR" integrations/meosql/build.sh
+MEODB_DIR="${MEODB_DIR:-$ROOT/../meodb}"
+if [ -f "$MEODB_DIR/src/feed/feed.mettle" ]; then
+  step integration-meodb env MEODB_DIR="$MEODB_DIR" integrations/meodb/build.sh
 else
-  echo "skip  integration-meosql (no change feed in $MEOSQL_DIR)"
+  echo "skip  integration-meodb (no change feed in $MEODB_DIR)"
 fi
 
 step memory-warnings tools/lint.sh --logs "$OUT" build/golden build/integrations
