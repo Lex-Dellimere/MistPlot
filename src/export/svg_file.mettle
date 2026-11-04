@@ -16,10 +16,10 @@
 // Phase 1) and still closes the handle.
 
 import "std/io";
-import "core/buf";
-import "renderer/backend";
-import "renderer/scene";
-import "backends/web/svg";
+import "mistplot/core/buf";
+import "mistplot/renderer/backend";
+import "mistplot/renderer/scene";
+import "mistplot/backends/web/svg";
 
 export fn mp_export_svg(scene: MpScene*, o: MpRenderOpts*,
                         path: cstring) -> int32 {

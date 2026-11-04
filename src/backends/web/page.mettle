@@ -23,12 +23,12 @@
 // The <figcaption> is omitted when spec->title is empty. The title is escaped
 // (& < > " ') exactly like the SVG's text nodes, so a title is never markup.
 
-import "core/buf";
-import "renderer/scene";
-import "renderer/backend";
-import "chart/spec";
-import "chart/resolve";
-import "backends/web/svg";
+import "mistplot/core/buf";
+import "mistplot/renderer/scene";
+import "mistplot/renderer/backend";
+import "mistplot/chart/spec";
+import "mistplot/chart/resolve";
+import "mistplot/backends/web/svg";
 
 // Writes each line of `s` prefixed with two spaces. The final newline of `s`
 // does not open a phantom indented line.

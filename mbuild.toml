@@ -4,7 +4,6 @@ version = "0.1.0"
 
 [build]
 targets = ["linux"]
-# Sources live in src/. `-I src` makes every import project-relative:
-#   import "core/scale"  ->  src/core/scale.mettle
-flags = ["-I", "src"]
+# Sources live in src/. mettle.deps maps mistplot=./src, so
+#   import "mistplot/core/scale"  ->  src/core/scale.mettle
 

@@ -15,13 +15,13 @@
 // defers that to Phase 2: a label that overlaps another is still emitted, in
 // the place its tick asks for).
 
-import "core/color";
-import "core/geom";
-import "core/scale";
-import "core/text";
-import "renderer/scene";
-import "chart/spec";
-import "chart/layout";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/scale";
+import "mistplot/core/text";
+import "mistplot/renderer/scene";
+import "mistplot/chart/spec";
+import "mistplot/chart/layout";
 
 // Pixel position of one axis value: a band axis labels its band centres (the
 // tick values of a band axis are band indices), a value axis maps the value.

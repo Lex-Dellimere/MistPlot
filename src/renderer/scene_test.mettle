@@ -8,14 +8,14 @@
 
 import "std/conv";
 import "std/mem";
-import "harness";
-import "core/buf";
-import "core/color";
-import "core/geom";
-import "core/text";
-import "core/data";
-import "renderer/scene";
-import "renderer/backend";
+import "mistplot/harness";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/text";
+import "mistplot/core/data";
+import "mistplot/renderer/scene";
+import "mistplot/renderer/backend";
 
 // Injected measurer: twice the byte length, so a test can tell the seam apart
 // from the default 0.58 heuristic.

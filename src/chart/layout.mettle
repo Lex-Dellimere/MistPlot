@@ -26,11 +26,11 @@
 // would eat it. plot.w/plot.h are floored at 1 for degenerate canvases.
 
 import "std/math";
-import "core/geom";
-import "core/text";
-import "core/scale";
-import "core/data";
-import "chart/spec";
+import "mistplot/core/geom";
+import "mistplot/core/text";
+import "mistplot/core/scale";
+import "mistplot/core/data";
+import "mistplot/chart/spec";
 
 export struct MpFrame { plot: MpRect; title: MpRect; legend: MpRect;
                         x_label: MpRect; y_label: MpRect; }

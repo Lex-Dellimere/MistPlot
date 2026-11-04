@@ -15,8 +15,8 @@
 
 import "std/mem";
 import "std/conv";
-import "core/color";
-import "core/format";
+import "mistplot/core/color";
+import "mistplot/core/format";
 
 export const MP_OK: int32 = 0;
 export const MP_ERR_ARG: int32 = 1;

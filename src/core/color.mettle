@@ -14,7 +14,7 @@
 // returns a borrowed view of it.
 
 import "std/conv";
-import "core/format";
+import "mistplot/core/format";
 
 export struct MpColor { r: uint8; g: uint8; b: uint8; a: uint8; }
 

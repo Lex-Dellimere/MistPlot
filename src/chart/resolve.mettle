@@ -17,18 +17,18 @@
 
 import "std/math";
 import "std/mem";
-import "core/buf";
-import "core/color";
-import "core/data";
-import "core/format";
-import "core/geom";
-import "core/scale";
-import "core/text";
-import "core/ticks";
-import "renderer/scene";
-import "chart/spec";
-import "chart/layout";
-import "chart/axis";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/data";
+import "mistplot/core/format";
+import "mistplot/core/geom";
+import "mistplot/core/scale";
+import "mistplot/core/text";
+import "mistplot/core/ticks";
+import "mistplot/renderer/scene";
+import "mistplot/chart/spec";
+import "mistplot/chart/layout";
+import "mistplot/chart/axis";
 
 fn chart_none() -> MpColor {
   return mp_color_a(0, 0, 0, 0);

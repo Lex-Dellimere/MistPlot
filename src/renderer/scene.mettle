@@ -31,10 +31,10 @@
 
 import "std/mem";
 import "std/conv";
-import "core/buf";
-import "core/color";
-import "core/geom";
-import "core/text";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/core/text";
 
 export const MP_NODE_RECT: int32 = 0;
 export const MP_NODE_LINE: int32 = 1;

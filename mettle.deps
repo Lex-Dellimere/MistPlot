@@ -1,0 +1,3 @@
+# mistplot=./src lets every file import its siblings as "mistplot/core/scale",
+# here and from an app that maps mistplot=<path>/src.
+mistplot=./src

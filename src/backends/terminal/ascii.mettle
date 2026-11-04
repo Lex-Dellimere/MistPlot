@@ -51,10 +51,10 @@
 //     spaces from each row. Every row ends with a newline in both modes.
 
 import "std/math";
-import "core/buf";
-import "core/color";
-import "renderer/backend";
-import "renderer/scene";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/renderer/backend";
+import "mistplot/renderer/scene";
 
 export const MP_ASCII_MAX_COLS: int32 = 200;
 export const MP_ASCII_MAX_ROWS: int32 = 80;

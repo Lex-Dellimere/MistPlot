@@ -21,13 +21,13 @@
 // argument errors.
 
 import "std/conv";
-import "harness";
-import "core/buf";
-import "core/color";
-import "core/geom";
-import "renderer/scene";
-import "renderer/backend";
-import "backends/terminal/ascii";
+import "mistplot/harness";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
+import "mistplot/renderer/scene";
+import "mistplot/renderer/backend";
+import "mistplot/backends/terminal/ascii";
 
 const ESC: int32 = 27;
 

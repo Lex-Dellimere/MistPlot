@@ -8,7 +8,7 @@
 // allocates nothing but out's growth, and reads no global state except the
 // theme and the text-measure seam.
 
-import "core/color";
+import "mistplot/core/color";
 
 export struct MpRenderOpts { width: float64; height: float64; theme: MpTheme;
                              pad: float64; aria: bool; }

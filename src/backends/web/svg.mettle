@@ -43,11 +43,11 @@
 //     consumed either, because Phase 1 forbids ids (no aria-labelledby is
 //     possible); the root always carries role="img".
 
-import "core/buf";
-import "core/color";
-import "core/format";
-import "renderer/backend";
-import "renderer/scene";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/format";
+import "mistplot/renderer/backend";
+import "mistplot/renderer/scene";
 
 // Anything at or beyond 1e15 would make mp_fmt_fixed fall back to `%g`-style
 // scientific text, so it is serialized as 0 instead (`e+` is banned here).

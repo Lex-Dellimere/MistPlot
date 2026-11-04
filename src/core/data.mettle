@@ -19,7 +19,7 @@
 
 import "std/mem";
 import "std/conv";
-import "core/buf";
+import "mistplot/core/buf";
 
 export struct MpSeries { name: string; xs: float64*; ys: float64*;
                          n: int64; cap: int64; }

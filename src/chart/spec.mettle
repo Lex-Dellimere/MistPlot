@@ -11,11 +11,11 @@
 // caller's buffer and returns a borrowed view, like core/format does.
 
 import "std/math";
-import "core/color";
-import "core/data";
-import "core/format";
-import "core/geom";
-import "core/scale";
+import "mistplot/core/color";
+import "mistplot/core/data";
+import "mistplot/core/format";
+import "mistplot/core/geom";
+import "mistplot/core/scale";
 
 export const MP_CHART_LINE: int32 = 0;
 export const MP_CHART_BAR: int32 = 1;

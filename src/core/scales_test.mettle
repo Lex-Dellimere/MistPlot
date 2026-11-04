@@ -5,10 +5,10 @@
 // mp_expect_str; no "contains" where an exact string is possible.
 
 import "std/math";
-import "harness";
-import "core/format";
-import "core/scale";
-import "core/ticks";
+import "mistplot/harness";
+import "mistplot/core/format";
+import "mistplot/core/scale";
+import "mistplot/core/ticks";
 
 fn check_format() {
   var b: uint8[64];
