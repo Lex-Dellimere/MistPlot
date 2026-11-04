@@ -5872,7 +5872,7 @@ Computes the tangent dy/dx at every point of a run for monotone cubic smoothing.
 
 **Errors:**
 
-- `MP_ERR_ARG` a pointer is 0 (with n > 0), n < 0, or the points are not finite with strictly increasing x; out is left partly written.
+- `MP_ERR_ARG` a pointer is 0 (with n > 0), n < 0, or the points are not finite with strictly increasing x; out is not written.
 
 **Memory:** Writes only out[0 .. n); nothing is retained.
 
