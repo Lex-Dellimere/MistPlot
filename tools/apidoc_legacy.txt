@@ -12,13 +12,7 @@ src/chart/axis.mettle
 src/chart/layout.mettle
 src/chart/resolve.mettle
 src/chart/spec.mettle
-src/core/color.mettle
-src/core/data.mettle
-src/core/format.mettle
-src/core/geom.mettle
-src/core/scale.mettle
 src/core/text.mettle
-src/core/ticks.mettle
 src/export/svg_file.mettle
 src/live/decimate.mettle
 src/live/ring.mettle

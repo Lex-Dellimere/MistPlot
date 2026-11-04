@@ -1,28 +1,41 @@
-// core/scale — linear / log / band scales as plain value structs.
-//
-// Dependencies: std/math only (nothing chart-shaped; scales never see a scene).
-// A `kind` discriminant instead of three types keeps copies cheap.
-//
-// Contract:
-//   linear/log: map(d0) == r0, map(d1) == r1; a degenerate domain d0 == d1 maps
-//   everything to the range midpoint and sets valid = false.
-//   log: requires d0 > 0 && d1 > 0, otherwise valid = false and map returns r0;
-//   a value <= 0 is clamped to d0 (no NaN).
-//   band: step = (r1-r0)/n, pad is a fraction of step clamped to 0..0.9,
-//   width = step*(1-pad), start = r0 + i*step + step*pad/2.
-//   map on a band treats the value as a fractional band index (r0 + v*step), so
-//   invert(map(v)) == v; invert returns the band index as a float.
+//! Linear, log and band scales as plain value structs (one kind field, cheap to copy).
+//! Uses std/math only. Linear and log map d0 to r0 and d1 to r1; a degenerate domain maps
+//! everything to the range midpoint and sets valid = false. Log needs d0, d1 > 0 (else
+//! valid = false and map returns r0) and clamps values <= 0 to d0. A band scale splits
+//! [r0, r1] into n steps; map reads a fractional band index, so invert(map(v)) == v.
 
 import "std/math";
 
+/// Scale kind: proportional mapping.
 export const MP_SCALE_LINEAR: int32 = 0;
+/// Scale kind: logarithmic mapping over a positive domain.
 export const MP_SCALE_LOG: int32 = 1;
+/// Scale kind: n equal bands (categories) with padding between them.
 export const MP_SCALE_BAND: int32 = 2;
 
-export struct MpScale { kind: int32; d0: float64; d1: float64; r0: float64;
-                        r1: float64; n_bands: int32; pad: float64;
-                        valid: bool; }
+/// A mapping from a data domain to a pixel range.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpScale {
+  kind: int32;      /// MP_SCALE_LINEAR, MP_SCALE_LOG or MP_SCALE_BAND
+  d0: float64;      /// domain start, data units (0 for bands)
+  d1: float64;      /// domain end, data units (n_bands for bands)
+  r0: float64;      /// range start, px
+  r1: float64;      /// range end, px (may be < r0, e.g. a y axis)
+  n_bands: int32;   /// band count (1 for linear and log)
+  pad: float64;     /// band padding as a fraction of the step, 0 .. 0.9
+  valid: bool;      /// false for a degenerate, non-finite or (log) non-positive domain
+}
 
+/// A linear scale mapping [d0, d1] onto [r0, r1].
+///
+/// @param d0 Domain start. Units: data units. Valid: finite and != d1; otherwise valid
+///   is false.
+/// @param d1 Domain end. Units: data units. Valid: finite and != d0; otherwise valid is
+///   false.
+/// @param r0 Range start. Units: px. Valid: any.
+/// @param r1 Range end. Units: px. Valid: any.
+/// @return The scale.
 export fn mp_scale_linear(d0: float64, d1: float64, r0: float64,
                           r1: float64) -> MpScale {
   var s: MpScale;
@@ -38,6 +51,15 @@ export fn mp_scale_linear(d0: float64, d1: float64, r0: float64,
   return s;
 }
 
+/// A logarithmic scale mapping [d0, d1] onto [r0, r1].
+///
+/// @param d0 Domain start. Units: data units. Valid: finite and != d1, > 0; otherwise valid
+///   is false.
+/// @param d1 Domain end. Units: data units. Valid: finite and != d0, > 0; otherwise valid is
+///   false.
+/// @param r0 Range start. Units: px. Valid: any.
+/// @param r1 Range end. Units: px. Valid: any.
+/// @return The scale.
 export fn mp_scale_log(d0: float64, d1: float64, r0: float64,
                        r1: float64) -> MpScale {
   var s: MpScale;
@@ -55,6 +77,14 @@ export fn mp_scale_log(d0: float64, d1: float64, r0: float64,
   return s;
 }
 
+/// A band scale of n_bands equal steps over [r0, r1].
+/// Band i starts at r0 + i*step + step*pad/2 and is step*(1 - pad) wide.
+///
+/// @param r0 Range start. Units: px. Valid: any.
+/// @param r1 Range end. Units: px. Valid: any.
+/// @param n_bands Number of bands. Valid: >= 1; otherwise valid is false.
+/// @param pad Gap between bands as a fraction of the step. Valid: 0 .. 0.9; clamped.
+/// @return The scale.
 export fn mp_scale_band(r0: float64, r1: float64, n_bands: int32,
                         pad: float64) -> MpScale {
   var s: MpScale;
@@ -77,6 +107,13 @@ fn scale_band_step(s: MpScale) -> float64 {
   return (s.r1 - s.r0) / (float64)s.n_bands;
 }
 
+/// Maps a data value to a pixel position.
+/// Bands read v as a fractional band index (r0 + v*step).
+///
+/// @param s The scale. Valid: any; an invalid scale gives the range midpoint (r0 for a
+///   log scale over a non-positive domain).
+/// @param v The value. Units: data units. Valid: any; log scales map v <= 0 as d0.
+/// @return The position in px.
 export fn mp_scale_map(s: MpScale, v: float64) -> float64 {
   if (s.kind == MP_SCALE_BAND) {
     return s.r0 + v * scale_band_step(s);
@@ -99,6 +136,11 @@ export fn mp_scale_map(s: MpScale, v: float64) -> float64 {
   return s.r0 + t2 * (s.r1 - s.r0);
 }
 
+/// Maps a pixel position back to a data value (a fractional band index for bands).
+///
+/// @param s The scale. Valid: any; an invalid or zero-width scale gives d0 (0 for bands).
+/// @param p The position. Units: px. Valid: any.
+/// @return The value in data units.
 export fn mp_scale_invert(s: MpScale, p: float64) -> float64 {
   if (s.kind == MP_SCALE_BAND) {
     var st: float64 = scale_band_step(s);
@@ -114,16 +156,30 @@ export fn mp_scale_invert(s: MpScale, p: float64) -> float64 {
   return s.d0 + (p - s.r0) / (s.r1 - s.r0) * (s.d1 - s.d0);
 }
 
+/// Width of one band, padding excluded.
+///
+/// @param s A band scale. Valid: n_bands >= 1; otherwise 0.
+/// @return step * (1 - pad), px.
 export fn mp_scale_band_width(s: MpScale) -> float64 {
   var st: float64 = scale_band_step(s);
   return st * (1.0 - s.pad);
 }
 
+/// Left (or top) edge of band i.
+///
+/// @param s A band scale. Valid: n_bands >= 1.
+/// @param i Band index. Valid: 0 .. n_bands-1; others extrapolate.
+/// @return r0 + i*step + step*pad/2, px.
 export fn mp_scale_band_start(s: MpScale, i: int32) -> float64 {
   var st: float64 = scale_band_step(s);
   return s.r0 + (float64)i * st + st * s.pad * 0.5;
 }
 
+/// Centre of band i.
+///
+/// @param s A band scale. Valid: n_bands >= 1.
+/// @param i Band index. Valid: 0 .. n_bands-1; others extrapolate.
+/// @return The centre, px.
 export fn mp_scale_band_center(s: MpScale, i: int32) -> float64 {
   return mp_scale_band_start(s, i) + mp_scale_band_width(s) * 0.5;
 }

@@ -1,4 +1,4 @@
-// core/core_test — core/error, mem, str, extent, target and the buf writers.
+// core/core_test — core/error, mem, str, extent, target, color, geom and the buf writers.
 //
 // Pure: no files, no externs of its own, so the same checks run in the compile-time
 // interpreter and in both compiled builds. Each check group ends with a leak check.
@@ -11,6 +11,8 @@ import "mistplot/core/str";
 import "mistplot/core/extent";
 import "mistplot/core/target";
 import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/geom";
 
 fn check_error() {
   mp_expect_str("error ok", mp_error_str(MP_OK), "ok");
@@ -216,6 +218,90 @@ fn check_buf() {
   mp_expect_i64("buf no leak", mp_alloc_live(), live0);
 }
 
+fn css(c: MpColor) -> string {
+  var tmp: uint8[48];
+  return mp_str_dup(mp_color_css(c, &tmp[0], 48));
+}
+
+fn check_css(name: string, c: MpColor, want: string) {
+  var s: string = css(c);
+  mp_expect_str(name, s, want);
+  mp_str_free(s);
+}
+
+fn check_color() {
+  var live0: int64 = mp_alloc_live();
+  mp_expect("rgb", mp_color_eq(mp_rgb(1, 2, 3), mp_rgba(1, 2, 3, 255)));
+  mp_expect("hex", mp_color_eq(mp_hex(0x4269D0), mp_rgb(0x42, 0x69, 0xD0)));
+  mp_expect("hex ignores high bits", mp_color_eq(mp_hex(0xFF000001), mp_rgb(0, 0, 1)));
+  mp_expect("color_hex", mp_color_hex(mp_rgba(0x12, 0x34, 0x56, 7)) == (uint32)0x123456);
+  mp_expect("eq sees alpha", !mp_color_eq(mp_rgb(1, 2, 3), mp_rgba(1, 2, 3, 254)));
+  mp_expect("alpha", mp_color_eq(mp_color_alpha(mp_rgb(9, 8, 7), 51), mp_rgba(9, 8, 7, 51)));
+  var a: MpColor = mp_rgba(0, 100, 255, 0);
+  var b: MpColor = mp_rgba(255, 200, 0, 255);
+  mp_expect("mix 0", mp_color_eq(mp_color_mix(a, b, 0.0), a));
+  mp_expect("mix 1", mp_color_eq(mp_color_mix(a, b, 1.0), b));
+  mp_expect("mix half", mp_color_eq(mp_color_mix(a, b, 0.5), mp_rgba(128, 150, 128, 128)));
+  mp_expect("mix clamps", mp_color_eq(mp_color_mix(a, b, 7.0), b));
+  mp_expect("mix nan", mp_color_eq(mp_color_mix(a, b, NAN()), a));
+  check_css("css opaque", mp_hex(0x4269D0), "#4269d0");
+  check_css("css alpha", mp_rgba(1, 2, 3, 128), "rgba(1,2,3,0.502)");
+  mp_expect("aliases", mp_color_eq(mp_color(1, 2, 3), mp_rgb(1, 2, 3))
+            && mp_color_eq(mp_color_a(1, 2, 3, 4), mp_rgba(1, 2, 3, 4))
+            && mp_color_eq(mp_color_from_hex(0x010203), mp_rgb(1, 2, 3)));
+  mp_expect_i64("font stack", (int64)MP_FONT_STACK.length, (int64)77);
+  mp_expect_i64("str no leak in color", mp_alloc_live(), live0);
+}
+
+fn check_theme() {
+  var l: MpTheme = mp_theme_light();
+  var d: MpTheme = mp_theme_dark();
+  mp_expect("light bg", mp_color_hex(l.bg) == (uint32)0xFFFFFF);
+  mp_expect("light title", mp_color_hex(l.title) == (uint32)0x111827);
+  mp_expect("light text", mp_color_hex(l.text) == (uint32)0x374151);
+  mp_expect("light muted", mp_color_hex(l.muted) == (uint32)0x6B7280);
+  mp_expect("light grid", mp_color_hex(l.grid) == (uint32)0xE5E7EB);
+  mp_expect("light axis", mp_color_hex(l.axis) == (uint32)0x9CA3AF);
+  mp_expect("dark bg", mp_color_hex(d.bg) == (uint32)0x111827);
+  mp_expect("dark title", mp_color_hex(d.title) == (uint32)0xF9FAFB);
+  mp_expect("dark text", mp_color_hex(d.text) == (uint32)0xD1D5DB);
+  mp_expect("dark muted", mp_color_hex(d.muted) == (uint32)0x9CA3AF);
+  mp_expect("dark grid", mp_color_hex(d.grid) == (uint32)0x1F2937);
+  mp_expect("dark axis", mp_color_hex(d.axis) == (uint32)0x4B5563);
+  mp_expect_i64("palette size", (int64)l.n_palette, (int64)MP_PALETTE_MAX);
+  mp_expect("palette 0", mp_color_hex(mp_theme_series(&l, 0)) == (uint32)0x4269D0);
+  mp_expect("palette 9", mp_color_hex(mp_theme_series(&d, 9)) == (uint32)0x9498A0);
+  mp_expect("palette wraps", mp_color_hex(mp_theme_series(&l, 12)) == (uint32)0xFF725C);
+  mp_expect("palette negative", mp_color_hex(mp_theme_series(&l, -1)) == (uint32)0x9498A0);
+  mp_expect("series null theme", mp_color_hex(mp_theme_series(0, 3)) == (uint32)0x4269D0);
+  var l2: MpTheme = mp_theme_light();
+  mp_expect("theme eq", mp_theme_eq(&l, &l2));
+  mp_expect("theme ne", !mp_theme_eq(&l, &d));
+  l2.palette[3] = mp_rgb(0, 0, 0);
+  mp_expect("theme palette ne", !mp_theme_eq(&l, &l2));
+  l2 = mp_theme_light();
+  l2.n_palette = 4;
+  mp_expect("theme count ne", !mp_theme_eq(&l, &l2));
+  mp_expect("theme null", mp_theme_eq(0, 0) && !mp_theme_eq(&l, 0));
+  mp_expect_str("legacy name", d.name, "dark");
+  mp_expect("legacy fg", mp_color_hex(l.fg) == (uint32)0x1F2933);
+}
+
+fn check_geom() {
+  mp_expect_near("clamp in", mp_clamp(0.5, 0.0, 1.0), 0.5, 0.0);
+  mp_expect_near("clamp low", mp_clamp(-2.0, -1.0, 1.0), -1.0, 0.0);
+  mp_expect_near("clamp high", mp_clamp(9.0, -1.0, 1.0), 1.0, 0.0);
+  mp_expect_near("clamp nan", mp_clamp(NAN(), 2.0, 3.0), 2.0, 0.0);
+  mp_expect_near("clamp inverted", mp_clamp(9.0, 3.0, 2.0), 3.0, 0.0);
+  mp_expect_near("clamp01", mp_clamp01(1.5), 1.0, 0.0);
+  var r: MpRect = mp_rect_shrink(mp_rect(0.0, 0.0, 100.0, 50.0),
+                                 mp_insets(1.0, 2.0, 3.0, 4.0));
+  mp_expect("shrink", r.x == 4.0 && r.y == 1.0 && r.w == 94.0 && r.h == 46.0);
+  mp_expect("contains edge", mp_rect_contains(r, 4.0, 47.0));
+  mp_expect("outside", !mp_rect_contains(r, 3.9, 10.0));
+  mp_expect("nan outside", !mp_rect_contains(r, NAN(), 10.0));
+}
+
 fn run_all() {
   check_error();
   check_mem();
@@ -224,6 +310,9 @@ fn run_all() {
   check_extent();
   check_target();
   check_buf();
+  check_color();
+  check_theme();
+  check_geom();
 }
 
 export fn main() -> int32 {
