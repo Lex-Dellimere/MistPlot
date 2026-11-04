@@ -157,6 +157,45 @@ fn chart_live() -> MpChart* {
   return c;
 }
 
+// 20000 noisy samples per series, so the Braille fast paths (dot runs, unclipped segments)
+// carry most of the drawing.
+fn chart_dense() -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_set_title(c, "Dense");
+  var a: int32 = mp_chart_series(c, "wave");
+  var b: int32 = mp_chart_series(c, "noise");
+  var seed: uint32 = 7;
+  var i: int32 = 0;
+  while (i < 20000) {
+    var t: float64 = (float64)i;
+    mp_chart_push(c, a, t, 50.0 + 30.0 * sin(t * 0.002) + 10.0 * lcg(&seed));
+    mp_chart_push(c, b, t, 20.0 + 60.0 * lcg(&seed));
+    i = i + 1;
+  }
+  return c;
+}
+
+// 600 scattered points in three marker shapes, some on the plot edges.
+fn chart_scatter_dense() -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_SCATTER);
+  var shapes: int32[3] = [MP_MARK_CIRCLE, MP_MARK_SQUARE, MP_MARK_DIAMOND];
+  var seed: uint32 = 11;
+  var k: int32 = 0;
+  while (k < 3) {
+    var s: int32 = mp_chart_series(c, "s");
+    mp_series_set_marker(c, s, shapes[k], 2.0 + (float64)k);
+    var i: int32 = 0;
+    while (i < 200) {
+      mp_chart_push(c, s, lcg(&seed) * 100.0, lcg(&seed) * 100.0);
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+  mp_chart_set_x_range(c, 0.0, 100.0);
+  mp_chart_set_y_range(c, 0.0, 100.0);
+  return c;
+}
+
 fn fixture_hidpi() -> int32 {
   var c: MpChart* = chart_line();
   var t: MpTarget = mp_target_hidpi(640.0, 400.0, 1.5);
@@ -178,6 +217,8 @@ fn run(name: string) -> int32 {
   if (name == "term_braille") { return term(chart_line(), 100, 28, MP_TERM_BRAILLE); }
   if (name == "term_blocks") { return term(chart_bars(), 80, 24, MP_TERM_BLOCKS); }
   if (name == "term_ascii") { return term(chart_line(), 80, 24, MP_TERM_ASCII); }
+  if (name == "term_dense") { return term(chart_dense(), 120, 32, MP_TERM_BRAILLE); }
+  if (name == "term_scatter") { return term(chart_scatter_dense(), 90, 30, MP_TERM_BRAILLE); }
   if (name == "term_plain") {
     return term(chart_live(), 80, 24, MP_TERM_BRAILLE | MP_TERM_PLAIN);
   }
@@ -190,6 +231,7 @@ export fn main(argc: int32, argv: cstring*) -> int32 {
     if (r != 2) { return r; }
   }
   print_err("usage: golden <fixture>   (line area_smooth bar_dark scatter_markers ");
-  print_err("live_window hidpi_1_5 term_braille term_blocks term_ascii term_plain)\n");
+  print_err("live_window hidpi_1_5 term_braille term_blocks term_ascii term_plain ");
+  print_err("term_dense term_scatter)\n");
   return 2;
 }
