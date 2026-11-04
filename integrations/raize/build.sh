@@ -4,7 +4,7 @@
 # channel push end to end with python (RaizeWeb's ws_client.py, imported from
 # ../raize_web) and checks both embed scripts with node. Prints PASS or FAIL.
 #
-# Needs ../raize_web next to this repo (mettle.deps maps raize=../raize_web).
+# Needs ../raize_web next to this repo (integrations/mettle.deps maps raize=).
 # Env: METTLE (compiler, default ../Mettle/bin/mettle next to this repo),
 #      SMOKE_PORT (default derived from the process id; the push check uses SMOKE_PORT + 1).
 

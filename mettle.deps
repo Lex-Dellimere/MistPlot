@@ -1,7 +1,0 @@
-# mistplot=./src lets every file import its siblings as "mistplot/core/scale",
-# here and from an app that maps mistplot=<path>/src. The other lines are the
-# libraries the integrations build against.
-mistplot=./src
-raize=../raize_web
-mythic=../mythic_ui/src
-meosql=../meosql

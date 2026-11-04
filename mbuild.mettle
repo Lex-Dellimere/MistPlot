@@ -1,0 +1,20 @@
+// MistPlot: charts for Mettle, static and live, as SVG, HTML, terminal text or
+// MythicUI widgets.
+//
+//   mbuild test     @test functions in the compile-time interpreter
+//   mbuild check    type-check every bin
+//   ./check.sh      the whole gate: debug and release, goldens, integrations
+//
+// Apps depend on it with mb_dep_path("mistplot", "<path>") and import
+// "mistplot/chart/spec" and so on, which resolve to src/.
+//
+// Needs the head compiler, not the v0.17.0 release:
+//   export MBUILD_METTLE_LINUX=/home/nox/Projects/mettle/Mettle/bin/mettle
+
+import "mbuild/api";
+
+fn project() {
+  mb_package("mistplot", "0.1.0");
+  mb_targets("linux");
+  mb_import_root("src");
+}

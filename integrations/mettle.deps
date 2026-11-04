@@ -1,0 +1,7 @@
+# The integrations build against these host libraries; the library in src/
+# never imports them, so they stay out of the project (mbuild.mettle). Each
+# integrations/*/build.sh builds its own files with the compiler directly.
+mistplot=../src
+raize=../../raize_web
+mythic=../../mythic_ui/src
+meosql=../../meosql

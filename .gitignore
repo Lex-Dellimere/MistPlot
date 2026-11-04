@@ -2,3 +2,4 @@ build/
 .mbuild/
 *.o
 *.svg.tmp
+/mettle.deps

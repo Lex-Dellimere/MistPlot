@@ -1,9 +1,0 @@
-[package]
-name = "mistplot"
-version = "0.1.0"
-
-[build]
-targets = ["linux"]
-# Sources live in src/. mettle.deps maps mistplot=./src, so
-#   import "mistplot/core/scale"  ->  src/core/scale.mettle
-

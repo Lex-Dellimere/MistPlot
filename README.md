@@ -32,13 +32,16 @@ runs the RaizeWeb, MythicUI and MeoSQL integration builds. It prints `PASS`.
 `MEOSQL_DIR` picks the MeoSQL checkout (default `../meosql`); an
 integration whose library isn't on disk is skipped.
 
-To use MistPlot from an app, map it in the app's `mettle.deps`:
+To use MistPlot from an app, add it to the app's `mbuild.mettle`:
 
-```
-mistplot=../mistplot/src
+```mettle
+mb_dep_path("mistplot", "../mistplot");
 ```
 
-and import modules as `import "mistplot/chart/spec";`.
+and import modules as `import "mistplot/chart/spec";`. The integrations live
+outside `src/`, so an app imports one by path (for example
+`import "../mistplot/integrations/raize/mp_raize";`) and maps its host
+library itself.
 
 ## Static charts
 
@@ -86,8 +89,7 @@ counts changes and is what the web and MythicUI integrations use to skip work.
 
 ## RaizeWeb
 
-`integrations/raize/mp_raize.mettle`. Add `raize=../raize_web` to
-`mettle.deps`.
+`integrations/raize/mp_raize.mettle`. Your app maps RaizeWeb as `raize`.
 
 ```mettle
 fn h_chart(ctx: RzContext*) -> int32 { return mp_raize_svg(ctx, g_spec, g_opts); }
@@ -117,8 +119,7 @@ Example: `integrations/raize/examples/dashboard.mettle` (port 8088,
 
 ## MythicUI
 
-`integrations/mythic/mp_mythic.mettle`. Add `mythic=../mythic_ui/src` to
-`mettle.deps`.
+`integrations/mythic/mp_mythic.mettle`. Your app maps MythicUI as `mythic`.
 
 ```mettle
 fn frame(ui: MythicUi*, ud: rawptr) {
@@ -140,8 +141,8 @@ Example: `integrations/mythic/examples/live_dashboard.mettle`.
 
 ## MeoSQL
 
-`integrations/meosql/mp_meo.mettle`, on MeoSQL's committed-change feed. Add
-`meosql=../meosql` to `mettle.deps`.
+`integrations/meosql/mp_meo.mettle`, on MeoSQL's committed-change feed. Your
+app maps MeoSQL as `meosql`.
 
 ```mettle
 var w: MpMeoWatch* = mp_meo_watch_new(feed);
