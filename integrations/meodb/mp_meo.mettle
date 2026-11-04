@@ -1,197 +1,210 @@
-// integrations/meodb/mp_meo — MistPlot live charts driven by MeoDB's
-// committed-change feed: the chart knows WHAT changed (which table, which keys,
-// INSERT or REPLACE) and WHEN (commit_seq and commit time), and it reacts only
-// to data whose transaction committed durably.
-//
-// Dependencies: meodb/src/feed/feed (MeoFeed, MeoFeedCursor, MeoChange,
-// meo_feed_read, meo_feed_cursor_end, MEO_CHANGE_*), meodb/src/pager/pager
-// (meo_peek_commit_seq), meodb/src/error/status (MEO_* codes),
-// mistplot/live/stream (MpLive, mp_live_seq, mp_live_touch), mistplot/core/buf
-// (MP_* codes), std/mem, std/thread (spin_lock), std/conv (str_from_bytes).
-// The core library under src/ never imports this file, so it builds without
-// MeoDB on disk.
-//
-// Reload model: MeoDB maps key -> rowid and has no row payloads, so an event
-// cannot carry a value to plot and MistPlot does not decode values from
-// events. A watched table is bound to an MpLive and an app-supplied reload
-// callback; when the table had at least one committed change in a poll (or
-// the feed reported a GAP), mp_meo_poll calls that callback ONCE (coalesced),
-// and the app re-queries the table and refreshes the MpLive. Apps that want
-// incremental handling also register a per-change callback
-// (mp_meo_watch_changes), which sees every event of that table, in commit
-// order, before the coalesced reload.
-//
-// Poll semantics (mp_meo_poll):
-//   * Bounded: the poll drains events up to the feed's newest event at the
-//     moment the poll starts (a cursor_end snapshot), in batches of
-//     MP_MEO_BATCH with a fixed MP_MEO_KEYBUF key buffer, so a writer that
-//     commits continuously cannot keep one poll running forever.
-//   * Per event: GAP marks every watched table for reload; an event of an
-//     unwatched table only updates the watch-wide "last commit" and the
-//     `ignored` counter; an event of a watched table bumps its change counters,
-//     records its commit_seq / time_us and calls its change callback.
-//   * Then each marked table's reload callback runs once, with the table's
-//     `last_reason` set (CHANGES, GAP or INITIAL). A table watched since the
-//     previous poll is reloaded once with reason INITIAL, so a chart is loaded
-//     before it starts following changes, with no window for a missed commit.
-//   * mp_live_touch policy: after a reload callback returns MP_OK, if the
-//     MpLive's seq did not move (the callback found identical data, or only
-//     edited the template), mp_meo_poll calls mp_live_touch. So the seq always
-//     advances after a successful reload: the frame re-renders (its "updated"
-//     subtitle refreshes) and web clients polling by ETag get a new frame.
-//   * A reload callback that returns non-MP_OK leaves the table marked: it is
-//     retried on the next poll. The code is kept in the table's last_error.
-//   * Returns the number of tables successfully reloaded, or -MP_ERR_STATE when
-//     the feed refused the read (the raw negative MEO code is in the watch-wide
-//     stats' feed_error), -MP_ERR_ARG for a null watch.
-//
-// Threads and locking:
-//   * A watch is polled by ONE thread at a time (a UI frame, e.g. MythicUI
-//     pass 0, or a producer thread). The MeoDB writer may run on any other
-//     thread: meo_feed_read takes only the feed's spin lock for the copy.
-//   * The callbacks run on the polling thread and touch the MpLive. The MpLive
-//     is not thread-safe, so when another thread renders it (RaizeWeb workers
-//     through MpRaizeLive, or a render thread), every callback must run under
-//     the SAME lock the renderer uses. mp_meo_poll_locked(w, lock) takes a
-//     std/thread spin lock around each callback invocation and the touch (not
-//     around the feed read): pass &rl->lock of an MpRaizeLive. A
-//     single-threaded MythicUI app polls with plain mp_meo_poll.
-//   * A reload that re-queries MeoDB must not use the writer's pager
-//     concurrently with the writer (the pager is not thread-safe). Run reads
-//     on the writer's thread, or serialize them with the writer under an app
-//     "db lock" (as examples/meo_live_chart.mettle does).
-//
-// "When": per table MpMeoTableStats (mp_meo_table_stats) and watch-wide
-// MpMeoWatchStats (mp_meo_watch_stats). Times are the feed's commit times
-// (CLOCK_REALTIME microseconds, nondecreasing). A GAP caused by this reader
-// falling behind the ring carries time_us 0 in MeoDB, so such a GAP updates
-// commit_seq but not the time. mp_meo_fmt_updated / mp_meo_fmt_subtitle turn
-// them into "hh:mm:ss" (UTC) and "updated hh:mm:ss · commit N" with integer
-// arithmetic only (no float interpolation).
-//
-// Cross-process (MpMeoProbe): a feed is in-process. When the writer is another
-// process, mp_meo_probe_check reads the persisted commit_seq from page 0 with
-// meo_peek_commit_seq and answers 1 when it moved (reload now), 0 when not.
-//
-// Ownership: mp_meo_watch_new allocates the watch, its change batch and key
-// buffer; mp_meo_watch_free is the only free path. The MeoFeed, every MpLive
-// and every ctx are BORROWED: free the watch before the feed, and unwatch (or
-// free the watch) before freeing an MpLive. mp_meo_probe_new copies the path;
-// mp_meo_probe_free releases it.
-//
-// Never prints, keeps no globals.
+//! MistPlot charts that follow MeoDB tables through MeoDB's committed-change feed: a
+//! chart reacts only to transactions that committed, knows which table changed and when
+//! (commit_seq and commit time), and can draw the row values carried by the events.
+//! A watched table is bound to an MpChart either with an app reload callback
+//! (mp_meo_watch_table: the app re-queries on change) or with a column mapping
+//! (mp_meo_watch_xy: x, y and an optional group column that picks the series). A mapped
+//! table takes committed INSERTs and in-place REPLACEs straight into the chart, and
+//! reloads it with a range scan (meo_q_scan_xy / meo_q_scan_xyg) after a DELETE, a GAP or
+//! a change it cannot apply in place. mp_meo_poll holds mp_chart_lock(c) around everything
+//! it does to a chart, so a chart shared with mp_chart_share can be rendered on other
+//! threads while the poll runs. MpMeoProbe watches a database written by another process
+//! (meo_peek_commit_seq, lock-free). Uses MeoDB (feed, db, catalog, record, query),
+//! MistPlot chart/chart, chart/samples, chart/config, data/col and core; never prints and
+//! keeps no globals. The core library never imports this file.
 
 import "std/mem";
 import "std/conv";
-import "std/thread";
-import "meodb/src/error/status";
-import "meodb/src/pager/pager";
+import "meodb/src/meodb";
 import "meodb/src/feed/feed";
-import "mistplot/core/buf";
-import "mistplot/live/stream";
+import "mistplot/core/error";
+import "mistplot/core/str";
+import "mistplot/core/format";
+import "mistplot/data/col";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
 
-// Watched tables per watch.
+/// Most tables one watch follows.
 export const MP_MEO_MAX_TABLES: int32 = 32;
-// Events per meo_feed_read call.
+/// Events read per meo_feed_read call.
 export const MP_MEO_BATCH: int32 = 64;
-// Key bytes per batch (4 x MEO_FEED_MAX_KEY: always room for at least one
-// event, so a read always makes progress).
+/// Key and value bytes per batch. Units: bytes. Four times MEO_FEED_MAX_KEY, so every read
+/// makes progress.
 export const MP_MEO_KEYBUF: int32 = 16384;
 
-// MpMeoTableStats.last_reason
+/// Reload reason: none yet.
 export const MP_MEO_REASON_NONE: int32 = 0;
-export const MP_MEO_REASON_CHANGES: int32 = 1;  // >= 1 committed change
-export const MP_MEO_REASON_GAP: int32 = 2;      // the feed lost events
-export const MP_MEO_REASON_INITIAL: int32 = 3;  // first poll after watch
+/// Reload reason: at least one committed change the table could not take in place.
+export const MP_MEO_REASON_CHANGES: int32 = 1;
+/// Reload reason: the feed lost events (a GAP).
+export const MP_MEO_REASON_GAP: int32 = 2;
+/// Reload reason: the first poll after the table was watched.
+export const MP_MEO_REASON_INITIAL: int32 = 3;
 
-// A consecutive transient CORRUPT from meo_peek_commit_seq is retried this many
-// times before mp_meo_probe_check reports it as a hard error.
+/// Consecutive -MEO_ERR_CORRUPT answers mp_meo_probe_check treats as "not yet" before it
+/// reports the error.
 export const MP_MEO_PROBE_CORRUPT_RETRIES: int32 = 8;
 
-// What a watched table has seen. Counters only grow.
+const MPM_HUGE: float64 = 1.7976931348623157e308;
+
+/// What one watched table has seen. Counters only grow.
+///
+/// @mem Plain value; holds no pointers.
 export struct MpMeoTableStats {
-  table_id: uint32;
-  change_count: int64;      // INSERT + REPLACE + ROOT_MOVED events
-  insert_count: int64;
-  replace_count: int64;
-  gap_count: int64;         // GAPs that reached this table
-  reload_count: int64;      // successful reload callbacks
-  last_commit_seq: uint64;  // newest commit that changed it (or a GAP's)
-  last_change_time_us: int64; // that commit's time (0 = not known yet)
-  last_reason: int32;       // MP_MEO_REASON_* of the latest reload attempt
-  last_error: int32;        // last non-MP_OK callback result (MP_OK = none)
+  table_id: uint32;           /// the table id the watch was registered with
+  change_count: int64;        /// INSERT + REPLACE + DELETE + ROOT_MOVED events
+  insert_count: int64;        /// INSERT events
+  replace_count: int64;       /// REPLACE events (updates)
+  delete_count: int64;        /// DELETE events
+  gap_count: int64;           /// GAPs that reached this table
+  reload_count: int64;        /// successful reloads, built-in or callback
+  fast_count: int64;          /// mapped tables: events applied to the chart without a reload
+  dropped_count: int64;       /// mapped tables: inserted rows with no numeric x, no group or no series
+  covered_count: int64;       /// mapped tables: events already contained in the last reload
+  last_commit_seq: uint64;    /// newest commit that changed the table (or a GAP's)
+  last_change_time_us: int64; /// that commit's time, CLOCK_REALTIME microseconds (0 = none yet)
+  last_reason: int32;         /// MP_MEO_REASON_* of the latest reload attempt
+  last_error: int32;          /// last non-MP_OK result of a reload or change callback (MP_OK = none)
+  meo_error: int32;           /// mapped tables: last negative MEO code of a built-in reload (MEO_OK = none)
 }
 
-// What the whole watch has seen, watched tables or not.
+/// What the whole watch has seen, watched tables or not.
+///
+/// @mem Plain value; holds no pointers.
 export struct MpMeoWatchStats {
-  polls: int64;
-  events: int64;            // every event read, GAPs included
-  gaps: int64;
-  ignored: int64;           // events of unwatched tables
-  reloads: int64;           // successful reload callbacks, all tables
-  last_commit_seq: uint64;  // newest commit_seq the feed reported
-  last_time_us: int64;      // newest commit time the feed reported
-  feed_error: int32;        // last negative MEO code from meo_feed_read
+  polls: int64;               /// mp_meo_poll calls
+  events: int64;              /// events read, GAPs included
+  gaps: int64;                /// GAP events
+  ignored: int64;             /// events of unwatched tables
+  reloads: int64;             /// successful reloads, all tables
+  last_commit_seq: uint64;    /// newest commit_seq the feed reported (the feed's at mp_meo_watch_new)
+  last_time_us: int64;        /// newest commit time the feed reported (the feed's at mp_meo_watch_new)
+  feed_error: int32;          /// last negative MEO code from meo_feed_read (MEO_OK = none)
 }
 
-// One table binding. Private to this module; read it via mp_meo_table_stats.
+/// One table binding of a watch; read it through mp_meo_table_stats.
+///
+/// @mem Owned by its watch. table, x_name, y_name and g_name are owned copies (mapped
+///   tables only); c, ctx and db are borrowed.
+/// @internal
 export struct MpMeoSlot {
-  used: bool;
-  pending: bool;            // reload due at the end of this poll
-  reason: int32;            // the strongest reason seen this poll
-  lv: MpLive*;              // borrowed, may be 0
-  ctx: rawptr;              // borrowed
-  reload: fn(rawptr, uint32, MpLive*) -> int32;
-  has_change: bool;
-  change: fn(rawptr, MpLive*, MeoChange*) -> int32;
-  st: MpMeoTableStats;
+  used: bool;                                      /// the slot is in use
+  pending: bool;                                   /// a reload is due at the end of this poll
+  reason: int32;                                   /// strongest reason seen this poll
+  c: MpChart*;                                     /// borrowed chart, may be 0
+  ctx: rawptr;                                     /// borrowed callback context
+  has_reload: bool;                                /// reload is set (mp_meo_watch_table)
+  reload: fn(rawptr, uint32, MpChart*) -> int32;   /// app reload callback
+  has_change: bool;                                /// change is set
+  change: fn(rawptr, MpChart*, MeoChange*) -> int32; /// per-event callback
+  mapped: bool;                                    /// registered by mp_meo_watch_xy
+  db: MeoDb*;                                      /// borrowed database (mapped)
+  table: string;                                   /// owned table name (mapped)
+  x_name: string;                                  /// owned x column name (mapped)
+  y_name: string;                                  /// owned y column name (mapped)
+  g_name: string;                                  /// owned group column name, "" = none
+  xc: int32;                                       /// x column index in the record
+  yc: int32;                                       /// y column index
+  gc: int32;                                       /// group column index, -1 = none
+  x_rowid: bool;                                   /// x is the INTEGER PRIMARY KEY (the rowid)
+  x_unique: bool;                                  /// x is the rowid, PRIMARY KEY or UNIQUE
+  covered_seq: uint64;                             /// commit_seq the last built-in reload contained
+  has_x: bool[32];                                 /// per series: last_x is set
+  last_x: float64[32];                             /// per series: largest x in the chart
+  st: MpMeoTableStats;                             /// counters
 }
 
+/// A watch over one MeoFeed: up to MP_MEO_MAX_TABLES table bindings and a cursor.
+///
+/// @mem From mp_meo_watch_new, released with mp_meo_watch_free, which frees slots, out,
+///   keybuf and the mapped names. feed is borrowed.
 export struct MpMeoWatch {
-  feed: MeoFeed*;           // borrowed
-  cur: MeoFeedCursor;
-  slots: MpMeoSlot*;        // owned, MP_MEO_MAX_TABLES
-  out: MeoChange*;          // owned, MP_MEO_BATCH
-  keybuf: uint8*;           // owned, MP_MEO_KEYBUF
-  st: MpMeoWatchStats;
+  feed: MeoFeed*;          /// borrowed feed
+  cur: MeoFeedCursor;      /// next event to read
+  slots: MpMeoSlot*;       /// owned, MP_MEO_MAX_TABLES slots
+  out: MeoChange*;         /// owned, MP_MEO_BATCH events
+  keybuf: uint8*;          /// owned, MP_MEO_KEYBUF bytes
+  st: MpMeoWatchStats;     /// counters
 }
 
-// Cross-process commit probe. `path` is an owned copy.
+/// Cross-process commit probe of one database file.
+///
+/// @mem From mp_meo_probe_new, released with mp_meo_probe_free; path is an owned copy.
 export struct MpMeoProbe {
-  path: string;
-  last_seq: uint64;
-  primed: bool;             // false until the first successful read
-  last_status: int32;       // last meo_peek_commit_seq answer
-  retries: int64;           // "not yet" answers (journal, BUSY, transient CORRUPT)
-  corrupt_run: int32;       // consecutive CORRUPT answers
+  path: string;            /// owned copy of the database path
+  last_seq: uint64;        /// commit_seq of the last committed read
+  primed: bool;            /// a committed read happened
+  last_status: int32;      /// last meo_peek_commit_seq answer
+  retries: int64;          /// "not yet" answers (hot, transient, busy, transient corrupt)
+  corrupt_run: int32;      /// consecutive -MEO_ERR_CORRUPT answers
 }
 
 // ---------------------------------------------------------------------------
 // Watch lifecycle
 // ---------------------------------------------------------------------------
 
-fn meo_stats_zero(st: MpMeoTableStats*, table_id: uint32) {
+fn mpm_stats_zero(st: MpMeoTableStats*, table_id: uint32) {
+  memset((rawptr)st, 0, sizeof(MpMeoTableStats));
   st->table_id = table_id;
-  st->change_count = 0;
-  st->insert_count = 0;
-  st->replace_count = 0;
-  st->gap_count = 0;
-  st->reload_count = 0;
-  st->last_commit_seq = 0;
-  st->last_change_time_us = 0;
   st->last_reason = MP_MEO_REASON_NONE;
   st->last_error = MP_OK;
+  st->meo_error = MEO_OK;
 }
 
-// A watch over `feed` (borrowed) that sees only what is published from now on
-// (its cursor starts at the feed's end). 0 for a null feed or an allocation
-// failure (nothing leaked).
+fn mpm_slot_names_free(s: MpMeoSlot*) {
+  if (s->mapped) {
+    mp_str_free(s->table);
+    mp_str_free(s->x_name);
+    mp_str_free(s->y_name);
+    mp_str_free(s->g_name);
+  }
+  s->table = "";
+  s->x_name = "";
+  s->y_name = "";
+  s->g_name = "";
+}
+
+fn mpm_slot_clear(s: MpMeoSlot*) {
+  mpm_slot_names_free(s);
+  s->used = false;
+  s->pending = false;
+  s->reason = MP_MEO_REASON_NONE;
+  s->c = 0;
+  s->ctx = 0;
+  s->has_reload = false;
+  s->has_change = false;
+  s->mapped = false;
+  s->db = 0;
+  s->xc = 0;
+  s->yc = 0;
+  s->gc = -1;
+  s->x_rowid = false;
+  s->x_unique = false;
+  s->covered_seq = 0;
+  var i: int32 = 0;
+  while (i < 32) {
+    s->has_x[i] = false;
+    s->last_x[i] = 0.0;
+    i = i + 1;
+  }
+}
+
+/// Creates a watch over feed that sees only what the feed publishes from now on (its
+/// cursor starts at the feed's end); the stats start at the feed's last commit and time.
+///
+/// @param feed The change feed, attached to the database's pager. Valid: non-zero.
+/// @return The watch, or 0 for a null feed or a failed allocation (nothing leaked).
+/// @mem The caller owns the watch and frees it with mp_meo_watch_free before the feed.
+///   The feed is borrowed.
+/// @thread Any thread; the feed may already be in use by a writer.
+/// @cost Three allocations (watch, event batch, key buffer) plus the slot array.
 export fn mp_meo_watch_new(feed: MeoFeed*) -> MpMeoWatch* {
   if (feed == 0) { return 0; }
   var w: MpMeoWatch* = new MpMeoWatch;
   if (w == 0) { return 0; }
-  // Locals, not the consts, as `new T[...]` extents: a const extent from an
-  // imported module can fail to resolve.
+  // Locals, not the consts, as `new T[...]` extents: an imported const extent can fail
+  // to resolve.
   var nslots: int32 = MP_MEO_MAX_TABLES;
   var nbatch: int32 = MP_MEO_BATCH;
   var nkey: int32 = MP_MEO_KEYBUF;
@@ -212,36 +225,37 @@ export fn mp_meo_watch_new(feed: MeoFeed*) -> MpMeoWatch* {
   w->keybuf = kb.data;
   var i: int32 = 0;
   while (i < MP_MEO_MAX_TABLES) {
-    w->slots[i].used = false;
-    w->slots[i].pending = false;
-    w->slots[i].has_change = false;
-    w->slots[i].lv = 0;
-    w->slots[i].ctx = 0;
+    w->slots[i].mapped = false;
+    mpm_slot_clear(&w->slots[i]);
     i = i + 1;
   }
-  w->st.polls = 0;
-  w->st.events = 0;
-  w->st.gaps = 0;
-  w->st.ignored = 0;
-  w->st.reloads = 0;
+  memset((rawptr)&w->st, 0, sizeof(MpMeoWatchStats));
   w->st.last_commit_seq = meo_feed_last_commit(feed);
-  w->st.last_time_us = 0;
+  w->st.last_time_us = meo_feed_last_time(feed);
   w->st.feed_error = MEO_OK;
   meo_feed_cursor_end(feed, &w->cur);
   return w;
 }
 
-// Frees the watch, its batch and key buffer. The feed and MpLives are borrowed
-// and untouched.
+/// Frees the watch, its buffers and its copies of mapped table and column names.
+///
+/// @param w The watch. Valid: a watch from mp_meo_watch_new, or 0 (ignored).
+/// @mem The feed, charts, databases and contexts are borrowed and untouched.
+/// @thread Not while another thread polls w.
 export fn mp_meo_watch_free(w: MpMeoWatch*) {
   if (w == 0) { return; }
+  var i: int32 = 0;
+  while (i < MP_MEO_MAX_TABLES) {
+    mpm_slot_names_free(&w->slots[i]);
+    i = i + 1;
+  }
   free(w->slots);
   free(w->out);
   free(w->keybuf);
   free(w);
 }
 
-fn meo_find(w: MpMeoWatch*, table_id: uint32) -> int32 {
+fn mpm_find(w: MpMeoWatch*, table_id: uint32) -> int32 {
   var i: int32 = 0;
   while (i < MP_MEO_MAX_TABLES) {
     if (w->slots[i].used && w->slots[i].st.table_id == table_id) { return i; }
@@ -250,82 +264,249 @@ fn meo_find(w: MpMeoWatch*, table_id: uint32) -> int32 {
   return -1;
 }
 
-// Watch `table_id` (the MeoDB writer's table_id, as passed to
-// meo_feed_insert): bind it to `lv` (borrowed; may be 0 for a table tracked
-// only for its stats) and the reload callback, called as
-// mp_meo_reload_cb(ctx, table_id, lv) -> MP_OK or an MP_* code. The first
-// poll afterwards reloads it once (reason INITIAL). MP_ERR_ARG for a null
-// watch, MP_ERR_STATE when the table is already watched or all
-// MP_MEO_MAX_TABLES slots are in use.
-//
-// The per-change callback is registered separately (mp_meo_watch_changes)
-// because a fn-pointer parameter cannot be given a literal 0.
-export fn mp_meo_watch_table(w: MpMeoWatch*, table_id: uint32, lv: MpLive*,
-    mp_meo_reload_cb: fn(rawptr, uint32, MpLive*) -> int32,
-    ctx: rawptr) -> int32 {
-  if (w == 0) { return MP_ERR_ARG; }
-  if (meo_find(w, table_id) >= 0) { return MP_ERR_STATE; }
+fn mpm_free_slot(w: MpMeoWatch*) -> int32 {
   var i: int32 = 0;
   while (i < MP_MEO_MAX_TABLES) {
-    if (!w->slots[i].used) {
-      var s: MpMeoSlot* = &w->slots[i];
-      s->used = true;
-      s->pending = true;
-      s->reason = MP_MEO_REASON_INITIAL;
-      s->lv = lv;
-      s->ctx = ctx;
-      s->reload = mp_meo_reload_cb;
-      s->has_change = false;
-      meo_stats_zero(&s->st, table_id);
-      return MP_OK;
+    if (!w->slots[i].used) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+fn mpm_slot_open(s: MpMeoSlot*, table_id: uint32, c: MpChart*, ctx: rawptr) {
+  mpm_slot_clear(s);
+  s->used = true;
+  s->pending = true;
+  s->reason = MP_MEO_REASON_INITIAL;
+  s->c = c;
+  s->ctx = ctx;
+  mpm_stats_zero(&s->st, table_id);
+}
+
+/// Watches a table with an app reload callback. The first poll afterwards reloads it once
+/// (reason MP_MEO_REASON_INITIAL); later polls reload it once (coalesced) when it had at
+/// least one committed change or the feed reported a GAP.
+///
+/// @param w The watch. Valid: non-zero.
+/// @param table_id The table's id in the feed: MeoTable.id for a catalog table
+///   (mp_meo_table_id), or the caller's id given to meo_feed_insert. Valid: any.
+/// @param c The chart passed to the callbacks. Valid: any; 0 tracks the table's stats only.
+/// @param mp_meo_reload_cb Called as mp_meo_reload_cb(ctx, table_id, c) under
+///   mp_chart_lock(c); refills c and answers MP_OK, or an MP_* code to be retried next poll.
+/// @param ctx Passed to the callbacks. Valid: any; borrowed.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG w is 0; nothing changes.
+/// @error MP_ERR_STATE the table is already watched or all MP_MEO_MAX_TABLES slots are used.
+/// @mem c and ctx are borrowed: unwatch (or free the watch) before freeing them.
+/// @thread The thread that polls w.
+export fn mp_meo_watch_table(w: MpMeoWatch*, table_id: uint32, c: MpChart*,
+                             mp_meo_reload_cb: fn(rawptr, uint32, MpChart*) -> int32,
+                             ctx: rawptr) -> int32 {
+  if (w == 0) { return MP_ERR_ARG; }
+  if (mpm_find(w, table_id) >= 0) { return MP_ERR_STATE; }
+  var i: int32 = mpm_free_slot(w);
+  if (i < 0) { return MP_ERR_STATE; }
+  var s: MpMeoSlot* = &w->slots[i];
+  mpm_slot_open(s, table_id, c, ctx);
+  s->reload = mp_meo_reload_cb;
+  s->has_reload = true;
+  return MP_OK;
+}
+
+fn mpm_col_index(t: MeoTable*, name: string) -> int32 {
+  var i: int32 = 0;
+  while (i < t->n_cols) {
+    if (meo_cat_name_eq(t->columns[i].name, t->columns[i].name_len, name.chars,
+        (int32)name.length)) {
+      return i;
     }
     i = i + 1;
   }
-  return MP_ERR_STATE;
+  return -1;
 }
 
-// Add (or replace) the per-change callback of a watched table, called as
-// mp_meo_change_cb(ctx, lv, change) for every INSERT / REPLACE / ROOT_MOVED
-// event of that table, in commit order, before the coalesced reload. `change`
-// and its key bytes are valid only during the call. The result is not a
-// control signal: a non-MP_OK result is recorded in last_error and dispatch
-// continues. MP_ERR_ARG for a null watch or an unwatched table.
+fn mpm_numeric(aff: int32) -> bool {
+  return aff == MEO_T_INT || aff == MEO_T_REAL;
+}
+
+/// The catalog id of a table: the table_id its change events carry.
+///
+/// @param db The database. Valid: non-zero, an open MeoDb (not a snapshot view).
+/// @param table Table name. Valid: any; an unknown name gives -1.
+/// @return The id (>= 1), or -1 for a null db, an unknown table or a db lock timeout.
+/// @mem Nothing is retained.
+/// @thread Any thread; takes the db lock briefly (waits for an open write transaction).
+export fn mp_meo_table_id(db: MeoDb*, table: string) -> int64 {
+  if (db == 0 || table.length == 0) { return -1; }
+  if (meo_db_enter(db) != MEO_OK) { return -1; }
+  var id: int64 = -1;
+  var t: MeoTable* = meo_cat_find(db->cat, table.chars, (int32)table.length);
+  if (t != 0) { id = t->id; }
+  meo_db_leave(db);
+  return id;
+}
+
+/// Watches a table through a column mapping: each row is one sample, x and y from the
+/// named columns, the series from the group column's value (series index = group value;
+/// no group: series 0). Committed INSERTs whose x is not below the series' largest x are
+/// pushed straight into c; a REPLACE (update) whose x column is the INTEGER PRIMARY KEY,
+/// PRIMARY KEY or UNIQUE overwrites the sample at that x in place. Anything else (DELETE,
+/// GAP, an x out of order, an update it cannot find) reloads c once at the end of the
+/// poll: mp_chart_clear, then a range scan (meo_q_scan_xy or meo_q_scan_xyg) of the whole
+/// table, holding the db lock so the reload knows exactly which commit it contains and
+/// later events of that commit are not applied twice. The first poll reloads once (reason
+/// MP_MEO_REASON_INITIAL).
+/// A NULL or non-numeric y is a NaN sample (a gap); a row with no numeric x, a non-INTEGER
+/// group or a group outside 0 .. mp_chart_series_count(c)-1 is not drawn. Create the
+/// series before the first poll.
+///
+/// @param w The watch. Valid: non-zero.
+/// @param db The database whose pager the feed is attached to. Valid: non-zero, open.
+/// @param table Table name. Valid: an existing table.
+/// @param x X column. Valid: an INTEGER or REAL column.
+/// @param y Y column. Valid: any column of the table.
+/// @param group Group column, or "" for one series. Valid: "" or an INTEGER column.
+/// @param c The chart. Valid: non-zero, with its series created.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG w, db or c is 0, a name is empty, the table or a column does not
+///   exist, x is not numeric or group is not INTEGER; nothing changes.
+/// @error MP_ERR_STATE the table is already watched, all slots are used, or the db lock
+///   timed out; nothing changes.
+/// @error MP_ERR_ALLOC a name copy failed; nothing changes.
+/// @mem table, x, y and group are copied; db and c are borrowed (unwatch before freeing
+///   them). Column positions are read once: re-watch after a schema change.
+/// @thread The thread that polls w; takes the db lock briefly.
+export fn mp_meo_watch_xy(w: MpMeoWatch*, db: MeoDb*, table: string, x: string,
+                          y: string, group: string, c: MpChart*) -> int32 {
+  if (w == 0 || db == 0 || c == 0) { return MP_ERR_ARG; }
+  if (table.length == 0 || x.length == 0 || y.length == 0) { return MP_ERR_ARG; }
+  if (meo_db_enter(db) != MEO_OK) { return MP_ERR_STATE; }
+  var t: MeoTable* = meo_cat_find(db->cat, table.chars, (int32)table.length);
+  var rc: int32 = MP_OK;
+  var xc: int32 = -1;
+  var yc: int32 = -1;
+  var gc: int32 = -1;
+  var id: uint32 = 0;
+  var xf: int32 = 0;
+  if (t == 0) {
+    rc = MP_ERR_ARG;
+  } else {
+    id = (uint32)t->id;
+    xc = mpm_col_index(t, x);
+    yc = mpm_col_index(t, y);
+    if (group.length > 0) { gc = mpm_col_index(t, group); }
+    if (xc < 0 || yc < 0 || (group.length > 0 && gc < 0)) {
+      rc = MP_ERR_ARG;
+    } else if (!mpm_numeric(t->columns[xc].affinity)) {
+      rc = MP_ERR_ARG;
+    } else if (gc >= 0 && t->columns[gc].affinity != MEO_T_INT) {
+      rc = MP_ERR_ARG;
+    } else {
+      xf = t->columns[xc].cflags;
+    }
+  }
+  meo_db_leave(db);
+  if (rc != MP_OK) { return rc; }
+  if (mpm_find(w, id) >= 0) { return MP_ERR_STATE; }
+  var i: int32 = mpm_free_slot(w);
+  if (i < 0) { return MP_ERR_STATE; }
+  var tn: string = mp_str_dup(table);
+  var xn: string = mp_str_dup(x);
+  var yn: string = mp_str_dup(y);
+  var gn: string = "";
+  if (group.length > 0) { gn = mp_str_dup(group); }
+  if (tn.length == 0 || xn.length == 0 || yn.length == 0 ||
+      (group.length > 0 && gn.length == 0)) {
+    mp_str_free(tn);
+    mp_str_free(xn);
+    mp_str_free(yn);
+    mp_str_free(gn);
+    return MP_ERR_ALLOC;
+  }
+  var s: MpMeoSlot* = &w->slots[i];
+  mpm_slot_open(s, id, c, 0);
+  s->mapped = true;
+  s->db = db;
+  s->table = tn;
+  s->x_name = xn;
+  s->y_name = yn;
+  s->g_name = gn;
+  s->xc = xc;
+  s->yc = yc;
+  s->gc = gc;
+  s->x_rowid = (xf & MEO_COL_ROWID_ALIAS) != 0;
+  s->x_unique = (xf & (MEO_COL_ROWID_ALIAS | MEO_COL_PK | MEO_COL_UNIQUE)) != 0;
+  return MP_OK;
+}
+
+/// Adds (or replaces) the per-event callback of a watched table, called for every INSERT,
+/// REPLACE, DELETE and ROOT_MOVED event of that table in commit order, under
+/// mp_chart_lock(c), after a mapped table's own handling of the event and before the
+/// coalesced reload. Read row values from change->val with meo_rec_get (the INTEGER
+/// PRIMARY KEY column reads NULL: its value is change->rowid).
+///
+/// @param w The watch. Valid: non-zero.
+/// @param table_id A watched table. Valid: registered with mp_meo_watch_table or
+///   mp_meo_watch_xy.
+/// @param mp_meo_change_cb Called as mp_meo_change_cb(ctx, c, change) with the ctx given to
+///   mp_meo_watch_table (0 for mp_meo_watch_xy). A non-MP_OK answer is kept in last_error;
+///   dispatch continues.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG w is 0 or the table is not watched; nothing changes.
+/// @mem change, its key and its value bytes are valid only during the call.
+/// @thread The thread that polls w.
 export fn mp_meo_watch_changes(w: MpMeoWatch*, table_id: uint32,
-    mp_meo_change_cb: fn(rawptr, MpLive*, MeoChange*) -> int32) -> int32 {
+                               mp_meo_change_cb: fn(rawptr, MpChart*, MeoChange*) -> int32) -> int32 {
   if (w == 0) { return MP_ERR_ARG; }
-  var i: int32 = meo_find(w, table_id);
+  var i: int32 = mpm_find(w, table_id);
   if (i < 0) { return MP_ERR_ARG; }
   w->slots[i].change = mp_meo_change_cb;
   w->slots[i].has_change = true;
   return MP_OK;
 }
 
-// Stop watching `table_id`; its events become `ignored`. MP_ERR_ARG when it
-// is not watched.
+/// Stops watching a table; its events count as ignored from now on.
+///
+/// @param w The watch. Valid: non-zero.
+/// @param table_id A watched table. Valid: any; an unwatched one is an error.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG w is 0 or the table is not watched; nothing changes.
+/// @mem Frees the slot's name copies; the chart and ctx are no longer borrowed.
+/// @thread The thread that polls w.
 export fn mp_meo_watch_unwatch(w: MpMeoWatch*, table_id: uint32) -> int32 {
   if (w == 0) { return MP_ERR_ARG; }
-  var i: int32 = meo_find(w, table_id);
+  var i: int32 = mpm_find(w, table_id);
   if (i < 0) { return MP_ERR_ARG; }
-  w->slots[i].used = false;
-  w->slots[i].pending = false;
-  w->slots[i].has_change = false;
-  w->slots[i].lv = 0;
-  w->slots[i].ctx = 0;
+  mpm_slot_clear(&w->slots[i]);
   return MP_OK;
 }
 
-// Copies the stats of `table_id` into *out. MP_ERR_ARG for a null argument or
-// an unwatched table.
+/// Copies the stats of one watched table.
+///
+/// @param w The watch. Valid: non-zero.
+/// @param table_id A watched table. Valid: any; an unwatched one is an error.
+/// @param out Receives the stats. Valid: non-zero.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG w or out is 0, or the table is not watched; out is unchanged.
+/// @mem Writes *out only.
+/// @thread The thread that polls w.
 export fn mp_meo_table_stats(w: MpMeoWatch*, table_id: uint32,
-    out: MpMeoTableStats*) -> int32 {
+                             out: MpMeoTableStats*) -> int32 {
   if (w == 0 || out == 0) { return MP_ERR_ARG; }
-  var i: int32 = meo_find(w, table_id);
+  var i: int32 = mpm_find(w, table_id);
   if (i < 0) { return MP_ERR_ARG; }
   *out = w->slots[i].st;
   return MP_OK;
 }
 
-// Copies the watch-wide stats into *out.
+/// Copies the watch-wide stats.
+///
+/// @param w The watch. Valid: non-zero.
+/// @param out Receives the stats. Valid: non-zero.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG w or out is 0; out is unchanged.
+/// @mem Writes *out only.
+/// @thread The thread that polls w.
 export fn mp_meo_watch_stats(w: MpMeoWatch*, out: MpMeoWatchStats*) -> int32 {
   if (w == 0 || out == 0) { return MP_ERR_ARG; }
   *out = w->st;
@@ -333,97 +514,242 @@ export fn mp_meo_watch_stats(w: MpMeoWatch*, out: MpMeoWatchStats*) -> int32 {
 }
 
 // ---------------------------------------------------------------------------
+// Mapped tables: decoding events and the built-in reload
+// ---------------------------------------------------------------------------
+
+fn mpm_nan() -> float64 {
+  var z: float64 = 0.0;
+  return z / z;
+}
+
+// 0 and *g, *x, *y set: drawable. 1: the row has no numeric x or no INTEGER group.
+// Negative: a MEO decode error.
+fn mpm_decode(s: MpMeoSlot*, ev: MeoChange*, g: int64*, x: float64*, y: float64*) -> int32 {
+  var v: MeoValue;
+  if (s->x_rowid) {
+    *x = (float64)(int64)ev->rowid;
+  } else {
+    var rc: int32 = meo_rec_get(ev->val, ev->val_len, s->xc, &v);
+    if (rc != MEO_OK) { return rc; }
+    if (v.type == MEO_T_INT) {
+      *x = (float64)v.i;
+    } else if (v.type == MEO_T_REAL) {
+      *x = v.f;
+    } else {
+      return 1;
+    }
+  }
+  *g = 0;
+  if (s->gc >= 0) {
+    var rg: int32 = meo_rec_get(ev->val, ev->val_len, s->gc, &v);
+    if (rg != MEO_OK) { return rg; }
+    if (v.type != MEO_T_INT) { return 1; }
+    *g = v.i;
+  }
+  *y = mpm_nan();
+  if (s->yc == s->xc && s->x_rowid) {
+    *y = *x;
+    return 0;
+  }
+  var ry: int32 = meo_rec_get(ev->val, ev->val_len, s->yc, &v);
+  if (ry != MEO_OK) { return ry; }
+  if (v.type == MEO_T_INT) { *y = (float64)v.i; }
+  if (v.type == MEO_T_REAL) { *y = v.f; }
+  return 0;
+}
+
+// Applies one INSERT or REPLACE of a mapped table to its chart. True when the chart now
+// matches the table (applied, or the row is not drawable); false when only a reload can
+// bring it in line. Runs under mp_chart_lock(s->c).
+fn mpm_fast(s: MpMeoSlot*, ev: MeoChange*) -> bool {
+  if (ev->kind == MEO_CHANGE_ROOT_MOVED) { return true; }
+  if (ev->kind != MEO_CHANGE_INSERT && ev->kind != MEO_CHANGE_REPLACE) { return false; }
+  var ins: bool = ev->kind == MEO_CHANGE_INSERT;
+  if (ev->val_len <= 0) { return false; }
+  var g: int64 = 0;
+  var x: float64 = 0.0;
+  var y: float64 = 0.0;
+  var rc: int32 = mpm_decode(s, ev, &g, &x, &y);
+  if (rc < 0) { return false; }
+  var c: MpChart* = s->c;
+  if (rc == 0 && (g < 0 || g >= (int64)c->n_series || g >= 32)) { rc = 1; }
+  if (rc == 1) {
+    // An updated row may have been drawn before; only a reload can tell.
+    if (!ins) { return false; }
+    s->st.dropped_count = s->st.dropped_count + 1;
+    return true;
+  }
+  var si: int32 = (int32)g;
+  if (ins) {
+    if (s->has_x[si] && x < s->last_x[si]) { return false; }
+    if (mp_chart_push(c, si, x, y) != MP_OK) { return false; }
+    s->has_x[si] = true;
+    s->last_x[si] = x;
+    s->st.fast_count = s->st.fast_count + 1;
+    return true;
+  }
+  // REPLACE: with a unique x, a sample at x in this series can only be this row.
+  if (!s->x_unique) { return false; }
+  var col: MpCol* = &c->series[(int64)si].col;
+  var i: int64 = mp_col_lower_bound(col, x);
+  if (i >= mp_col_len(col) || mp_col_x(col, i) != x) { return false; }
+  if (mp_col_set(col, i, x, y) != MP_OK) { return false; }
+  mp_chart_touch(c);
+  s->st.fast_count = s->st.fast_count + 1;
+  return true;
+}
+
+fn mpm_scan_put(s: MpMeoSlot*, g: int64, x: float64, y: float64) -> int32 {
+  var c: MpChart* = s->c;
+  if (g < 0 || g >= (int64)c->n_series || g >= 32) { return 0; }
+  var si: int32 = (int32)g;
+  if (mp_chart_push(c, si, x, y) != MP_OK) { return 1; }
+  if (!s->has_x[si] || x > s->last_x[si]) {
+    s->has_x[si] = true;
+    s->last_x[si] = x;
+  }
+  return 0;
+}
+
+fn mpm_scan_xy(ctx: rawptr, x: float64, y: float64) -> int32 {
+  return mpm_scan_put((MpMeoSlot*)ctx, 0, x, y);
+}
+
+fn mpm_scan_xyg(ctx: rawptr, g: int64, x: float64, y: float64) -> int32 {
+  return mpm_scan_put((MpMeoSlot*)ctx, g, x, y);
+}
+
+// The built-in reload of a mapped table: under the db lock, note the commit_seq, clear the
+// chart and range-scan the whole table into it. Runs under mp_chart_lock(s->c).
+fn mpm_xy_reload(s: MpMeoSlot*) -> int32 {
+  var db: MeoDb* = s->db;
+  // A reload inside this thread's own open transaction would draw uncommitted rows.
+  if (meo_lock_held(&db->lock)) { return MP_ERR_STATE; }
+  var rc: int32 = meo_db_enter(db);
+  if (rc != MEO_OK) {
+    s->st.meo_error = rc;
+    return MP_ERR_STATE;
+  }
+  var seq: uint64 = meo_pager_commit_seq(db->pager);
+  mp_chart_clear(s->c);
+  var i: int32 = 0;
+  while (i < 32) {
+    s->has_x[i] = false;
+    i = i + 1;
+  }
+  if (s->gc >= 0) {
+    rc = meo_q_scan_xyg(db, s->table, s->x_name, s->y_name, s->g_name, -MPM_HUGE,
+      MPM_HUGE, &mpm_scan_xyg, (rawptr)s);
+  } else {
+    rc = meo_q_scan_xy(db, s->table, s->x_name, s->y_name, -MPM_HUGE, MPM_HUGE,
+      &mpm_scan_xy, (rawptr)s);
+  }
+  meo_db_leave(db);
+  if (rc != MEO_OK) {
+    if (rc < 0) { s->st.meo_error = rc; }
+    if (rc == 1) { return MP_ERR_ALLOC; }
+    return MP_ERR_IO;
+  }
+  s->covered_seq = seq;
+  return MP_OK;
+}
+
+// ---------------------------------------------------------------------------
 // Poll
 // ---------------------------------------------------------------------------
 
-fn meo_lock(lock: int32*) {
-  if (lock != 0) { spin_lock(lock); }
-}
-
-fn meo_unlock(lock: int32*) {
-  if (lock != 0) { spin_unlock(lock); }
-}
-
 // GAP outranks INITIAL outranks CHANGES for the reported reason.
-fn meo_reason_rank(r: int32) -> int32 {
+fn mpm_reason_rank(r: int32) -> int32 {
   if (r == MP_MEO_REASON_GAP) { return 3; }
   if (r == MP_MEO_REASON_INITIAL) { return 2; }
   if (r == MP_MEO_REASON_CHANGES) { return 1; }
   return 0;
 }
 
-fn meo_mark(s: MpMeoSlot*, reason: int32) {
-  if (!s->pending || meo_reason_rank(reason) > meo_reason_rank(s->reason)) {
+fn mpm_mark(s: MpMeoSlot*, reason: int32) {
+  if (!s->pending || mpm_reason_rank(reason) > mpm_reason_rank(s->reason)) {
     s->reason = reason;
   }
   s->pending = true;
 }
 
-fn meo_note_commit(w: MpMeoWatch*, c: MeoChange*) {
-  if (c->commit_seq > w->st.last_commit_seq) {
-    w->st.last_commit_seq = c->commit_seq;
-  }
-  if (c->time_us > w->st.last_time_us) { w->st.last_time_us = c->time_us; }
+fn mpm_note(st: MpMeoTableStats*, ev: MeoChange*) {
+  if (ev->commit_seq > st->last_commit_seq) { st->last_commit_seq = ev->commit_seq; }
+  if (ev->time_us > st->last_change_time_us) { st->last_change_time_us = ev->time_us; }
 }
 
-fn meo_dispatch(w: MpMeoWatch*, c: MeoChange*, lock: int32*) {
-  w->st.events = w->st.events + 1;
-  meo_note_commit(w, c);
-  if (c->kind == MEO_CHANGE_GAP) {
-    w->st.gaps = w->st.gaps + 1;
-    var i: int32 = 0;
-    while (i < MP_MEO_MAX_TABLES) {
-      var g: MpMeoSlot* = &w->slots[i];
-      if (g->used) {
-        g->st.gap_count = g->st.gap_count + 1;
-        if (c->commit_seq > g->st.last_commit_seq) {
-          g->st.last_commit_seq = c->commit_seq;
-        }
-        if (c->time_us > g->st.last_change_time_us) {
-          g->st.last_change_time_us = c->time_us;
-        }
-        meo_mark(g, MP_MEO_REASON_GAP);
+fn mpm_covered(s: MpMeoSlot*, ev: MeoChange*) -> bool {
+  return s->mapped && ev->commit_seq <= s->covered_seq;
+}
+
+fn mpm_dispatch_gap(w: MpMeoWatch*, ev: MeoChange*) {
+  w->st.gaps = w->st.gaps + 1;
+  var i: int32 = 0;
+  while (i < MP_MEO_MAX_TABLES) {
+    var s: MpMeoSlot* = &w->slots[i];
+    if (s->used) {
+      s->st.gap_count = s->st.gap_count + 1;
+      mpm_note(&s->st, ev);
+      if (mpm_covered(s, ev)) {
+        s->st.covered_count = s->st.covered_count + 1;
+      } else {
+        mpm_mark(s, MP_MEO_REASON_GAP);
       }
-      i = i + 1;
     }
+    i = i + 1;
+  }
+}
+
+fn mpm_dispatch(w: MpMeoWatch*, ev: MeoChange*) {
+  w->st.events = w->st.events + 1;
+  if (ev->commit_seq > w->st.last_commit_seq) { w->st.last_commit_seq = ev->commit_seq; }
+  if (ev->time_us > w->st.last_time_us) { w->st.last_time_us = ev->time_us; }
+  if (ev->kind == MEO_CHANGE_GAP) {
+    mpm_dispatch_gap(w, ev);
     return;
   }
-  var k: int32 = meo_find(w, c->table_id);
+  var k: int32 = mpm_find(w, ev->table_id);
   if (k < 0) {
     w->st.ignored = w->st.ignored + 1;
     return;
   }
   var s: MpMeoSlot* = &w->slots[k];
   s->st.change_count = s->st.change_count + 1;
-  if (c->kind == MEO_CHANGE_INSERT) {
+  if (ev->kind == MEO_CHANGE_INSERT) {
     s->st.insert_count = s->st.insert_count + 1;
-  } else if (c->kind == MEO_CHANGE_REPLACE) {
+  } else if (ev->kind == MEO_CHANGE_REPLACE) {
     s->st.replace_count = s->st.replace_count + 1;
+  } else if (ev->kind == MEO_CHANGE_DELETE) {
+    s->st.delete_count = s->st.delete_count + 1;
   }
-  if (c->commit_seq > s->st.last_commit_seq) {
-    s->st.last_commit_seq = c->commit_seq;
+  mpm_note(&s->st, ev);
+  mp_chart_lock(s->c);
+  if (mpm_covered(s, ev)) {
+    s->st.covered_count = s->st.covered_count + 1;
+  } else if (!s->mapped) {
+    mpm_mark(s, MP_MEO_REASON_CHANGES);
+  } else if (!s->pending && !mpm_fast(s, ev)) {
+    mpm_mark(s, MP_MEO_REASON_CHANGES);
   }
-  if (c->time_us > s->st.last_change_time_us) {
-    s->st.last_change_time_us = c->time_us;
-  }
-  meo_mark(s, MP_MEO_REASON_CHANGES);
   if (s->has_change) {
-    meo_lock(lock);
-    var rc: int32 = s->change(s->ctx, s->lv, c);
-    meo_unlock(lock);
+    var rc: int32 = s->change(s->ctx, s->c, ev);
     if (rc != MP_OK) { s->st.last_error = rc; }
   }
+  mp_chart_unlock(s->c);
 }
 
-fn meo_reload_one(w: MpMeoWatch*, s: MpMeoSlot*, lock: int32*) -> bool {
+fn mpm_reload_one(w: MpMeoWatch*, s: MpMeoSlot*) -> bool {
   s->st.last_reason = s->reason;
-  meo_lock(lock);
-  var before: int64 = mp_live_seq(s->lv);
-  var rc: int32 = s->reload(s->ctx, s->st.table_id, s->lv);
-  if (rc == MP_OK && s->lv != 0 && mp_live_seq(s->lv) == before) {
-    mp_live_touch(s->lv);
+  mp_chart_lock(s->c);
+  var before: int64 = mp_chart_seq(s->c);
+  var rc: int32 = MP_OK;
+  if (s->mapped) {
+    rc = mpm_xy_reload(s);
+  } else if (s->has_reload) {
+    rc = s->reload(s->ctx, s->st.table_id, s->c);
   }
-  meo_unlock(lock);
+  if (rc == MP_OK && s->c != 0 && mp_chart_seq(s->c) == before) { mp_chart_touch(s->c); }
+  mp_chart_unlock(s->c);
   if (rc != MP_OK) {
     s->st.last_error = rc;
     return false;          // stays pending: retried next poll
@@ -435,7 +761,30 @@ fn meo_reload_one(w: MpMeoWatch*, s: MpMeoSlot*, lock: int32*) -> bool {
   return true;
 }
 
-fn meo_poll_impl(w: MpMeoWatch*, lock: int32*) -> int32 {
+/// Drains the committed changes published since the last poll, applies them, then reloads
+/// each table that needs it once. Bounded: it reads up to the feed's newest event at the
+/// moment it starts, so a writer that never stops cannot keep it running. Per event: a
+/// GAP marks every watched table for reload; an event of an unwatched table only moves the
+/// watch-wide stats; an event of a watched table moves its counters, goes through the
+/// mapped fast path (mp_meo_watch_xy) or marks the table, then reaches its change
+/// callback. Events a mapped table's last reload already contained are skipped. After a
+/// successful reload whose chart seq did not move, the chart is touched, so its seq
+/// always advances (an "updated" subtitle refreshes, ETag clients see a new frame). Every
+/// callback, fast-path change, reload and touch of a chart runs under mp_chart_lock(c);
+/// the feed read takes no chart lock.
+///
+/// @param w The watch. Valid: non-zero.
+/// @return The number of tables reloaded successfully (0 or more), -MP_ERR_STATE when the
+///   feed refused a read (the MEO code is in the watch stats' feed_error; what was read is
+///   still applied and reloaded), or -MP_ERR_ARG for a null watch. A failed reload stays
+///   pending and is retried at the next poll; its code is in the table's last_error.
+/// @mem Nothing is allocated; events and their bytes live in the watch's buffers.
+/// @thread One polling thread at a time. The MeoDB writer may run on any other thread;
+///   charts may be rendered on other threads after mp_chart_share(c). A mapped reload
+///   takes the db lock (waiting for an open write transaction), so never poll while this
+///   thread holds the db lock, and never take a chart lock while holding the db lock.
+/// @cost O(events) plus one table scan per reloaded mapped table.
+export fn mp_meo_poll(w: MpMeoWatch*) -> int32 {
   if (w == 0) { return -MP_ERR_ARG; }
   w->st.polls = w->st.polls + 1;
   var end: MeoFeedCursor;
@@ -443,8 +792,8 @@ fn meo_poll_impl(w: MpMeoWatch*, lock: int32*) -> int32 {
   meo_feed_cursor_end(w->feed, &end);
   var failed: bool = false;
   while (w->cur.next_seq < end.next_seq) {
-    var n: int32 = meo_feed_read(w->feed, &w->cur, w->out, MP_MEO_BATCH,
-      w->keybuf, MP_MEO_KEYBUF);
+    var n: int32 = meo_feed_read(w->feed, &w->cur, w->out, MP_MEO_BATCH, w->keybuf,
+      MP_MEO_KEYBUF);
     if (n < 0) {
       w->st.feed_error = n;
       failed = true;
@@ -453,17 +802,16 @@ fn meo_poll_impl(w: MpMeoWatch*, lock: int32*) -> int32 {
     if (n == 0) { break; }
     var i: int32 = 0;
     while (i < n) {
-      meo_dispatch(w, &w->out[i], lock);
+      mpm_dispatch(w, &w->out[i]);
       i = i + 1;
     }
   }
-  // Reload even after a failed read: what was dispatched is real.
   var reloaded: int32 = 0;
   var k: int32 = 0;
   while (k < MP_MEO_MAX_TABLES) {
     var s: MpMeoSlot* = &w->slots[k];
     if (s->used && s->pending) {
-      if (meo_reload_one(w, s, lock)) { reloaded = reloaded + 1; }
+      if (mpm_reload_one(w, s)) { reloaded = reloaded + 1; }
     }
     k = k + 1;
   }
@@ -471,68 +819,29 @@ fn meo_poll_impl(w: MpMeoWatch*, lock: int32*) -> int32 {
   return reloaded;
 }
 
-// Drain the committed changes published since the last poll, call the
-// per-change callbacks, then each changed table's reload callback once. See
-// the header for the full contract. Use when nothing else touches the MpLives
-// concurrently (a single-threaded UI).
-export fn mp_meo_poll(w: MpMeoWatch*) -> int32 {
-  return meo_poll_impl(w, 0);
-}
-
-// mp_meo_poll with the std/thread spin lock `lock` held around every callback
-// invocation and the mp_live_touch (never around the feed read). Pass the lock
-// your renderer holds, e.g. &rl->lock of an MpRaizeLive. A null lock returns
-// -MP_ERR_ARG (use mp_meo_poll).
-export fn mp_meo_poll_locked(w: MpMeoWatch*, lock: int32*) -> int32 {
-  if (lock == 0) { return -MP_ERR_ARG; }
-  return meo_poll_impl(w, lock);
-}
-
 // ---------------------------------------------------------------------------
 // "When" formatting
 // ---------------------------------------------------------------------------
 
-fn meo_put2(out: uint8*, pos: int64, v: int64) -> int64 {
+fn mpm_put2(out: uint8*, pos: int64, v: int64) -> int64 {
   out[pos] = (uint8)(48 + (int32)(v / 10));
   out[pos + 1] = (uint8)(48 + (int32)(v % 10));
   return pos + 2;
 }
 
-fn meo_put_clock(out: uint8*, pos: int64, time_us: int64) -> int64 {
+fn mpm_put_clock(out: uint8*, pos: int64, time_us: int64) -> int64 {
   var secs: int64 = time_us / (int64)1000000;
   if (time_us < 0 && secs * (int64)1000000 != time_us) { secs = secs - 1; }
   var day: int64 = secs % (int64)86400;
   if (day < 0) { day = day + (int64)86400; }
-  var p: int64 = meo_put2(out, pos, day / 3600);
+  var p: int64 = mpm_put2(out, pos, day / 3600);
   out[p] = 58;
-  p = meo_put2(out, p + 1, (day / 60) % 60);
+  p = mpm_put2(out, p + 1, (day / 60) % 60);
   out[p] = 58;
-  return meo_put2(out, p + 1, day % 60);
+  return mpm_put2(out, p + 1, day % 60);
 }
 
-fn meo_put_u64(out: uint8*, pos: int64, v: uint64) -> int64 {
-  var tmp: uint8[24];
-  var n: int32 = 0;
-  var x: uint64 = v;
-  if (x == 0) {
-    tmp[0] = 48;
-    n = 1;
-  }
-  while (x > 0) {
-    tmp[n] = (uint8)(48 + (int32)(x % (uint64)10));
-    x = x / (uint64)10;
-    n = n + 1;
-  }
-  var p: int64 = pos;
-  while (n > 0) {
-    out[p] = tmp[n - 1];
-    p = p + 1;
-    n = n - 1;
-  }
-  return p;
-}
-
-fn meo_put_str(out: uint8*, pos: int64, s: string) -> int64 {
+fn mpm_put_str(out: uint8*, pos: int64, s: string) -> int64 {
   var p: int64 = pos;
   var i: int64 = 0;
   while (i < (int64)s.length) {
@@ -543,49 +852,84 @@ fn meo_put_str(out: uint8*, pos: int64, s: string) -> int64 {
   return p;
 }
 
-// A commit time (CLOCK_REALTIME microseconds) as UTC "hh:mm:ss" in out
-// (cap >= 9). Returns a view of out, or "" when cap is too small.
+/// A commit time as UTC "hh:mm:ss".
+///
+/// @param time_us Commit time. Units: CLOCK_REALTIME microseconds. Valid: any.
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 9; smaller gives "".
+/// @return A view of out, or "" when out is 0 or cap is too small.
+/// @mem Writes into out and returns a view of it: valid while out is. Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
 export fn mp_meo_fmt_updated(time_us: int64, out: uint8*, cap: int64) -> string {
   if (out == 0 || cap < 9) { return ""; }
-  var n: int64 = meo_put_clock(out, 0, time_us);
+  var n: int64 = mpm_put_clock(out, 0, time_us);
   return str_from_bytes((cstring)out, n);
 }
 
-// "updated hh:mm:ss · commit N" (UTF-8 middle dot) in out (cap >= 64): a
-// chart subtitle. Returns a view of out, or "" when cap is too small.
+/// The chart subtitle "updated hh:mm:ss · commit N" (UTF-8 middle dot, UTC time).
+///
+/// @param time_us Commit time. Units: CLOCK_REALTIME microseconds. Valid: any.
+/// @param commit_seq Commit number. Valid: any.
+/// @param out Destination bytes. Valid: non-zero, cap bytes writable.
+/// @param cap Size of out. Units: bytes. Valid: >= 64; smaller gives "".
+/// @return A view of out, or "" when out is 0 or cap is too small.
+/// @mem Writes into out and returns a view of it: valid while out is. Nothing is retained.
+/// @thread Safe from any thread (with distinct buffers).
 export fn mp_meo_fmt_subtitle(time_us: int64, commit_seq: uint64, out: uint8*,
-    cap: int64) -> string {
+                              cap: int64) -> string {
   if (out == 0 || cap < 64) { return ""; }
-  var p: int64 = meo_put_str(out, 0, "updated ");
-  p = meo_put_clock(out, p, time_us);
-  p = meo_put_str(out, p, " · commit ");
-  p = meo_put_u64(out, p, commit_seq);
+  var p: int64 = mpm_put_str(out, 0, "updated ");
+  p = mpm_put_clock(out, p, time_us);
+  p = mpm_put_str(out, p, " · commit ");
+  var num: uint8[32];
+  p = mpm_put_str(out, p, mp_fmt_u64(commit_seq, &num[0], 32));
   return str_from_bytes((cstring)out, p);
+}
+
+/// Sets c's subtitle to "updated hh:mm:ss · commit N" for a watched table: its newest
+/// commit, or the feed's last commit when the table has not changed since it was watched.
+///
+/// @param w The watch. Valid: non-zero.
+/// @param table_id A watched table. Valid: any; an unwatched one is an error.
+/// @param c The chart. Valid: non-zero.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG w or c is 0, or the table is not watched; the subtitle is unchanged.
+/// @error MP_ERR_ALLOC the subtitle copy failed (also the chart's sticky error).
+/// @mem The text is copied into the chart; nothing is retained.
+/// @thread The thread that polls w; c's seq moves only when the text changed.
+export fn mp_meo_set_subtitle(w: MpMeoWatch*, table_id: uint32, c: MpChart*) -> int32 {
+  if (w == 0 || c == 0) { return MP_ERR_ARG; }
+  var i: int32 = mpm_find(w, table_id);
+  if (i < 0) { return MP_ERR_ARG; }
+  var t: int64 = w->slots[i].st.last_change_time_us;
+  var seq: uint64 = w->slots[i].st.last_commit_seq;
+  if (seq == 0) {
+    t = w->st.last_time_us;
+    seq = w->st.last_commit_seq;
+  }
+  var buf: uint8[80];
+  return mp_chart_set_subtitle(c, mp_meo_fmt_subtitle(t, seq, &buf[0], 80));
 }
 
 // ---------------------------------------------------------------------------
 // Cross-process probe
 // ---------------------------------------------------------------------------
 
-// A probe of the database file at `path` (copied). 0 for an empty path or an
-// allocation failure.
+/// Creates a probe of the database file at path.
+///
+/// @param path Database file. Valid: non-empty.
+/// @return The probe, or 0 for an empty path or a failed allocation.
+/// @mem path is copied; free the probe with mp_meo_probe_free.
+/// @thread Safe from any thread.
 export fn mp_meo_probe_new(path: string) -> MpMeoProbe* {
-  var len: int64 = (int64)path.length;
-  if (len <= 0) { return 0; }
+  if (path.length == 0) { return 0; }
   var pr: MpMeoProbe* = new MpMeoProbe;
   if (pr == 0) { return 0; }
-  var nb: uint8* = (uint8*)malloc(len + 1);
-  if (nb == 0) {
+  pr->path = mp_str_dup(path);
+  if (pr->path.length == 0) {
     free(pr);
     return 0;
   }
-  var i: int64 = 0;
-  while (i < len) {
-    nb[i] = path.chars[i];
-    i = i + 1;
-  }
-  nb[len] = 0;
-  pr->path = str_from_bytes((cstring)nb, len);
   pr->last_seq = 0;
   pr->primed = false;
   pr->last_status = MEO_OK;
@@ -594,25 +938,37 @@ export fn mp_meo_probe_new(path: string) -> MpMeoProbe* {
   return pr;
 }
 
+/// Frees a probe and its path copy.
+///
+/// @param pr The probe. Valid: from mp_meo_probe_new, or 0 (ignored).
+/// @mem pr is invalid afterwards.
+/// @thread The thread that uses pr.
 export fn mp_meo_probe_free(pr: MpMeoProbe*) {
   if (pr == 0) { return; }
-  free(pr->path.chars);
+  mp_str_free(pr->path);
   free(pr);
 }
 
-// 1 when the persisted commit_seq moved since the last successful check (and
-// on the first successful check: nothing has been loaded yet), 0 when it did
-// not or when MeoDB says "not yet" (a journal exists: status 1; a page 0
-// caught mid-write: -MEO_ERR_BUSY; a transient -MEO_ERR_CORRUPT, retried up to
-// MP_MEO_PROBE_CORRUPT_RETRIES consecutive times), negative MEO code on a hard
-// error (missing file, foreign file, persistent corruption). last_seq only
-// moves on a committed read.
+/// Reads the persisted commit_seq of the file with meo_peek_commit_seq (no file lock, so
+/// it works while another process holds the database open) and says whether to reload.
+/// MEO_PEEK_HOT (a journal exists, the value may still roll back), MEO_PEEK_TRANSIENT (page
+/// 0 caught mid-write), -MEO_ERR_BUSY and up to MP_MEO_PROBE_CORRUPT_RETRIES consecutive
+/// -MEO_ERR_CORRUPT answers mean "not yet" and give 0; last_seq moves only on a committed
+/// read.
+///
+/// @param pr The probe. Valid: non-zero.
+/// @return 1 when the commit_seq moved since the last committed read (and at the first
+///   one), 0 when it did not or MeoDB said "not yet", a negative MEO code on a hard error
+///   (missing or foreign file, persistent corruption; -MEO_ERR_USAGE for a null probe).
+/// @mem Nothing is allocated beyond meo_peek_commit_seq's page buffer, freed inside.
+/// @thread The thread that uses pr; any thread relative to the writer process.
+/// @cost One open, one or two page reads, one close.
 export fn mp_meo_probe_check(pr: MpMeoProbe*) -> int32 {
   if (pr == 0) { return -MEO_ERR_USAGE; }
   var seq: uint64 = 0;
   var rc: int32 = meo_peek_commit_seq(pr->path, &seq);
   pr->last_status = rc;
-  if (rc == 1 || rc == -MEO_ERR_BUSY) {
+  if (rc == MEO_PEEK_HOT || rc == MEO_PEEK_TRANSIENT || rc == -MEO_ERR_BUSY) {
     pr->retries = pr->retries + 1;
     pr->corrupt_run = 0;
     return 0;
@@ -635,7 +991,12 @@ export fn mp_meo_probe_check(pr: MpMeoProbe*) -> int32 {
   return 0;
 }
 
-// The commit_seq of the last committed read (0 before the first).
+/// The commit_seq of the last committed read.
+///
+/// @param pr The probe. Valid: any; 0 gives 0.
+/// @return The commit_seq, 0 before the first committed read.
+/// @mem Reads only.
+/// @thread The thread that uses pr.
 export fn mp_meo_probe_seq(pr: MpMeoProbe*) -> uint64 {
   if (pr == 0) { return 0; }
   return pr->last_seq;

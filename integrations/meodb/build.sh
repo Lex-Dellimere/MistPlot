@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the MeoDB integration's test and example in debug and release, runs
-# the test in both modes, runs the example for a few seconds and checks its SVG.
+# the test in both modes, runs the example for a few seconds and checks its SVG
+# and terminal output.
 # Prints PASS or FAIL.
 #
 # Env: METTLE (compiler, default ../Mettle/bin/mettle next to this repo),
@@ -52,19 +53,22 @@ step() { # name, command...
   fi
 }
 
-# One polyline per series (3), the "updated hh:mm:ss · commit N" subtitle, and
-# points that changed between the first and the final snapshot.
+# One series polyline per sensor (3; legend swatches excluded), the "updated hh:mm:ss ·
+# commit N" subtitle, points that changed between the first and the final snapshot, a
+# Braille terminal frame (U+2800..U+28FF) and at least one DELETE that reloaded the chart.
 check_svg() { # mode
-  local svg="$OUT/live.$1.svg" first="$OUT/live.$1.first.svg"
+  local svg="$OUT/live.$1.svg" first="$OUT/live.$1.first.svg" log="$OUT/run-example-$1.log"
   [ -s "$svg" ] && [ -s "$first" ] || { echo "missing $svg or $first"; return 1; }
-  local polys; polys="$(grep -o '<polyline' "$svg" | wc -l)"
-  echo "polylines: $polys"
+  local polys; polys="$(grep -o '<polyline[^>]*>' "$svg" | grep -vc 'mp-c-legend')"
+  echo "series polylines: $polys"
   [ "$polys" = 3 ] || return 1
   grep -Eo 'updated [0-9]{2}:[0-9]{2}:[0-9]{2} · commit [0-9]+' "$svg" || return 1
   if cmp -s <(grep -o 'points="[^"]*"' "$first") <(grep -o 'points="[^"]*"' "$svg"); then
     echo "polyline points did not change between the two snapshots"
     return 1
   fi
+  LC_ALL=C grep -q $'\xe2[\xa0-\xa3]' "$log" || { echo "no Braille cells in $log"; return 1; }
+  grep -Eq 'deletes=[1-9]' "$log" || { echo "no DELETE reached the chart"; return 1; }
 }
 
 for mode in debug release; do
@@ -82,7 +86,7 @@ for mode in debug release; do
   if [ -x "$OUT/meo_live_chart.$mode" ]; then
     step "run-example-$mode" "$OUT/meo_live_chart.$mode" --run-for "$RUN_FOR" \
       --db "$OUT/live.$mode.db" --svg "$OUT/live.$mode.svg" \
-      --first-svg "$OUT/live.$mode.first.svg" --quiet
+      --first-svg "$OUT/live.$mode.first.svg" --retain 2 --quiet
     echo "      $(tail -n 1 "$OUT/run-example-$mode.log")"
     step "check-svg-$mode" check_svg "$mode"
   fi

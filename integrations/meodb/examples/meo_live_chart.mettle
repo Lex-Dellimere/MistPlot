@@ -1,96 +1,67 @@
-// integrations/meodb/examples/meo_live_chart — a live MistPlot chart that
-// follows a MeoDB table and redraws only on committed data.
+// integrations/meodb/examples/meo_live_chart: a live MistPlot chart that follows a MeoDB
+// table and redraws only on committed data.
 //
-// A writer thread inserts sensor "readings" into a MeoDB database and commits
-// a transaction every ~200 ms (one reading per sensor). The main thread polls
-// an MpMeoWatch over the database's change feed; when the readings table had a
-// committed change, the watch calls the reload callback, which re-scans the
-// table with a b-tree cursor and rebuilds the MpLive's series. Once a second
-// the chart is written to an SVG file and drawn in the terminal, with the
-// subtitle "updated hh:mm:ss · commit N" taken from the watch's stats.
+// A writer thread inserts one reading per sensor into a WAL-mode MeoDB table and commits
+// every ~200 ms; every few seconds it also deletes readings older than the retention.
+// The main thread polls an MpMeoWatch over the database's change feed. The table is
+// watched through a column mapping (x = t, y = deg, series = sensor), so committed
+// inserts go straight into the chart, and a delete reloads it with a range scan on the
+// indexed t column. Once a second the chart is written to an SVG file and drawn in the
+// terminal (Braille), with the subtitle "updated hh:mm:ss · commit N".
 //
-// MeoDB maps key -> rowid and stores no row values, so this example encodes
-// a reading as
-//   key   = meo_key_int(sensor) ++ meo_key_int(ts_micros)
-//   rowid = the reading in milli-degrees, as an unsigned integer
-// The value riding in the rowid is a stand-in, not a schema.
+//   readings(id INTEGER PRIMARY KEY, sensor INTEGER NOT NULL, t REAL NOT NULL, deg REAL)
+//   index readings_t on t
 //
-// Threads and locks:
-//   * The writer thread owns all writes. The pager is not thread-safe, so the
-//     reload's scan must not run concurrently with a write: both take the
-//     app's `db_lock` (a std/thread spin lock), the writer for each
-//     begin..commit, the reload for its scan. A scan therefore always sees a
-//     committed state.
-//   * The MpLives are touched only by the main thread (poll callbacks and
-//     renders run there), so mp_meo_poll needs no MpLive lock. With RaizeWeb
-//     workers rendering, use mp_meo_poll_locked(w, &rl->lock) instead.
-//   * The feed is read lock-free by the watch (MeoDB's feed takes its own
-//     spin lock for the copy only).
+// Threads: the writer owns every write; MeoDb's own lock serialises it with the watch's
+// reload scan, and in WAL mode commits never wait for readers. Only the main thread
+// touches the chart, so it is not shared (call mp_chart_share before rendering it on
+// another thread, e.g. from RaizeWeb workers).
 //
 // Usage (from the mistplot repo root):
 //   meo_live_chart [--run-for S] [--db PATH] [--svg PATH] [--first-svg PATH]
-//                  [--quiet]
-//   --run-for S     run S seconds (default 10), then stop the writer, join it,
-//                   poll and render one last time, and exit 0
-//   --db PATH       database file (default build/integrations/meodb/live.db);
-//                   it is recreated empty at startup
-//   --svg PATH      the SVG rewritten every second
-//                   (default build/integrations/meodb/live.svg)
-//   --first-svg P   a copy of the first second's SVG, to compare against the
-//                   final one (default build/integrations/meodb/live.first.svg)
+//                  [--retain S] [--quiet]
+//   --run-for S     run S seconds (default 10), then stop the writer, join it, poll and
+//                   render one last time, and exit
+//   --db PATH       database file (default build/integrations/meodb/live.db), recreated
+//   --svg PATH      the SVG rewritten every second (default build/integrations/meodb/live.svg)
+//   --first-svg P   a copy of the first second's SVG (default .../live.first.svg)
+//   --retain S      the writer deletes readings older than S seconds (default 20)
 //   --quiet         print the terminal chart only once, at the end
 //
-// Exit codes: 0 ok, 1 setup failed, 2 the writer or a render failed.
+// Exit codes: 0 ok, 1 setup failed, 2 the writer, a poll or a render failed.
 
 import "std/io";
 import "std/mem";
 import "std/math";
 import "std/conv";
 import "std/thread";
-import "meodb/src/error/status";
+import "meodb/src/meodb";
 import "meodb/src/platform/file";
 import "meodb/src/platform/file_linux";
 import "meodb/src/platform/clock_linux";
-import "meodb/src/pager/pager";
-import "meodb/src/types/key";
-import "meodb/src/btree/node";
-import "meodb/src/btree/btree";
 import "meodb/src/feed/feed";
-import "mistplot/core/buf";
-import "mistplot/core/color";
-import "mistplot/renderer/backend";
-import "mistplot/renderer/scene";
-import "mistplot/chart/spec";
-import "mistplot/live/stream";
-import "mistplot/backends/terminal/ascii";
-import "mistplot/export/svg_file";
+import "mistplot/mistplot";
 import "../mp_meo";
 
-const DEMO_TABLE: uint32 = 1;          // "readings"
 const DEMO_SENSORS: int32 = 3;
 const DEMO_COMMIT_MS: uint32 = 200;
 const DEMO_POLL_MS: uint32 = 50;
-const DEMO_WINDOW_S: float64 = 30.0;
-const DEMO_RING: int64 = 4096;
+const DEMO_PURGE_EVERY: int32 = 5;      // commits between retention deletes
 const DEMO_TERM_COLS: int32 = 100;
-const DEMO_TERM_ROWS: int32 = 24;
+const DEMO_TERM_ROWS: int32 = 28;
 
 struct Demo {
-  db_lock: int32;       // spin lock: writer txns vs reload scans
-  pager: MeoPager*;
+  db: MeoDb*;
   feed: MeoFeed*;
-  root: uint32;         // readings tree root (written under db_lock)
+  w: MpMeoWatch*;
+  c: MpChart*;
+  table_id: uint32;
+  t0_us: int64;         // wall clock at start (x = seconds since)
+  retain_s: float64;
   stop: int32;          // atomic: writer should stop
   writer_err: int32;
-  commits: int32;       // writer's committed txns
-  t0_us: int64;         // wall clock at start (x = seconds since)
-  lv: MpLive*;          // the SVG chart (bound to the watch)
-  term: MpLive*;        // the same data laid out for the terminal grid
-  w: MpMeoWatch*;
-  sub: uint8*;          // subtitle bytes, borrowed by lv's template
-  term_sub: uint8*;     // its ASCII copy, borrowed by term's spec
-  rows: int64;          // rows the last reload scanned
-  scan_err: int32;
+  commits: int32;       // writer's committed transactions
+  purges: int32;        // retention deletes that removed rows
 }
 
 // --- writer thread ---------------------------------------------------------
@@ -104,226 +75,163 @@ fn demo_xorshift(s: uint32*) -> uint32 {
   return x;
 }
 
-// One reading in milli-degrees: 20 + 4*sensor degrees, a sine with a 6 s
-// period (phase-shifted per sensor), plus +-0.5 degree noise. Always positive,
-// so it fits the rowid (uint64).
-fn demo_reading(sensor: int32, t: float64, rng: uint32*) -> uint64 {
+// One reading in degrees: 20 + 4*sensor, a sine with a 6 s period (phase-shifted per
+// sensor), plus +-0.5 degree noise.
+fn demo_reading(sensor: int32, t: float64, rng: uint32*) -> float64 {
   var u: float64 = (float64)demo_xorshift(rng) / 4294967296.0;
-  var deg: float64 = 20.0 + 4.0 * (float64)sensor +
-    3.0 * sin(t * 6.283185307179586 / 6.0 + (float64)sensor * 1.3) +
-    (u - 0.5);
-  return (uint64)(deg * 1000.0);
+  return 20.0 + 4.0 * (float64)sensor +
+    3.0 * sin(t * 6.283185307179586 / 6.0 + (float64)sensor * 1.3) + (u - 0.5);
+}
+
+fn demo_insert(db: MeoDb*, sensor: int32, t: float64, deg: float64) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_insert(db, "readings", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_into(q, "sensor");
+  meo_q_into(q, "t");
+  meo_q_into(q, "deg");
+  var v: MeoValue;
+  meo_value_set_int(&v, (int64)sensor);
+  meo_q_value(q, &v);
+  meo_value_set_real(&v, t);
+  meo_q_value(q, &v);
+  meo_value_set_real(&v, deg);
+  meo_q_value(q, &v);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+// DELETE FROM readings WHERE t < before; the number of rows removed, or a negative code.
+fn demo_purge(db: MeoDb*, before: float64) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_delete(db, "readings", &q);
+  if (rc != MEO_OK) { return rc; }
+  var v: MeoValue;
+  meo_value_set_real(&v, before);
+  meo_q_where(q, "t", MEO_Q_LT, &v);
+  rc = meo_q_step(q);
+  var n: int32 = meo_q_changes(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return rc; }
+  return n;
 }
 
 fn demo_writer(arg: cstring) -> uint32 {
   var d: Demo* = (Demo*)arg;
   var rng: uint32 = (uint32)2463534242;
-  var kb: uint8[32];
   while (atomic_compare_exchange_i32(&d->stop, 0, 0) == 0) {
-    var now: int64 = meo_clock_realtime_us();
-    var t: float64 = (float64)(now - d->t0_us) / 1000000.0;
-    spin_lock(&d->db_lock);
-    var rc: int32 = meo_pager_begin(d->pager);
+    var t: float64 = (float64)(meo_clock_realtime_us() - d->t0_us) / 1000000.0;
+    var rc: int32 = meo_db_begin(d->db, MEO_TX_DEFAULT);
     var s: int32 = 0;
     while (rc == MEO_OK && s < DEMO_SENSORS) {
-      var n1: int32 = meo_key_int(&kb[0], 32, (int64)s);
-      var n2: int32 = meo_key_int(&kb[9], 23, now);
-      var k: MeoBtKey = { data: &kb[0], len: n1 + n2 };
-      rc = meo_feed_insert(d->feed, d->pager, DEMO_TABLE, &d->root,
-        &meo_key_compare, k, demo_reading(s, t, &rng));
+      rc = demo_insert(d->db, s, t, demo_reading(s, t, &rng));
       s = s + 1;
     }
     if (rc == MEO_OK) {
-      rc = meo_pager_set_root(d->pager, MEO_ROOT_BTREE, d->root);
-    }
-    if (rc == MEO_OK) {
-      rc = meo_pager_commit(d->pager);
+      rc = meo_db_commit(d->db);
     } else {
-      meo_pager_rollback(d->pager);
+      meo_db_rollback(d->db);
     }
-    spin_unlock(&d->db_lock);
     if (rc != MEO_OK) {
       d->writer_err = rc;
       break;
     }
     d->commits = d->commits + 1;
+    if (d->commits % DEMO_PURGE_EVERY == 0) {
+      var n: int32 = demo_purge(d->db, t - d->retain_s);   // autocommit
+      if (n < 0) {
+        d->writer_err = n;
+        break;
+      }
+      if (n > 0) { d->purges = d->purges + 1; }
+    }
     thread_sleep_ms(DEMO_COMMIT_MS);
   }
   return 0;
 }
 
-// --- reload: re-scan the table ---------------------------------------------
-
-// Decode one meo_key_int field at p (9 bytes: tag, then big-endian with the
-// sign bit flipped). MeoDB has no decoder for it.
-fn demo_key_int(p: uint8*) -> int64 {
-  var x: uint64 = 0;
-  var i: int32 = 1;
-  while (i < 9) {
-    x = (x << (uint64)8) | (uint64)p[i];
-    i = i + 1;
-  }
-  return (int64)(x ^ ((uint64)1 << (uint64)63));
-}
-
-// `s` with each multi-byte UTF-8 sequence replaced by one `-`, into `out`.
-// The terminal backend draws every non-ASCII byte as `?`, so the subtitle's
-// middle dot would otherwise show as `??`.
-fn demo_ascii(s: string, out: uint8*, cap: int64) -> string {
-  var n: int64 = 0;
-  var i: int64 = 0;
-  while (i < (int64)s.length && n < cap) {
-    var c: uint8 = s.chars[i];
-    if (c < 128) {
-      out[n] = c;
-      n = n + 1;
-    } else if (c >= 192) {
-      out[n] = 45;
-      n = n + 1;
-    }
-    i = i + 1;
-  }
-  return str_from_bytes((cstring)out, n);
-}
-
-// The reload callback: under db_lock, walk the whole readings table from the
-// smallest key and rebuild both MpLives, then set the subtitle from the
-// watch's stats.
-fn demo_reload(ctx: rawptr, table_id: uint32, lv: MpLive*) -> int32 {
-  var d: Demo* = (Demo*)ctx;
-  mp_live_clear(d->lv);
-  mp_live_clear(d->term);
-  var rows: int64 = 0;
-  var err: int32 = MEO_OK;
-  spin_lock(&d->db_lock);
-  var root: uint32 = d->root;
-  if (root != 0) {
-    var c: MeoBtCursor;
-    meo_bt_cursor_init(&c);
-    // Lower bound of every key: an int field holding INT64_MIN sorts at or
-    // before any key that starts with an int field.
-    var kb: uint8[16];
-    var kn: int32 = meo_key_int(&kb[0], 16, (int64)((uint64)1 << (uint64)63));
-    var lo: MeoBtKey = { data: &kb[0], len: kn };
-    var rc: int32 = meo_bt_seek(d->pager, &c, root, &meo_key_compare, lo);
-    while (rc == 0) {
-      var klen: int32 = meo_btn_leaf_key_len(c.leaf->data, c.slot_in_leaf);
-      var kp: uint8* = meo_btn_leaf_key_ptr(c.leaf->data, c.slot_in_leaf);
-      var rid: uint64 = 0;
-      if (klen == 18 && meo_bt_rowid(d->pager, &c, &rid) == MEO_OK) {
-        var sensor: int64 = demo_key_int(kp);
-        var ts: int64 = demo_key_int(kp + 9);
-        if (sensor >= 0 && sensor < (int64)DEMO_SENSORS) {
-          var x: float64 = (float64)(ts - d->t0_us) / 1000000.0;
-          var y: float64 = (float64)rid / 1000.0;
-          mp_live_push(d->lv, (int32)sensor, x, y);
-          mp_live_push(d->term, (int32)sensor, x, y);
-          rows = rows + 1;
-        }
-      }
-      rc = meo_bt_next(d->pager, &c);
-    }
-    if (rc < 0) { err = rc; }
-    meo_bt_close(d->pager, &c);
-  }
-  spin_unlock(&d->db_lock);
-  d->rows = rows;
-  if (err != MEO_OK) {
-    d->scan_err = err;
-    return MP_ERR_IO;
-  }
-  var st: MpMeoTableStats;
-  if (mp_meo_table_stats(d->w, table_id, &st) == MP_OK) {
-    var subtitle: string = mp_meo_fmt_subtitle(st.last_change_time_us,
-      st.last_commit_seq, d->sub, 80);
-    mp_live_spec(d->lv)->subtitle = subtitle;
-    mp_live_spec(d->term)->subtitle = demo_ascii(subtitle, d->term_sub, 80);
-  }
-  return MP_OK;
-}
-
 // --- setup -----------------------------------------------------------------
 
-fn demo_live(width: float64, height: float64) -> MpLive* {
-  var lv: MpLive* = mp_live_new(MP_CHART_LINE, DEMO_SENSORS, DEMO_RING);
-  if (lv == 0) { return 0; }
-  mp_live_series_name(lv, 0, "sensor 0");
-  mp_live_series_name(lv, 1, "sensor 1");
-  mp_live_series_name(lv, 2, "sensor 2");
-  mp_live_window(lv, DEMO_WINDOW_S);
-  var sp: MpChartSpec* = mp_live_spec(lv);
-  sp->title = "Sensor readings (MeoDB)";
-  sp->x_label = "since start";
-  sp->y_label = "deg C";
-  sp->x_format = MP_FMT_TIME;
-  sp->y_start_at_zero = false;
-  sp->y_fixed = true;
-  sp->y_min = 15.0;
-  sp->y_max = 33.0;
-  sp->width = width;
-  sp->height = height;
-  mp_live_touch(lv);
-  return lv;
-}
-
-fn demo_reset(db: cstring) -> int32 {
-  var path: string = str_from_cstr(db);
-  var f: MeoFile = meo_file_open(path,
-    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
-  if (!f.is_open) { return -MEO_ERR_IO; }
-  var rc: int32 = meo_file_truncate(f, 0);
-  meo_file_close(f);
+fn demo_remove(path: string) {
+  meo_file_unlink(path);
   var j: string = path + "-journal";
   meo_file_unlink(j);
   free(j.chars);
-  return rc;
+  var wl: string = path + "-wal";
+  meo_file_unlink(wl);
+  free(wl.chars);
+}
+
+fn demo_schema(db: MeoDb*) -> int32 {
+  var q: MeoQuery* = 0;
+  var rc: int32 = meo_q_create(db, "readings", &q);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "sensor", MEO_T_INT, MEO_COL_NOT_NULL);
+  meo_q_column_def(q, "t", MEO_T_REAL, MEO_COL_NOT_NULL);
+  meo_q_column_def(q, "deg", MEO_T_REAL, 0);
+  rc = meo_q_step(q);
+  meo_q_free(q);
+  if (rc != MEO_DONE) { return rc; }
+  var qi: MeoQuery* = 0;
+  rc = meo_q_create_index(db, "readings", "readings_t", &qi);
+  if (rc != MEO_OK) { return rc; }
+  meo_q_index_column(qi, "t");
+  rc = meo_q_step(qi);
+  meo_q_free(qi);
+  if (rc != MEO_DONE) { return rc; }
+  return MEO_OK;
+}
+
+fn demo_chart() -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  if (c == 0) { return 0; }
+  mp_chart_set_title(c, "Sensor readings (MeoDB)");
+  mp_chart_set_x_label(c, "since start");
+  mp_chart_set_y_label(c, "deg C");
+  mp_chart_set_x_format(c, MP_FMT_TIME);
+  mp_chart_set_y_range(c, 15.0, 33.0);
+  mp_chart_keep(c, 4096);
+  mp_chart_window(c, 30.0);
+  mp_chart_series(c, "sensor 0");
+  mp_chart_series(c, "sensor 1");
+  mp_chart_series(c, "sensor 2");
+  if (mp_chart_error(c) != MP_OK) {
+    mp_chart_free(c);
+    return 0;
+  }
+  return c;
 }
 
 fn demo_arg_is(a: cstring, s: string) -> bool {
   return str_from_cstr(a) == s;
 }
 
-// Renders and prints the terminal view (plain text, no escapes).
 fn demo_print_term(d: Demo*, out: MpBuf*) -> int32 {
-  mp_live_update(d->term);
-  var sp: MpChartSpec* = mp_live_spec(d->term);
-  var o: MpRenderOpts = mp_render_opts(sp->width, sp->height, sp->theme);
-  o.pad = -1.0;
-  var rc: int32 = mp_ascii_render_grid(mp_live_scene(d->term), &o,
-    DEMO_TERM_COLS, DEMO_TERM_ROWS, out);
-  if (rc != MP_OK) { return rc; }
-  print(mp_buf_str(out));
-  return MP_OK;
+  var rc: int32 = mp_chart_term(d->c, DEMO_TERM_COLS, DEMO_TERM_ROWS,
+    MP_TERM_BRAILLE | MP_TERM_PLAIN, out);
+  if (rc == MP_OK) { print(mp_buf_str(out)); }
+  return rc;
 }
 
-fn demo_write_svg(d: Demo*, o: MpRenderOpts*, path: cstring) -> int32 {
-  mp_live_update(d->lv);
-  if (mp_live_error(d->lv) != MP_OK) { return mp_live_error(d->lv); }
-  return mp_export_svg(mp_live_scene(d->lv), o, path);
-}
-
-// Frees whatever was set up; every field may still be 0. The feed unhooks
-// itself from the pager, so it can go first.
+// Frees whatever was set up; every field may still be 0.
 fn demo_free(d: Demo*) {
   if (d == 0) { return; }
   if (d->w != 0) { mp_meo_watch_free(d->w); }
+  if (d->db != 0) { meo_db_close(d->db); }
   if (d->feed != 0) { meo_feed_free(d->feed); }
-  if (d->pager != 0) {
-    meo_pager_close(d->pager);
-    meo_pager_free(d->pager);
-  }
-  if (d->lv != 0) { mp_live_free(d->lv); }
-  if (d->term != 0) { mp_live_free(d->term); }
-  if (d->sub != 0) { free(d->sub); }
-  if (d->term_sub != 0) { free(d->term_sub); }
+  if (d->c != 0) { mp_chart_free(d->c); }
   free(d);
 }
 
 fn main(argc: int32, argv: cstring*) -> int32 {
   var run_for: int32 = 10;
-  var db: cstring = "build/integrations/meodb/live.db";
-  var svg: cstring = "build/integrations/meodb/live.svg";
-  var first_svg: cstring = "build/integrations/meodb/live.first.svg";
+  var db_path: string = "build/integrations/meodb/live.db";
+  var svg: string = "build/integrations/meodb/live.svg";
+  var first_svg: string = "build/integrations/meodb/live.first.svg";
+  var retain: int64 = 20;
   var quiet: bool = false;
   var i: int32 = 1;
   while (i < argc) {
@@ -334,14 +242,18 @@ fn main(argc: int32, argv: cstring*) -> int32 {
       var v: int64 = str_to_i64_or(str_from_cstr(argv[i + 1]), 10);
       if (v > 0 && v < 86400) { run_for = (int32)v; }
       i = i + 1;
+    } else if (more && demo_arg_is(argv[i], "--retain")) {
+      var r: int64 = str_to_i64_or(str_from_cstr(argv[i + 1]), 20);
+      if (r > 0 && r < 86400) { retain = r; }
+      i = i + 1;
     } else if (more && demo_arg_is(argv[i], "--db")) {
-      db = argv[i + 1];
+      db_path = str_from_cstr(argv[i + 1]);
       i = i + 1;
     } else if (more && demo_arg_is(argv[i], "--svg")) {
-      svg = argv[i + 1];
+      svg = str_from_cstr(argv[i + 1]);
       i = i + 1;
     } else if (more && demo_arg_is(argv[i], "--first-svg")) {
-      first_svg = argv[i + 1];
+      first_svg = str_from_cstr(argv[i + 1]);
       i = i + 1;
     }
     i = i + 1;
@@ -350,46 +262,36 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   var d: Demo* = new Demo;
   if (d == 0) { return 1; }
   memset((rawptr)d, 0, sizeof(Demo));
-  if (demo_reset(db) != MEO_OK) {
-    println("cannot create the database file");
+  d->retain_s = (float64)retain;
+  demo_remove(db_path);
+  var rc: int32 = meo_db_open(db_path,
+    MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_WAL, 0, &d->db);
+  if (rc != MEO_OK || demo_schema(d->db) != MEO_OK) {
+    println("cannot create the database ({rc})");
     demo_free(d);
     return 1;
   }
-  d->pager = meo_pager_open(str_from_cstr(db), 64, MEO_PAGER_CREATE);
   d->feed = meo_feed_new(4096);
-  d->sub = (uint8*)malloc(80);
-  d->term_sub = (uint8*)malloc(80);
-  d->lv = demo_live(640.0, 400.0);
-  d->term = demo_live(mp_ascii_chart_width(DEMO_TERM_COLS),
-    mp_ascii_chart_height(DEMO_TERM_ROWS));
-  if (d->pager == 0 || d->feed == 0 || d->sub == 0 || d->term_sub == 0 ||
-      d->lv == 0 || d->term == 0) {
+  d->c = demo_chart();
+  if (d->feed == 0 || d->c == 0 || meo_feed_attach(d->db->pager, d->feed) != MEO_OK) {
     println("setup failed");
     demo_free(d);
     return 1;
   }
-  if (meo_feed_attach(d->pager, d->feed) != MEO_OK) {
-    println("feed attach failed");
-    demo_free(d);
-    return 1;
-  }
   d->w = mp_meo_watch_new(d->feed);
-  if (d->w == 0 || mp_meo_watch_table(d->w, DEMO_TABLE, d->lv, &demo_reload,
-      (rawptr)d) != MP_OK) {
+  d->table_id = (uint32)mp_meo_table_id(d->db, "readings");
+  if (d->w == 0 ||
+      mp_meo_watch_xy(d->w, d->db, "readings", "t", "deg", "sensor", d->c) != MP_OK) {
     println("watch failed");
     demo_free(d);
     return 1;
   }
   d->t0_us = meo_clock_realtime_us();
-  var opts: MpRenderOpts* = new MpRenderOpts;
-  *opts = mp_render_opts(640.0, 400.0, mp_theme_light());
-  var tbuf: MpBuf* = mp_buf_new(8192);
-
+  var tbuf: MpBuf* = mp_buf_new(16384);
   var writer: int64 = CreateThread(0, 0, &demo_writer, (cstring)d, 0, 0);
-  if (writer == 0) {
+  if (writer == 0 || tbuf == 0) {
     println("writer thread failed");
     mp_buf_free(tbuf);
-    free(opts);
     demo_free(d);
     return 1;
   }
@@ -404,13 +306,14 @@ fn main(argc: int32, argv: cstring*) -> int32 {
     if (mp_meo_poll(d->w) < 0) { fail = 2; }
     tick = tick + 1;
     if (tick % ticks_per_s == 0) {
-      if (demo_write_svg(d, opts, svg) != MP_OK) { fail = 2; }
-      if (frames == 0 && demo_write_svg(d, opts, first_svg) != MP_OK) {
+      mp_meo_set_subtitle(d->w, d->table_id, d->c);
+      if (mp_chart_save_svg(d->c, 640.0, 400.0, svg) != MP_OK) { fail = 2; }
+      if (frames == 0 && mp_chart_save_svg(d->c, 640.0, 400.0, first_svg) != MP_OK) {
         fail = 2;
       }
       frames = frames + 1;
       if (!quiet) {
-        println("--- second {frames}: {d->rows} rows ---");
+        println("--- second {frames} ---");
         if (demo_print_term(d, tbuf) != MP_OK) { fail = 2; }
       }
     }
@@ -420,22 +323,24 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   thread_join_infinite(writer);
   thread_close(writer);
   if (mp_meo_poll(d->w) < 0) { fail = 2; }
-  if (demo_write_svg(d, opts, svg) != MP_OK) { fail = 2; }
+  mp_meo_set_subtitle(d->w, d->table_id, d->c);
+  if (mp_chart_save_svg(d->c, 640.0, 400.0, svg) != MP_OK) { fail = 2; }
   if (demo_print_term(d, tbuf) != MP_OK) { fail = 2; }
 
   var st: MpMeoTableStats;
-  mp_meo_table_stats(d->w, DEMO_TABLE, &st);
+  mp_meo_table_stats(d->w, d->table_id, &st);
   var ws: MpMeoWatchStats;
   mp_meo_watch_stats(d->w, &ws);
-  if (d->writer_err != 0 || d->scan_err != 0) { fail = 2; }
-  var pager_seq: uint64 = meo_pager_commit_seq(d->pager);
-  println("subtitle: {mp_live_spec(d->lv)->subtitle}");
-  print("commits={d->commits} pager_commit_seq={(int64)pager_seq} rows={d->rows} ");
-  print("reloads={st.reload_count} polls={ws.polls} events={ws.events} gaps={ws.gaps} ");
-  println("last_commit={(int64)st.last_commit_seq} live_seq={mp_live_seq(d->lv)} exit={fail}");
+  if (d->writer_err != 0 || st.meo_error != MEO_OK) { fail = 2; }
+  var rows: int64 = mp_chart_len(d->c, 0) + mp_chart_len(d->c, 1) + mp_chart_len(d->c, 2);
+  var pager_seq: uint64 = meo_pager_commit_seq(d->db->pager);
+  println("subtitle: {d->c->subtitle}");
+  print("commits={d->commits} purges={d->purges} pager_commit_seq={(int64)pager_seq} ");
+  print("samples={rows} fast={st.fast_count} reloads={st.reload_count} deletes={st.delete_count} ");
+  print("polls={ws.polls} events={ws.events} gaps={ws.gaps} ");
+  println("last_commit={(int64)st.last_commit_seq} seq={mp_chart_seq(d->c)} exit={fail}");
 
   mp_buf_free(tbuf);
-  free(opts);
   demo_free(d);
   return fail;
 }

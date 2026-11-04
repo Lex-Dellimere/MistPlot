@@ -1,7 +1,6 @@
 # Files not yet rewritten to the doc rules of tools/apidoc.sh: they are exempt
 # from its checks and from lint's callback-naming rule. Remove a file when it is
 # rewritten or deleted; the list must end up empty.
-integrations/meodb/mp_meo.mettle
 src/backends/terminal/ascii.mettle
 src/backends/web/live.mettle
 src/backends/web/page.mettle

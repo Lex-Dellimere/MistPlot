@@ -1,82 +1,76 @@
-// integrations/meodb/tests/meodb_test — mp_meo against a real MeoDB pager
-// file, feed and (for the probe) a second database file.
+// integrations/meodb/tests/meodb_test: mp_meo against real MeoDB databases (typed tables,
+// rollback and WAL mode), their change feeds and, for the probe, a second database file.
 //
 // A compiled program, not @test functions: every case needs files under
-// build/integrations/meodb/, a pager and (t9) a thread, none of which the
-// compile-time interpreter provides. Run from the mistplot repo root.
+// build/integrations/meodb/ and some need threads, which the compile-time interpreter
+// does not provide. Run from the mistplot repo root.
 //
-//   t1 commit     a committed txn of inserts reaches the right table's
-//                 reload_cb exactly once per poll (two commits before one poll
-//                 coalesce into one reload); stats: insert/change counts,
-//                 last_commit_seq == the pager's commit_seq, time >= the time
-//                 taken before the commit, reason CHANGES; a poll with nothing
-//                 new reloads nothing; the first poll after watching reloads
-//                 once with reason INITIAL. The MpLive seq advances after a
-//                 reload: by mp_live_touch when the callback did not push, by
-//                 the callback's own push (and only that) when it did.
-//   t2 rollback   a rolled-back txn triggers nothing and changes no stats.
-//   t3 two tables only the table that changed reloads.
-//   t4 change_cb  sees INSERT vs REPLACE (old_rowid) with the right keys and
-//                 rowids, in commit order, before the coalesced reload.
-//   t5 gap        a txn larger than a tiny feed ring publishes one GAP, which
-//                 reloads every watched table (reason GAP); a reader that fell
-//                 behind the ring gets a GAP too.
-//   t6 unwatched  events of unwatched (and unwatched-later) tables are
-//                 counted as ignored and reload nothing.
-//   t7 reload err a reload returning an error stays pending and is retried on
-//                 the next poll; last_error keeps the code.
-//   t8 probe      mp_meo_probe_check: 1 on first sight, 0 when unchanged, 0
-//                 ("not yet") while a journal exists, 1 after a commit through
-//                 a second pager on a second path, negative for a missing file.
-//   t9 threads    a writer thread commits N txns while this thread polls with
-//                 mp_meo_poll_locked: reload count >= 1, every insert counted,
-//                 final last_commit_seq == the pager's commit_seq.
-//   fmt           mp_meo_fmt_updated / mp_meo_fmt_subtitle text.
-//
-// Deterministic: the thread case asserts bounds and totals only.
+//   t1 commit      committed inserts reach the table's reload callback once per poll (two
+//                  commits before one poll coalesce); stats; INITIAL; the chart seq always
+//                  advances after a reload (touch, or the callback's own push only).
+//   t2 rollback    a rolled-back transaction changes nothing, on both kinds of watch.
+//   t3 two tables  only the table that changed reloads.
+//   t4 change_cb   INSERT / REPLACE (same and new rowid) / DELETE in commit order with row
+//                  values (INTEGER PRIMARY KEY read as NULL, value = rowid), before the
+//                  coalesced reload.
+//   t5 gap         a transaction bigger than the ring is one GAP that reloads every table,
+//                  stamped with the commit time; so is a reader that fell behind.
+//   t6 unwatched   events of unwatched tables are ignored.
+//   t7 reload err  a failed reload stays pending and is retried.
+//   t8 probe       first sight, unchanged, hot journal, commit seen, WAL file, missing
+//                  file; a second opener gets -MEO_ERR_BUSY while the probe still reads.
+//   t9 fast path   mapped table: inserts pushed with no reload, updates in place, DELETE,
+//                  out-of-order insert and GAP reload by range scan, NULL y is NaN,
+//                  rollback does nothing; values checked sample by sample.
+//   t10 groups     the group column picks the series; out-of-range groups are dropped.
+//   t11 wal        the fast path and the DELETE reload on a WAL database.
+//   t12 threads    a writer thread inserts, updates and deletes while this thread polls a
+//                  mapped table (rollback and WAL mode): the chart ends equal to the table,
+//                  every row exactly once.
+//   fmt            mp_meo_fmt_updated / mp_meo_fmt_subtitle / mp_meo_set_subtitle.
 
 import "std/io";
 import "std/mem";
 import "std/thread";
-import "meodb/src/error/status";
+import "meodb/src/meodb";
 import "meodb/src/platform/file";
 import "meodb/src/platform/file_linux";
 import "meodb/src/platform/clock_linux";
-import "meodb/src/pager/pager";
-import "meodb/src/types/key";
-import "meodb/src/btree/btree";
 import "meodb/src/feed/feed";
 import "mistplot/test/harness";
-import "mistplot/core/buf";
-import "mistplot/chart/spec";
-import "mistplot/live/stream";
+import "mistplot/core/error";
+import "mistplot/data/col";
+import "mistplot/chart/chart";
+import "mistplot/chart/samples";
+import "mistplot/chart/config";
+import "mistplot/sync/share";
 import "../mp_meo";
 
-const T_DB: string = "build/integrations/meodb/meodb_test.dat";
-const T_DB_GAP: string = "build/integrations/meodb/meodb_test_gap.dat";
-const T_DB_PROBE: string = "build/integrations/meodb/meodb_test_probe.dat";
-const T_DB_THR: string = "build/integrations/meodb/meodb_test_thr.dat";
-const T_A: uint32 = 7;
-const T_B: uint32 = 8;
-const T_C: uint32 = 9;
+const T_DB: string = "build/integrations/meodb/meodb_test.db";
+const T_DB_GAP: string = "build/integrations/meodb/meodb_test_gap.db";
+const T_DB_PROBE: string = "build/integrations/meodb/meodb_test_probe.db";
+const T_DB_PROBE_WAL: string = "build/integrations/meodb/meodb_test_probe_wal.db";
+const T_DB_WAL: string = "build/integrations/meodb/meodb_test_wal.db";
+const T_DB_THR: string = "build/integrations/meodb/meodb_test_thr.db";
 
 // What a callback saw. One per watched table.
 struct TRec {
   reloads: int32;
   last_table: uint32;
   rc: int32;            // what reload answers
-  push: bool;           // reload pushes one sample into lv
+  push: bool;           // reload pushes one sample into series 0
   changes: int32;
   kinds: int32[8];
-  keys: int64[8];
-  rowids: uint64[8];
-  olds: uint64[8];
-  order: int32;         // shared event counter snapshot at reload
+  rowids: int64[8];
+  olds: int64[8];
+  ids: int64[8];        // column 0 as read from val (-1 = NULL)
+  vals: float64[8];     // column 1 as read from val
+  order: int32;         // shared counter snapshot at the last reload
   clock: int32*;        // shared counter, bumped by every callback
   change_at_last: int32;
 }
 
-fn t_reload(ctx: rawptr, table_id: uint32, lv: MpLive*) -> int32 {
+fn t_reload(ctx: rawptr, table_id: uint32, c: MpChart*) -> int32 {
   var r: TRec* = (TRec*)ctx;
   r->reloads = r->reloads + 1;
   r->last_table = table_id;
@@ -84,31 +78,26 @@ fn t_reload(ctx: rawptr, table_id: uint32, lv: MpLive*) -> int32 {
     r->clock[0] = r->clock[0] + 1;
     r->order = r->clock[0];
   }
-  if (r->push && lv != 0) { mp_live_push(lv, 0, (float64)r->reloads, 1.0); }
+  if (r->push && c != 0) { mp_chart_push(c, 0, (float64)r->reloads, 1.0); }
   return r->rc;
 }
 
-// True when the change's key is the meo_key_int encoding of v.
-fn t_key_is(c: MeoChange*, v: int64) -> bool {
-  var kb: uint8[16];
-  var n: int32 = meo_key_int(&kb[0], 16, v);
-  if (c->key_len != n || c->key == 0) { return false; }
-  return meo_key_compare(c->key, c->key_len, &kb[0], n) == 0;
-}
-
-fn t_change(ctx: rawptr, lv: MpLive*, c: MeoChange*) -> int32 {
+fn t_change(ctx: rawptr, c: MpChart*, ev: MeoChange*) -> int32 {
   var r: TRec* = (TRec*)ctx;
-  if (c->kind == MEO_CHANGE_ROOT_MOVED) { return MP_OK; }
   if (r->changes < 8) {
     var i: int32 = r->changes;
-    r->kinds[i] = c->kind;
-    r->rowids[i] = c->rowid;
-    r->olds[i] = c->old_rowid;
-    r->keys[i] = -1;
-    var v: int64 = 0;
-    while (v < 64) {
-      if (t_key_is(c, v)) { r->keys[i] = v; }
-      v = v + 1;
+    r->kinds[i] = ev->kind;
+    r->rowids[i] = (int64)ev->rowid;
+    r->olds[i] = (int64)ev->old_rowid;
+    var v: MeoValue;
+    r->ids[i] = -2;
+    r->vals[i] = -1.0;
+    if (meo_rec_get(ev->val, ev->val_len, 0, &v) == MEO_OK) {
+      r->ids[i] = -1;
+      if (v.type == MEO_T_INT) { r->ids[i] = v.i; }
+    }
+    if (meo_rec_get(ev->val, ev->val_len, 1, &v) == MEO_OK && v.type == MEO_T_REAL) {
+      r->vals[i] = v.f;
     }
   }
   r->changes = r->changes + 1;
@@ -127,46 +116,156 @@ fn t_rec() -> TRec* {
 
 // --- db helpers ------------------------------------------------------------
 
-fn t_reset(db: string) -> int32 {
-  var f: MeoFile = meo_file_open(db,
-    MEO_OPEN_READ | MEO_OPEN_WRITE | MEO_OPEN_CREATE);
-  if (!f.is_open) { return -MEO_ERR_IO; }
-  var rc: int32 = meo_file_truncate(f, 0);
-  meo_file_close(f);
-  var j: string = db + "-journal";
+fn t_remove(path: string) {
+  meo_file_unlink(path);
+  var j: string = path + "-journal";
   meo_file_unlink(j);
   free(j.chars);
+  var wl: string = path + "-wal";
+  meo_file_unlink(wl);
+  free(wl.chars);
+}
+
+fn t_int(x: int64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_int(&v, x);
+  return v;
+}
+
+fn t_real(x: float64) -> MeoValue {
+  var v: MeoValue;
+  meo_value_set_real(&v, x);
+  return v;
+}
+
+// name(id INTEGER PRIMARY KEY, v REAL) or, grouped, name(id INTEGER PRIMARY KEY,
+// v REAL, g INTEGER).
+fn t_create(db: MeoDb*, name: string, grouped: bool) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_create(db, name, &q);
+  meo_q_column_def(q, "id", MEO_T_INT, MEO_COL_PK);
+  meo_q_column_def(q, "v", MEO_T_REAL, 0);
+  if (grouped) { meo_q_column_def(q, "g", MEO_T_INT, 0); }
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
   return rc;
 }
 
-fn t_open(db: string) -> MeoPager* {
-  if (t_reset(db) != MEO_OK) { return 0; }
-  return meo_pager_open(db, 16, MEO_PAGER_CREATE);
-}
-
-fn t_close(p: MeoPager*) {
-  meo_pager_close(p);
-  meo_pager_free(p);
-}
-
-fn t_ins(f: MeoFeed*, p: MeoPager*, table: uint32, root: uint32*, v: int64,
-    rowid: uint64) -> int32 {
-  var kb: uint8[16];
-  var n: int32 = meo_key_int(&kb[0], 16, v);
-  var k: MeoBtKey = { data: &kb[0], len: n };
-  return meo_feed_insert(f, p, table, root, &meo_key_compare, k, rowid);
-}
-
-// One committed transaction inserting keys [from, to) into one table.
-fn t_commit_range(f: MeoFeed*, p: MeoPager*, table: uint32, root: uint32*,
-    from: int64, to: int64) -> int32 {
-  if (meo_pager_begin(p) != MEO_OK) { return -1; }
-  var v: int64 = from;
-  while (v < to) {
-    if (t_ins(f, p, table, root, v, (uint64)(v * 10)) != MEO_OK) { return -2; }
-    v = v + 1;
+// A fresh database with tables "a", "b" (id, v) and "c" (id, v, g), and a feed of cap
+// events attached.
+fn t_open(path: string, wal: bool, cap: int32, f: MeoFeed**) -> MeoDb* {
+  t_remove(path);
+  var mode: int32 = MEO_OPEN_NO_WAL;
+  if (wal) { mode = MEO_OPEN_WAL; }
+  var db: MeoDb* = 0;
+  if (meo_db_open(path, MEO_OPEN_CREATE | MEO_OPEN_READ | MEO_OPEN_WRITE | mode, 0, &db)
+      != MEO_OK) {
+    return 0;
   }
-  return meo_pager_commit(p);
+  t_create(db, "a", false);
+  t_create(db, "b", false);
+  t_create(db, "c", true);
+  f[0] = meo_feed_new(cap);
+  if (meo_feed_attach(db->pager, f[0]) != MEO_OK) {
+    meo_feed_free(f[0]);
+    meo_db_close(db);
+    return 0;
+  }
+  return db;
+}
+
+fn t_close(db: MeoDb*, f: MeoFeed*) {
+  meo_db_close(db);
+  meo_feed_free(f);
+}
+
+fn t_ins(db: MeoDb*, table: string, id: int64, v: float64) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_insert(db, table, &q);
+  var a: MeoValue = t_int(id);
+  var b: MeoValue = t_real(v);
+  meo_q_value(q, &a);
+  meo_q_value(q, &b);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn t_ins_null(db: MeoDb*, table: string, id: int64) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_insert(db, table, &q);
+  var a: MeoValue = t_int(id);
+  var b: MeoValue;
+  meo_value_set_null(&b);
+  meo_q_value(q, &a);
+  meo_q_value(q, &b);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn t_ins_g(db: MeoDb*, id: int64, v: float64, g: int64) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_insert(db, "c", &q);
+  var a: MeoValue = t_int(id);
+  var b: MeoValue = t_real(v);
+  var gv: MeoValue = t_int(g);
+  meo_q_value(q, &a);
+  meo_q_value(q, &b);
+  meo_q_value(q, &gv);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+// UPDATE table SET v = v [, id = nid when nid >= 0] WHERE id = id.
+fn t_upd(db: MeoDb*, table: string, id: int64, nid: int64, v: float64) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_update(db, table, &q);
+  var s: MeoValue = t_real(v);
+  var w: MeoValue = t_int(id);
+  var n: MeoValue = t_int(nid);
+  if (nid >= 0) { meo_q_assign(q, "id", &n); }
+  meo_q_assign(q, "v", &s);
+  meo_q_where(q, "id", MEO_Q_EQ, &w);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+fn t_del(db: MeoDb*, table: string, id: int64) -> int32 {
+  var q: MeoQuery* = 0;
+  meo_q_delete(db, table, &q);
+  var w: MeoValue = t_int(id);
+  meo_q_where(q, "id", MEO_Q_EQ, &w);
+  var rc: int32 = meo_q_step(q);
+  meo_q_free(q);
+  if (rc == MEO_DONE) { return MEO_OK; }
+  return rc;
+}
+
+// One committed transaction inserting ids [from, to) into table, v = id * 1.5.
+fn t_commit_range(db: MeoDb*, table: string, from: int64, to: int64) -> int32 {
+  if (meo_db_begin(db, MEO_TX_DEFAULT) != MEO_OK) { return -100; }
+  var id: int64 = from;
+  while (id < to) {
+    var rc: int32 = t_ins(db, table, id, (float64)id * 1.5);
+    if (rc != MEO_OK) {
+      meo_db_rollback(db);
+      return rc;
+    }
+    id = id + 1;
+  }
+  return meo_db_commit(db);
+}
+
+fn t_id(db: MeoDb*, name: string) -> uint32 {
+  return (uint32)mp_meo_table_id(db, name);
 }
 
 fn t_stats(w: MpMeoWatch*, table: uint32) -> MpMeoTableStats {
@@ -175,355 +274,631 @@ fn t_stats(w: MpMeoWatch*, table: uint32) -> MpMeoTableStats {
   return st;
 }
 
+fn t_line(names: int32) -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var i: int32 = 0;
+  while (i < names) {
+    mp_chart_series(c, "s");
+    i = i + 1;
+  }
+  return c;
+}
+
+fn t_len(c: MpChart*, s: int32) -> int64 {
+  return mp_chart_len(c, s);
+}
+
+fn t_x(c: MpChart*, s: int32, i: int64) -> float64 {
+  return mp_col_x(&c->series[(int64)s].col, i);
+}
+
+fn t_y(c: MpChart*, s: int32, i: int64) -> float64 {
+  return mp_col_y(&c->series[(int64)s].col, i);
+}
+
+// True when series s holds exactly n samples, sample i = (xs[i], ys[i]); NaN matches NaN.
+fn t_series_is(c: MpChart*, s: int32, xs: float64*, ys: float64*, n: int64) -> bool {
+  if (t_len(c, s) != n) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    var y: float64 = t_y(c, s, i);
+    var yok: bool = y == ys[i] || (y != y && ys[i] != ys[i]);
+    if (t_x(c, s, i) != xs[i] || !yok) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
 // --- cases -----------------------------------------------------------------
 
 fn t1_commit() {
-  var p: MeoPager* = t_open(T_DB);
-  mp_expect("t1 open", p != 0);
-  if (p == 0) { return; }
-  var f: MeoFeed* = meo_feed_new(1024);
-  mp_expect_i64("t1 attach", meo_feed_attach(p, f), MEO_OK);
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB, false, 1024, &f);
+  mp_expect("t1 open", db != 0);
+  if (db == 0) { return; }
+  var ta: uint32 = t_id(db, "a");
+  mp_expect("t1 table id", ta >= 1);
+  mp_expect_i64("t1 unknown table id", mp_meo_table_id(db, "nope"), -1);
   var w: MpMeoWatch* = mp_meo_watch_new(f);
   mp_expect("t1 watch", w != 0);
-  var lv: MpLive* = mp_live_new(MP_CHART_LINE, 1, 64);
+  var c: MpChart* = t_line(1);
   var r: TRec* = t_rec();
-  mp_expect_i64("t1 watch table", mp_meo_watch_table(w, T_A, lv, &t_reload,
-    (rawptr)r), MP_OK);
-  mp_expect_i64("t1 watch twice", mp_meo_watch_table(w, T_A, lv, &t_reload,
-    (rawptr)r), MP_ERR_STATE);
+  mp_expect_i64("t1 watch table", mp_meo_watch_table(w, ta, c, &t_reload, (rawptr)r), MP_OK);
+  mp_expect_i64("t1 watch twice", mp_meo_watch_table(w, ta, c, &t_reload, (rawptr)r),
+    MP_ERR_STATE);
 
-  // First poll: the INITIAL load, once.
-  var seq0: int64 = mp_live_seq(lv);
+  var seq0: int64 = mp_chart_seq(c);
   mp_expect_i64("t1 initial poll", mp_meo_poll(w), 1);
   mp_expect_i64("t1 initial reloads", r->reloads, 1);
-  mp_expect_i64("t1 initial reason", t_stats(w, T_A).last_reason,
-    MP_MEO_REASON_INITIAL);
-  mp_expect_i64("t1 touch after reload", mp_live_seq(lv), seq0 + 1);
+  mp_expect_i64("t1 initial reason", t_stats(w, ta).last_reason, MP_MEO_REASON_INITIAL);
+  mp_expect_i64("t1 touch after reload", mp_chart_seq(c), seq0 + 1);
   mp_expect_i64("t1 idle poll", mp_meo_poll(w), 0);
   mp_expect_i64("t1 idle reloads", r->reloads, 1);
 
-  var root: uint32 = 0;
   var t0: int64 = meo_clock_realtime_us();
-  mp_expect_i64("t1 commit", t_commit_range(f, p, T_A, &root, 0, 3), MEO_OK);
-  var seq1: int64 = mp_live_seq(lv);
+  mp_expect_i64("t1 commit", t_commit_range(db, "a", 1, 4), MEO_OK);
+  var seq1: int64 = mp_chart_seq(c);
   mp_expect_i64("t1 poll after commit", mp_meo_poll(w), 1);
   mp_expect_i64("t1 reloads after commit", r->reloads, 2);
-  mp_expect_i64("t1 reload table id", (int64)r->last_table, (int64)T_A);
-  mp_expect("t1 live seq advanced", mp_live_seq(lv) > seq1);
-  var st: MpMeoTableStats = t_stats(w, T_A);
+  mp_expect_i64("t1 reload table id", (int64)r->last_table, (int64)ta);
+  mp_expect("t1 chart seq advanced", mp_chart_seq(c) > seq1);
+  var st: MpMeoTableStats = t_stats(w, ta);
   mp_expect_i64("t1 inserts", st.insert_count, 3);
-  // The tree's first insert also moves the root (0 -> page): one ROOT_MOVED.
-  mp_expect_i64("t1 changes", st.change_count, 4);
+  mp_expect_i64("t1 changes", st.change_count, 3);
   mp_expect_i64("t1 replaces", st.replace_count, 0);
   mp_expect_i64("t1 commit seq", (int64)st.last_commit_seq,
-    (int64)meo_pager_commit_seq(p));
+    (int64)meo_pager_commit_seq(db->pager));
   mp_expect("t1 time >= start", st.last_change_time_us >= t0);
   mp_expect_i64("t1 reason", st.last_reason, MP_MEO_REASON_CHANGES);
   mp_expect_i64("t1 reload_count", st.reload_count, 2);
   var ws: MpMeoWatchStats;
   mp_meo_watch_stats(w, &ws);
   mp_expect_i64("t1 watch last commit", (int64)ws.last_commit_seq,
-    (int64)meo_pager_commit_seq(p));
+    (int64)meo_pager_commit_seq(db->pager));
   mp_expect_i64("t1 watch time", ws.last_time_us, st.last_change_time_us);
+  mp_expect_i64("t1 feed last time", meo_feed_last_time(f), st.last_change_time_us);
   mp_expect_i64("t1 polls", ws.polls, 3);
   mp_expect_i64("t1 again idle", mp_meo_poll(w), 0);
-  mp_expect_i64("t1 again reloads", r->reloads, 2);
 
-  // Two commits, one poll: one reload, all six inserts counted.
-  mp_expect_i64("t1 commit 2", t_commit_range(f, p, T_A, &root, 3, 5), MEO_OK);
-  mp_expect_i64("t1 commit 3", t_commit_range(f, p, T_A, &root, 5, 9), MEO_OK);
+  mp_expect_i64("t1 commit 2", t_commit_range(db, "a", 4, 6), MEO_OK);
+  mp_expect_i64("t1 commit 3", t_commit_range(db, "a", 6, 10), MEO_OK);
   mp_expect_i64("t1 coalesced poll", mp_meo_poll(w), 1);
   mp_expect_i64("t1 coalesced reloads", r->reloads, 3);
-  st = t_stats(w, T_A);
+  st = t_stats(w, ta);
   mp_expect_i64("t1 coalesced inserts", st.insert_count, 9);
   mp_expect_i64("t1 coalesced commit seq", (int64)st.last_commit_seq,
-    (int64)meo_pager_commit_seq(p));
+    (int64)meo_pager_commit_seq(db->pager));
 
-  // A reload that pushes moves the seq by its own push only (no extra touch).
   r->push = true;
-  mp_expect_i64("t1 commit 4", t_commit_range(f, p, T_A, &root, 9, 10), MEO_OK);
-  var seq2: int64 = mp_live_seq(lv);
+  mp_expect_i64("t1 commit 4", t_commit_range(db, "a", 10, 11), MEO_OK);
+  var seq2: int64 = mp_chart_seq(c);
   mp_expect_i64("t1 push poll", mp_meo_poll(w), 1);
-  mp_expect_i64("t1 push seq +1", mp_live_seq(lv), seq2 + 1);
+  mp_expect_i64("t1 push seq +1", mp_chart_seq(c), seq2 + 1);
 
   mp_meo_watch_free(w);
-  meo_feed_free(f);
-  t_close(p);
-  mp_live_free(lv);
+  t_close(db, f);
+  mp_chart_free(c);
   free(r);
 }
 
 fn t2_rollback() {
-  var p: MeoPager* = t_open(T_DB);
-  var f: MeoFeed* = meo_feed_new(1024);
-  meo_feed_attach(p, f);
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB, false, 1024, &f);
+  if (db == 0) { return; }
+  var ta: uint32 = t_id(db, "a");
+  var tb: uint32 = t_id(db, "b");
   var w: MpMeoWatch* = mp_meo_watch_new(f);
   var r: TRec* = t_rec();
-  mp_meo_watch_table(w, T_A, 0, &t_reload, (rawptr)r);
+  var c: MpChart* = t_line(1);
+  mp_meo_watch_table(w, ta, 0, &t_reload, (rawptr)r);
+  mp_expect_i64("t2 watch xy", mp_meo_watch_xy(w, db, "b", "id", "v", "", c), MP_OK);
   mp_meo_poll(w);
-  var root: uint32 = 0;
-  mp_expect_i64("t2 commit", t_commit_range(f, p, T_A, &root, 0, 2), MEO_OK);
+  mp_expect_i64("t2 commit", t_commit_range(db, "a", 1, 3), MEO_OK);
+  mp_expect_i64("t2 commit b", t_commit_range(db, "b", 1, 3), MEO_OK);
   mp_meo_poll(w);
-  var before: MpMeoTableStats = t_stats(w, T_A);
+  var before: MpMeoTableStats = t_stats(w, ta);
   var reloads: int32 = r->reloads;
-  meo_pager_begin(p);
-  t_ins(f, p, T_A, &root, 40, 400);
-  t_ins(f, p, T_A, &root, 41, 410);
-  mp_expect_i64("t2 rollback", meo_pager_rollback(p), MEO_OK);
+  var seq: int64 = mp_chart_seq(c);
+  var blen: int64 = t_len(c, 0);
+  meo_db_begin(db, MEO_TX_DEFAULT);
+  t_ins(db, "a", 40, 4.0);
+  t_ins(db, "a", 41, 4.1);
+  t_ins(db, "b", 40, 4.0);
+  t_del(db, "b", 1);
+  mp_expect_i64("t2 rollback", meo_db_rollback(db), MEO_OK);
   mp_expect_i64("t2 poll after rollback", mp_meo_poll(w), 0);
   mp_expect_i64("t2 no reload", r->reloads, reloads);
-  var after: MpMeoTableStats = t_stats(w, T_A);
+  var after: MpMeoTableStats = t_stats(w, ta);
   mp_expect_i64("t2 inserts unchanged", after.insert_count, before.insert_count);
   mp_expect_i64("t2 commit unchanged", (int64)after.last_commit_seq,
     (int64)before.last_commit_seq);
+  mp_expect_i64("t2 mapped chart untouched", mp_chart_seq(c), seq);
+  mp_expect_i64("t2 mapped len", t_len(c, 0), blen);
+  mp_expect_i64("t2 mapped no reload", t_stats(w, tb).reload_count, 1);
   var ws: MpMeoWatchStats;
   mp_meo_watch_stats(w, &ws);
   mp_expect_i64("t2 no gap", ws.gaps, 0);
   mp_meo_watch_free(w);
-  meo_feed_free(f);
-  t_close(p);
+  t_close(db, f);
+  mp_chart_free(c);
   free(r);
 }
 
 fn t3_two_tables() {
-  var p: MeoPager* = t_open(T_DB);
-  var f: MeoFeed* = meo_feed_new(1024);
-  meo_feed_attach(p, f);
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB, false, 1024, &f);
+  if (db == 0) { return; }
+  var ta: uint32 = t_id(db, "a");
+  var tb: uint32 = t_id(db, "b");
+  mp_expect("t3 distinct ids", ta != tb);
   var w: MpMeoWatch* = mp_meo_watch_new(f);
-  var lva: MpLive* = mp_live_new(MP_CHART_LINE, 1, 64);
-  var lvb: MpLive* = mp_live_new(MP_CHART_LINE, 1, 64);
+  var ca: MpChart* = t_line(1);
+  var cb: MpChart* = t_line(1);
   var ra: TRec* = t_rec();
   var rb: TRec* = t_rec();
-  mp_meo_watch_table(w, T_A, lva, &t_reload, (rawptr)ra);
-  mp_meo_watch_table(w, T_B, lvb, &t_reload, (rawptr)rb);
+  mp_meo_watch_table(w, ta, ca, &t_reload, (rawptr)ra);
+  mp_meo_watch_table(w, tb, cb, &t_reload, (rawptr)rb);
   mp_expect_i64("t3 initial both", mp_meo_poll(w), 2);
-  var sa: int64 = mp_live_seq(lva);
-  var root_b: uint32 = 0;
-  mp_expect_i64("t3 commit B", t_commit_range(f, p, T_B, &root_b, 0, 4), MEO_OK);
+  var sa: int64 = mp_chart_seq(ca);
+  mp_expect_i64("t3 commit B", t_commit_range(db, "b", 1, 5), MEO_OK);
   mp_expect_i64("t3 one table reloaded", mp_meo_poll(w), 1);
   mp_expect_i64("t3 A not reloaded", ra->reloads, 1);
   mp_expect_i64("t3 B reloaded", rb->reloads, 2);
-  mp_expect_i64("t3 B table id", (int64)rb->last_table, (int64)T_B);
-  mp_expect_i64("t3 A seq unchanged", mp_live_seq(lva), sa);
-  mp_expect_i64("t3 A no inserts", t_stats(w, T_A).insert_count, 0);
-  mp_expect_i64("t3 B inserts", t_stats(w, T_B).insert_count, 4);
-  mp_expect_i64("t3 A commit seq 0", (int64)t_stats(w, T_A).last_commit_seq, 0);
+  mp_expect_i64("t3 B table id", (int64)rb->last_table, (int64)tb);
+  mp_expect_i64("t3 A seq unchanged", mp_chart_seq(ca), sa);
+  mp_expect_i64("t3 A no inserts", t_stats(w, ta).insert_count, 0);
+  mp_expect_i64("t3 B inserts", t_stats(w, tb).insert_count, 4);
+  mp_expect_i64("t3 A commit seq 0", (int64)t_stats(w, ta).last_commit_seq, 0);
   mp_meo_watch_free(w);
-  meo_feed_free(f);
-  t_close(p);
-  mp_live_free(lva);
-  mp_live_free(lvb);
+  t_close(db, f);
+  mp_chart_free(ca);
+  mp_chart_free(cb);
   free(ra);
   free(rb);
 }
 
 fn t4_change_cb() {
-  var p: MeoPager* = t_open(T_DB);
-  var f: MeoFeed* = meo_feed_new(1024);
-  meo_feed_attach(p, f);
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB, false, 1024, &f);
+  if (db == 0) { return; }
+  var ta: uint32 = t_id(db, "a");
+  var tb: uint32 = t_id(db, "b");
   var w: MpMeoWatch* = mp_meo_watch_new(f);
   var clock: int32* = (int32*)malloc(4);
   clock[0] = 0;
   var r: TRec* = t_rec();
   r->clock = clock;
-  mp_meo_watch_table(w, T_A, 0, &t_reload, (rawptr)r);
-  mp_expect_i64("t4 changes on unwatched", mp_meo_watch_changes(w, T_B,
-    &t_change), MP_ERR_ARG);
-  mp_expect_i64("t4 changes", mp_meo_watch_changes(w, T_A, &t_change), MP_OK);
+  mp_meo_watch_table(w, ta, 0, &t_reload, (rawptr)r);
+  mp_expect_i64("t4 changes on unwatched", mp_meo_watch_changes(w, tb, &t_change),
+    MP_ERR_ARG);
+  mp_expect_i64("t4 changes", mp_meo_watch_changes(w, ta, &t_change), MP_OK);
   mp_meo_poll(w);
-  var root: uint32 = 0;
-  meo_pager_begin(p);
-  t_ins(f, p, T_A, &root, 10, 100);
-  t_ins(f, p, T_A, &root, 11, 110);
-  meo_pager_commit(p);
-  meo_pager_begin(p);
-  t_ins(f, p, T_A, &root, 10, 105);    // existing key: REPLACE
-  meo_pager_commit(p);
+  meo_db_begin(db, MEO_TX_DEFAULT);
+  t_ins(db, "a", 10, 1.0);
+  t_ins(db, "a", 11, 1.1);
+  meo_db_commit(db);
+  mp_expect_i64("t4 update", t_upd(db, "a", 10, -1, 2.5), MEO_OK);
+  mp_expect_i64("t4 update id", t_upd(db, "a", 11, 20, 3.5), MEO_OK);
+  mp_expect_i64("t4 delete", t_del(db, "a", 10), MEO_OK);
   mp_expect_i64("t4 poll", mp_meo_poll(w), 1);
-  mp_expect_i64("t4 change count", r->changes, 3);
+  mp_expect_i64("t4 change count", r->changes, 5);
   mp_expect_i64("t4 kind 0", r->kinds[0], MEO_CHANGE_INSERT);
-  mp_expect_i64("t4 key 0", r->keys[0], 10);
-  mp_expect_i64("t4 rowid 0", (int64)r->rowids[0], 100);
-  mp_expect_i64("t4 old 0", (int64)r->olds[0], 0);
+  mp_expect_i64("t4 rowid 0", r->rowids[0], 10);
+  mp_expect_i64("t4 pk stored null", r->ids[0], -1);
+  mp_expect_near("t4 val 0", r->vals[0], 1.0, 0.0);
   mp_expect_i64("t4 kind 1", r->kinds[1], MEO_CHANGE_INSERT);
-  mp_expect_i64("t4 key 1", r->keys[1], 11);
+  mp_expect_i64("t4 rowid 1", r->rowids[1], 11);
   mp_expect_i64("t4 kind 2", r->kinds[2], MEO_CHANGE_REPLACE);
-  mp_expect_i64("t4 key 2", r->keys[2], 10);
-  mp_expect_i64("t4 rowid 2", (int64)r->rowids[2], 105);
-  mp_expect_i64("t4 old 2", (int64)r->olds[2], 100);
+  mp_expect_i64("t4 rowid 2", r->rowids[2], 10);
+  mp_expect_i64("t4 old 2", r->olds[2], 10);
+  mp_expect_near("t4 val 2", r->vals[2], 2.5, 0.0);
+  mp_expect_i64("t4 kind 3", r->kinds[3], MEO_CHANGE_REPLACE);
+  mp_expect_i64("t4 rowid 3", r->rowids[3], 20);
+  mp_expect_i64("t4 old 3", r->olds[3], 11);
+  mp_expect_near("t4 val 3", r->vals[3], 3.5, 0.0);
+  mp_expect_i64("t4 kind 4", r->kinds[4], MEO_CHANGE_DELETE);
+  mp_expect_i64("t4 rowid 4", r->rowids[4], 10);
+  mp_expect_near("t4 deleted row val", r->vals[4], 2.5, 0.0);
   mp_expect("t4 changes before reload", r->change_at_last < r->order);
   mp_expect_i64("t4 reloads", r->reloads, 2);
-  var st: MpMeoTableStats = t_stats(w, T_A);
+  var st: MpMeoTableStats = t_stats(w, ta);
   mp_expect_i64("t4 inserts", st.insert_count, 2);
-  mp_expect_i64("t4 replaces", st.replace_count, 1);
+  mp_expect_i64("t4 replaces", st.replace_count, 2);
+  mp_expect_i64("t4 deletes", st.delete_count, 1);
+  mp_expect_i64("t4 change_count", st.change_count, 5);
   mp_meo_watch_free(w);
-  meo_feed_free(f);
-  t_close(p);
+  t_close(db, f);
   free(r);
   free(clock);
 }
 
 fn t5_gap() {
-  var p: MeoPager* = t_open(T_DB_GAP);
-  var f: MeoFeed* = meo_feed_new(2);
-  meo_feed_attach(p, f);
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB_GAP, false, 2, &f);
+  if (db == 0) { return; }
+  var ta: uint32 = t_id(db, "a");
+  var tb: uint32 = t_id(db, "b");
   var w: MpMeoWatch* = mp_meo_watch_new(f);
   var ra: TRec* = t_rec();
   var rb: TRec* = t_rec();
-  mp_meo_watch_table(w, T_A, 0, &t_reload, (rawptr)ra);
-  mp_meo_watch_table(w, T_B, 0, &t_reload, (rawptr)rb);
+  mp_meo_watch_table(w, ta, 0, &t_reload, (rawptr)ra);
+  mp_meo_watch_table(w, tb, 0, &t_reload, (rawptr)rb);
   mp_meo_poll(w);
-  // Five inserts in one txn > ring cap 2: published as ONE GAP.
-  var root: uint32 = 0;
-  mp_expect_i64("t5 big commit", t_commit_range(f, p, T_A, &root, 0, 5), MEO_OK);
+  var t0: int64 = meo_clock_realtime_us();
+  mp_expect_i64("t5 big commit", t_commit_range(db, "a", 1, 6), MEO_OK);
   mp_expect_i64("t5 gap reloads all", mp_meo_poll(w), 2);
   mp_expect_i64("t5 A reloaded", ra->reloads, 2);
   mp_expect_i64("t5 B reloaded", rb->reloads, 2);
-  var sb: MpMeoTableStats = t_stats(w, T_B);
+  var sb: MpMeoTableStats = t_stats(w, tb);
   mp_expect_i64("t5 B reason gap", sb.last_reason, MP_MEO_REASON_GAP);
   mp_expect_i64("t5 B gap count", sb.gap_count, 1);
   mp_expect_i64("t5 B commit seq from gap", (int64)sb.last_commit_seq,
-    (int64)meo_pager_commit_seq(p));
-  mp_expect("t5 B time from gap", sb.last_change_time_us > 0);
-  mp_expect_i64("t5 A no inserts (gap carries none)",
-    t_stats(w, T_A).insert_count, 0);
-  // Reader behind the ring: three single-insert commits overflow cap 2.
-  t_commit_range(f, p, T_A, &root, 10, 11);
-  t_commit_range(f, p, T_A, &root, 11, 12);
-  t_commit_range(f, p, T_A, &root, 12, 13);
+    (int64)meo_pager_commit_seq(db->pager));
+  mp_expect("t5 gap carries the commit time", sb.last_change_time_us >= t0);
+  mp_expect_i64("t5 A no inserts (gap carries none)", t_stats(w, ta).insert_count, 0);
+  t_commit_range(db, "a", 10, 11);
+  t_commit_range(db, "a", 11, 12);
+  t_commit_range(db, "a", 12, 13);
+  var t1: int64 = meo_feed_last_time(f);
   mp_expect_i64("t5 behind reloads all", mp_meo_poll(w), 2);
   mp_expect_i64("t5 B reloaded again", rb->reloads, 3);
-  mp_expect_i64("t5 B reason gap again", t_stats(w, T_B).last_reason,
-    MP_MEO_REASON_GAP);
+  sb = t_stats(w, tb);
+  mp_expect_i64("t5 B reason gap again", sb.last_reason, MP_MEO_REASON_GAP);
+  mp_expect_i64("t5 behind gap time = newest commit", sb.last_change_time_us, t1);
   var ws: MpMeoWatchStats;
   mp_meo_watch_stats(w, &ws);
   mp_expect_i64("t5 two gaps", ws.gaps, 2);
   mp_expect_i64("t5 watch commit seq", (int64)ws.last_commit_seq,
-    (int64)meo_pager_commit_seq(p));
+    (int64)meo_pager_commit_seq(db->pager));
   mp_meo_watch_free(w);
-  meo_feed_free(f);
-  t_close(p);
+  t_close(db, f);
   free(ra);
   free(rb);
 }
 
 fn t6_unwatched() {
-  var p: MeoPager* = t_open(T_DB);
-  var f: MeoFeed* = meo_feed_new(1024);
-  meo_feed_attach(p, f);
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB, false, 1024, &f);
+  if (db == 0) { return; }
+  var ta: uint32 = t_id(db, "a");
+  var tb: uint32 = t_id(db, "b");
   var w: MpMeoWatch* = mp_meo_watch_new(f);
   var ra: TRec* = t_rec();
   var rb: TRec* = t_rec();
-  mp_meo_watch_table(w, T_A, 0, &t_reload, (rawptr)ra);
-  mp_meo_watch_table(w, T_B, 0, &t_reload, (rawptr)rb);
+  mp_meo_watch_table(w, ta, 0, &t_reload, (rawptr)ra);
+  mp_meo_watch_table(w, tb, 0, &t_reload, (rawptr)rb);
   mp_meo_poll(w);
-  var root_c: uint32 = 0;
-  mp_expect_i64("t6 commit C", t_commit_range(f, p, T_C, &root_c, 0, 3), MEO_OK);
+  mp_expect_i64("t6 commit C", t_ins_g(db, 1, 1.0, 0), MEO_OK);
+  t_ins_g(db, 2, 2.0, 0);
+  t_ins_g(db, 3, 3.0, 0);
   mp_expect_i64("t6 C reloads nothing", mp_meo_poll(w), 0);
   var ws: MpMeoWatchStats;
   mp_meo_watch_stats(w, &ws);
-  mp_expect_i64("t6 ignored", ws.ignored, 4);   // 3 inserts + 1 ROOT_MOVED
+  mp_expect_i64("t6 ignored", ws.ignored, 3);
   mp_expect_i64("t6 watch commit seq moves", (int64)ws.last_commit_seq,
-    (int64)meo_pager_commit_seq(p));
-  mp_expect_i64("t6 unwatch", mp_meo_watch_unwatch(w, T_B), MP_OK);
-  mp_expect_i64("t6 unwatch twice", mp_meo_watch_unwatch(w, T_B), MP_ERR_ARG);
+    (int64)meo_pager_commit_seq(db->pager));
+  mp_expect_i64("t6 unwatch", mp_meo_watch_unwatch(w, tb), MP_OK);
+  mp_expect_i64("t6 unwatch twice", mp_meo_watch_unwatch(w, tb), MP_ERR_ARG);
   var tmp: MpMeoTableStats;
-  mp_expect_i64("t6 stats of unwatched", mp_meo_table_stats(w, T_B, &tmp),
-    MP_ERR_ARG);
-  var root_b: uint32 = 0;
-  t_commit_range(f, p, T_B, &root_b, 0, 2);
+  mp_expect_i64("t6 stats of unwatched", mp_meo_table_stats(w, tb, &tmp), MP_ERR_ARG);
+  t_commit_range(db, "b", 1, 3);
   mp_expect_i64("t6 B now ignored", mp_meo_poll(w), 0);
   mp_expect_i64("t6 B no reload", rb->reloads, 1);
   mp_expect_i64("t6 A no reload", ra->reloads, 1);
   mp_meo_watch_stats(w, &ws);
-  mp_expect_i64("t6 ignored more", ws.ignored, 7);
+  mp_expect_i64("t6 ignored more", ws.ignored, 5);
   mp_meo_watch_free(w);
-  meo_feed_free(f);
-  t_close(p);
+  t_close(db, f);
   free(ra);
   free(rb);
 }
 
 fn t7_reload_error() {
-  var p: MeoPager* = t_open(T_DB);
-  var f: MeoFeed* = meo_feed_new(1024);
-  meo_feed_attach(p, f);
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB, false, 1024, &f);
+  if (db == 0) { return; }
+  var ta: uint32 = t_id(db, "a");
   var w: MpMeoWatch* = mp_meo_watch_new(f);
-  var lv: MpLive* = mp_live_new(MP_CHART_LINE, 1, 64);
+  var c: MpChart* = t_line(1);
   var r: TRec* = t_rec();
-  mp_meo_watch_table(w, T_A, lv, &t_reload, (rawptr)r);
+  mp_meo_watch_table(w, ta, c, &t_reload, (rawptr)r);
   mp_meo_poll(w);
-  var root: uint32 = 0;
-  t_commit_range(f, p, T_A, &root, 0, 2);
+  t_commit_range(db, "a", 1, 3);
   r->rc = MP_ERR_IO;
-  var s0: int64 = mp_live_seq(lv);
+  var s0: int64 = mp_chart_seq(c);
   mp_expect_i64("t7 failed reload counts 0", mp_meo_poll(w), 0);
   mp_expect_i64("t7 called", r->reloads, 2);
-  mp_expect_i64("t7 no touch on failure", mp_live_seq(lv), s0);
-  mp_expect_i64("t7 last_error", t_stats(w, T_A).last_error, MP_ERR_IO);
+  mp_expect_i64("t7 no touch on failure", mp_chart_seq(c), s0);
+  mp_expect_i64("t7 last_error", t_stats(w, ta).last_error, MP_ERR_IO);
   r->rc = MP_OK;
   mp_expect_i64("t7 retried", mp_meo_poll(w), 1);
   mp_expect_i64("t7 called again", r->reloads, 3);
-  mp_expect_i64("t7 reload_count", t_stats(w, T_A).reload_count, 2);
+  mp_expect_i64("t7 reload_count", t_stats(w, ta).reload_count, 2);
   mp_expect_i64("t7 then idle", mp_meo_poll(w), 0);
   mp_meo_watch_free(w);
-  meo_feed_free(f);
-  t_close(p);
-  mp_live_free(lv);
+  t_close(db, f);
+  mp_chart_free(c);
   free(r);
 }
 
 fn t8_probe() {
-  var missing: MpMeoProbe* = mp_meo_probe_new("build/integrations/meodb/no_such.dat");
+  var missing: MpMeoProbe* = mp_meo_probe_new("build/integrations/meodb/no_such.db");
   mp_expect("t8 missing file is an error", mp_meo_probe_check(missing) < 0);
   mp_meo_probe_free(missing);
+  mp_expect("t8 empty path", mp_meo_probe_new("") == 0);
 
-  var p: MeoPager* = t_open(T_DB_PROBE);   // a second pager, a second path
-  mp_expect("t8 open", p != 0);
-  if (p == 0) { return; }
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB_PROBE, false, 64, &f);
+  mp_expect("t8 open", db != 0);
+  if (db == 0) { return; }
+  var other: MeoDb* = 0;
+  mp_expect_i64("t8 second opener busy",
+    meo_db_open(T_DB_PROBE, MEO_OPEN_READ | MEO_OPEN_WRITE, 0, &other), -MEO_ERR_BUSY);
   var pr: MpMeoProbe* = mp_meo_probe_new(T_DB_PROBE);
   mp_expect_i64("t8 first sight", mp_meo_probe_check(pr), 1);
   mp_expect_i64("t8 unchanged", mp_meo_probe_check(pr), 0);
   mp_expect_i64("t8 still unchanged", mp_meo_probe_check(pr), 0);
-  var root: uint32 = 0;
-  var kb: uint8[16];
-  meo_pager_begin(p);
-  var n: int32 = meo_key_int(&kb[0], 16, 5);
-  var k: MeoBtKey = { data: &kb[0], len: n };
-  meo_bt_insert(p, &root, &meo_key_compare, k, 50);
-  meo_pager_set_root(p, MEO_ROOT_BTREE, root);
-  mp_expect_i64("t8 journal: not yet", mp_meo_probe_check(pr), 0);
-  mp_expect_i64("t8 journal status", pr->last_status, 1);
-  mp_expect("t8 retry counted", pr->retries >= 1);
-  mp_expect_i64("t8 commit", meo_pager_commit(p), MEO_OK);
+  meo_db_begin(db, MEO_TX_DEFAULT);
+  var i: int64 = 0;
+  while (i < 400) {
+    t_ins(db, "a", i + 1, 1.0);
+    i = i + 1;
+  }
+  var hot: int32 = mp_meo_probe_check(pr);
+  mp_expect_i64("t8 open txn: no new commit", hot, 0);
+  mp_expect("t8 open txn status ok or hot",
+    pr->last_status == MEO_OK || pr->last_status == MEO_PEEK_HOT);
+  mp_expect_i64("t8 commit", meo_db_commit(db), MEO_OK);
   mp_expect_i64("t8 commit seen", mp_meo_probe_check(pr), 1);
   mp_expect_i64("t8 probe seq", (int64)mp_meo_probe_seq(pr),
-    (int64)meo_pager_commit_seq(p));
+    (int64)meo_pager_commit_seq(db->pager));
   mp_expect_i64("t8 then unchanged", mp_meo_probe_check(pr), 0);
   mp_meo_probe_free(pr);
-  t_close(p);
+  t_close(db, f);
+
+  // WAL mode: the newest commit is read from the log, still with no lock.
+  var fw: MeoFeed* = 0;
+  var dbw: MeoDb* = t_open(T_DB_PROBE_WAL, true, 64, &fw);
+  mp_expect("t8 wal open", dbw != 0);
+  if (dbw == 0) { return; }
+  var pw: MpMeoProbe* = mp_meo_probe_new(T_DB_PROBE_WAL);
+  mp_expect_i64("t8 wal first sight", mp_meo_probe_check(pw), 1);
+  mp_expect_i64("t8 wal unchanged", mp_meo_probe_check(pw), 0);
+  t_ins(dbw, "a", 1, 1.0);
+  mp_expect_i64("t8 wal commit seen", mp_meo_probe_check(pw), 1);
+  mp_expect_i64("t8 wal probe seq", (int64)mp_meo_probe_seq(pw),
+    (int64)meo_pager_commit_seq(dbw->pager));
+  mp_meo_probe_free(pw);
+  t_close(dbw, fw);
 }
 
-// --- t9: writer thread + polling thread ------------------------------------
+// Mapped table "a": x = id (INTEGER PRIMARY KEY), y = v.
+fn t9_fast_path() {
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB_GAP, false, 1024, &f);
+  if (db == 0) { return; }
+  var ta: uint32 = t_id(db, "a");
+  t_commit_range(db, "a", 1, 4);                       // rows before the watch
+  var w: MpMeoWatch* = mp_meo_watch_new(f);
+  var c: MpChart* = t_line(1);
+  mp_expect_i64("t9 bad table", mp_meo_watch_xy(w, db, "nope", "id", "v", "", c), MP_ERR_ARG);
+  mp_expect_i64("t9 bad column", mp_meo_watch_xy(w, db, "a", "id", "zz", "", c), MP_ERR_ARG);
+  mp_expect_i64("t9 group not int", mp_meo_watch_xy(w, db, "c", "id", "v", "v", c), MP_ERR_ARG);
+  mp_expect_i64("t9 null chart", mp_meo_watch_xy(w, db, "a", "id", "v", "", 0), MP_ERR_ARG);
+  mp_expect_i64("t9 watch xy", mp_meo_watch_xy(w, db, "a", "id", "v", "", c), MP_OK);
+  mp_expect_i64("t9 twice", mp_meo_watch_xy(w, db, "a", "id", "v", "", c), MP_ERR_STATE);
+  mp_expect_i64("t9 initial", mp_meo_poll(w), 1);
+  var x0: float64[3] = [1.0, 2.0, 3.0];
+  var y0: float64[3] = [1.5, 3.0, 4.5];
+  mp_expect("t9 initial scan", t_series_is(c, 0, &x0[0], &y0[0], 3));
+  mp_expect_i64("t9 initial reason", t_stats(w, ta).last_reason, MP_MEO_REASON_INITIAL);
 
-const T9_TXNS: int32 = 60;
-const T9_PER: int32 = 2;
+  // Inserts: pushed, no reload.
+  t_commit_range(db, "a", 4, 6);
+  t_ins(db, "a", 7, 0.25);
+  var seq: int64 = mp_chart_seq(c);
+  mp_expect_i64("t9 insert poll reloads nothing", mp_meo_poll(w), 0);
+  mp_expect("t9 seq moved", mp_chart_seq(c) > seq);
+  var x1: float64[6] = [1.0, 2.0, 3.0, 4.0, 5.0, 7.0];
+  var y1: float64[6] = [1.5, 3.0, 4.5, 6.0, 7.5, 0.25];
+  mp_expect("t9 inserted values", t_series_is(c, 0, &x1[0], &y1[0], 6));
+  var st: MpMeoTableStats = t_stats(w, ta);
+  mp_expect_i64("t9 fast count", st.fast_count, 3);
+  mp_expect_i64("t9 reload count", st.reload_count, 1);
 
-struct T9Shared {
-  feed: MeoFeed*;
-  pager: MeoPager*;
+  // Update in place.
+  mp_expect_i64("t9 update", t_upd(db, "a", 2, -1, 9.0), MEO_OK);
+  mp_expect_i64("t9 update poll", mp_meo_poll(w), 0);
+  var y2: float64[6] = [1.5, 9.0, 4.5, 6.0, 7.5, 0.25];
+  mp_expect("t9 updated in place", t_series_is(c, 0, &x1[0], &y2[0], 6));
+  mp_expect_i64("t9 replace fast", t_stats(w, ta).fast_count, 4);
+
+  // NULL y: a NaN sample.
+  t_ins_null(db, "a", 8);
+  mp_meo_poll(w);
+  mp_expect_i64("t9 null pushed", t_len(c, 0), 7);
+  var ny: float64 = t_y(c, 0, 6);
+  mp_expect("t9 null is NaN", ny != ny);
+
+  // Delete: reload by range scan.
+  mp_expect_i64("t9 delete", t_del(db, "a", 3), MEO_OK);
+  mp_expect_i64("t9 delete reloads", mp_meo_poll(w), 1);
+  var nan: float64 = 0.0;
+  nan = nan / nan;
+  var x3: float64[6] = [1.0, 2.0, 4.0, 5.0, 7.0, 8.0];
+  var y3: float64[6] = [1.5, 9.0, 6.0, 7.5, 0.25, nan];
+  mp_expect("t9 after delete", t_series_is(c, 0, &x3[0], &y3[0], 6));
+  st = t_stats(w, ta);
+  mp_expect_i64("t9 delete reload count", st.reload_count, 2);
+  mp_expect_i64("t9 delete reason", st.last_reason, MP_MEO_REASON_CHANGES);
+  mp_expect_i64("t9 delete count", st.delete_count, 1);
+
+  // Out of order insert (id 3 again, below 8): reload, x order from the scan.
+  t_ins(db, "a", 3, 3.25);
+  mp_expect_i64("t9 out of order reloads", mp_meo_poll(w), 1);
+  var x4: float64[7] = [1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 8.0];
+  var y4: float64[7] = [1.5, 9.0, 3.25, 6.0, 7.5, 0.25, nan];
+  mp_expect("t9 out of order values", t_series_is(c, 0, &x4[0], &y4[0], 7));
+
+  // An update that changes the rowid (x): reload.
+  mp_expect_i64("t9 id update", t_upd(db, "a", 8, 9, 2.0), MEO_OK);
+  mp_expect_i64("t9 id update reloads", mp_meo_poll(w), 1);
+  var x5: float64[7] = [1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 9.0];
+  var y5: float64[7] = [1.5, 9.0, 3.25, 6.0, 7.5, 0.25, 2.0];
+  mp_expect("t9 id update values", t_series_is(c, 0, &x5[0], &y5[0], 7));
+
+  // A per-event callback sees every event of a mapped table too.
+  var r: TRec* = t_rec();
+  mp_expect_i64("t9 change cb", mp_meo_watch_changes(w, ta, &t_change), MP_OK);
+  meo_db_begin(db, MEO_TX_DEFAULT);
+  t_ins(db, "a", 10, 1.0);
+  t_ins(db, "a", 11, 1.0);
+  mp_expect_i64("t9 rollback", meo_db_rollback(db), MEO_OK);
+  var sr: int64 = mp_chart_seq(c);
+  mp_expect_i64("t9 rollback poll", mp_meo_poll(w), 0);
+  mp_expect_i64("t9 rollback chart", mp_chart_seq(c), sr);
+  mp_expect_i64("t9 rollback len", t_len(c, 0), 7);
+  mp_expect_i64("t9 rollback no event", t_stats(w, ta).change_count, st.change_count + 2);
+  mp_meo_watch_free(w);
+  t_close(db, f);
+  free(r);
+
+  // GAP: a transaction bigger than the ring reloads by range scan.
+  var f2: MeoFeed* = 0;
+  var db2: MeoDb* = t_open(T_DB_GAP, false, 2, &f2);
+  if (db2 == 0) {
+    mp_chart_free(c);
+    return;
+  }
+  var w2: MpMeoWatch* = mp_meo_watch_new(f2);
+  mp_chart_clear(c);
+  mp_meo_watch_xy(w2, db2, "a", "id", "v", "", c);
+  mp_meo_poll(w2);
+  mp_expect_i64("t9 gap db empty", t_len(c, 0), 0);
+  t_commit_range(db2, "a", 1, 6);
+  mp_expect_i64("t9 gap reloads", mp_meo_poll(w2), 1);
+  var a2: uint32 = t_id(db2, "a");
+  mp_expect_i64("t9 gap reason", t_stats(w2, a2).last_reason, MP_MEO_REASON_GAP);
+  var x6: float64[5] = [1.0, 2.0, 3.0, 4.0, 5.0];
+  var y6: float64[5] = [1.5, 3.0, 4.5, 6.0, 7.5];
+  mp_expect("t9 gap scan values", t_series_is(c, 0, &x6[0], &y6[0], 5));
+  t_ins(db2, "a", 6, 9.0);
+  mp_expect_i64("t9 after gap fast again", mp_meo_poll(w2), 0);
+  mp_expect_i64("t9 after gap len", t_len(c, 0), 6);
+  mp_meo_watch_free(w2);
+  t_close(db2, f2);
+  mp_chart_free(c);
+}
+
+// Mapped grouped table "c": x = id, y = v, series = g.
+fn t10_groups() {
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB, false, 1024, &f);
+  if (db == 0) { return; }
+  var tc: uint32 = t_id(db, "c");
+  var w: MpMeoWatch* = mp_meo_watch_new(f);
+  var c: MpChart* = t_line(2);
+  t_ins_g(db, 1, 10.0, 0);
+  t_ins_g(db, 2, 20.0, 1);
+  mp_expect_i64("t10 watch", mp_meo_watch_xy(w, db, "c", "id", "v", "g", c), MP_OK);
+  mp_meo_poll(w);
+  mp_expect_i64("t10 initial s0", t_len(c, 0), 1);
+  mp_expect_i64("t10 initial s1", t_len(c, 1), 1);
+  meo_db_begin(db, MEO_TX_DEFAULT);
+  t_ins_g(db, 3, 30.0, 0);
+  t_ins_g(db, 4, 40.0, 1);
+  t_ins_g(db, 5, 50.0, 7);                         // no series 7: dropped
+  t_ins_g(db, 6, 60.0, 1);
+  meo_db_commit(db);
+  mp_expect_i64("t10 poll no reload", mp_meo_poll(w), 0);
+  var x0: float64[2] = [1.0, 3.0];
+  var y0: float64[2] = [10.0, 30.0];
+  var x1: float64[3] = [2.0, 4.0, 6.0];
+  var y1: float64[3] = [20.0, 40.0, 60.0];
+  mp_expect("t10 series 0", t_series_is(c, 0, &x0[0], &y0[0], 2));
+  mp_expect("t10 series 1", t_series_is(c, 1, &x1[0], &y1[0], 3));
+  var st: MpMeoTableStats = t_stats(w, tc);
+  mp_expect_i64("t10 dropped", st.dropped_count, 1);
+  mp_expect_i64("t10 fast", st.fast_count, 3);
+  // An update of a row in series 1 overwrites it in place.
+  t_upd(db, "c", 4, -1, 44.0);
+  mp_expect_i64("t10 update no reload", mp_meo_poll(w), 0);
+  var y1b: float64[3] = [20.0, 44.0, 60.0];
+  mp_expect("t10 series 1 updated", t_series_is(c, 1, &x1[0], &y1b[0], 3));
+  // A dropped row updated: it might have been drawn, so reload.
+  t_upd(db, "c", 5, -1, 55.0);
+  mp_expect_i64("t10 dropped row update reloads", mp_meo_poll(w), 1);
+  mp_expect("t10 series 0 after reload", t_series_is(c, 0, &x0[0], &y0[0], 2));
+  mp_expect("t10 series 1 after reload", t_series_is(c, 1, &x1[0], &y1b[0], 3));
+  mp_meo_watch_free(w);
+  t_close(db, f);
+  mp_chart_free(c);
+}
+
+fn t11_wal() {
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB_WAL, true, 1024, &f);
+  mp_expect("t11 open", db != 0);
+  if (db == 0) { return; }
+  mp_expect("t11 wal mode", meo_db_wal_mode(db));
+  var ta: uint32 = t_id(db, "a");
+  var w: MpMeoWatch* = mp_meo_watch_new(f);
+  var c: MpChart* = t_line(1);
+  mp_meo_watch_xy(w, db, "a", "id", "v", "", c);
+  mp_expect_i64("t11 initial", mp_meo_poll(w), 1);
+  mp_expect_i64("t11 commit", t_commit_range(db, "a", 1, 5), MEO_OK);
+  mp_expect_i64("t11 fast", mp_meo_poll(w), 0);
+  mp_expect_i64("t11 len", t_len(c, 0), 4);
+  t_upd(db, "a", 1, -1, 7.0);
+  t_del(db, "a", 4);
+  mp_expect_i64("t11 delete reloads", mp_meo_poll(w), 1);
+  var x0: float64[3] = [1.0, 2.0, 3.0];
+  var y0: float64[3] = [7.0, 3.0, 4.5];
+  mp_expect("t11 values", t_series_is(c, 0, &x0[0], &y0[0], 3));
+  var st: MpMeoTableStats = t_stats(w, ta);
+  mp_expect_i64("t11 commit seq", (int64)st.last_commit_seq,
+    (int64)meo_pager_commit_seq(db->pager));
+  mp_expect_i64("t11 no meo error", st.meo_error, MEO_OK);
+  mp_meo_watch_free(w);
+  t_close(db, f);
+  mp_chart_free(c);
+}
+
+// --- t12: writer thread + polling thread -----------------------------------
+
+const T12_TXNS: int32 = 120;
+const T12_PER: int32 = 3;
+
+struct T12Shared {
+  db: MeoDb*;
   done: int32;
   writer_err: int32;
 }
 
-fn t9_writer(arg: cstring) -> uint32 {
-  var sh: T9Shared* = (T9Shared*)arg;
-  var root: uint32 = 0;
+// Rows id = 1.., g = id % 3, v = id; every 10th transaction updates the oldest live row
+// (v = -id) and every 25th deletes one.
+fn t12_writer(arg: cstring) -> uint32 {
+  var sh: T12Shared* = (T12Shared*)arg;
   var t: int32 = 0;
-  while (t < T9_TXNS) {
-    var from: int64 = (int64)t * (int64)T9_PER;
-    if (t_commit_range(sh->feed, sh->pager, T_A, &root, from,
-        from + (int64)T9_PER) != MEO_OK) {
+  var next: int64 = 1;
+  while (t < T12_TXNS) {
+    var rc: int32 = meo_db_begin(sh->db, MEO_TX_DEFAULT);
+    var k: int32 = 0;
+    while (rc == MEO_OK && k < T12_PER) {
+      rc = t_ins_g(sh->db, next, (float64)next, next % 3);
+      next = next + 1;
+      k = k + 1;
+    }
+    if (rc == MEO_OK && t % 10 == 9) {
+      rc = t_upd(sh->db, "c", (int64)t, -1, -(float64)t);
+    }
+    if (rc == MEO_OK && t % 25 == 24) { rc = t_del(sh->db, "c", (int64)t * 2); }
+    if (rc == MEO_OK) {
+      rc = meo_db_commit(sh->db);
+    } else {
+      meo_db_rollback(sh->db);
+    }
+    if (rc != MEO_OK) {
       sh->writer_err = t + 1;
       break;
     }
@@ -534,52 +909,79 @@ fn t9_writer(arg: cstring) -> uint32 {
   return 0;
 }
 
-fn t9_threads() {
-  var p: MeoPager* = t_open(T_DB_THR);
-  var f: MeoFeed* = meo_feed_new(65536);
-  meo_feed_attach(p, f);
+// The table as the chart should show it: id ascending, series id % 3.
+fn t12_expected_v(id: int64) -> float64 {
+  if (id % 10 == 9 && id < (int64)T12_TXNS) { return -(float64)id; }
+  return (float64)id;
+}
+
+fn t12_deleted(id: int64) -> bool {
+  return id % 50 == 48 && id < (int64)T12_TXNS * 2;
+}
+
+fn t12_run(path: string, wal: bool, tag: string) {
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(path, wal, 65536, &f);
+  mp_expect("t12 open {tag}", db != 0);
+  if (db == 0) { return; }
+  var tc: uint32 = t_id(db, "c");
   var w: MpMeoWatch* = mp_meo_watch_new(f);
-  var lv: MpLive* = mp_live_new(MP_CHART_LINE, 1, 64);
-  var r: TRec* = t_rec();
-  mp_meo_watch_table(w, T_A, lv, &t_reload, (rawptr)r);
-  var lock: int32* = (int32*)malloc(4);
-  lock[0] = 0;
-  mp_expect_i64("t9 locked needs a lock", mp_meo_poll_locked(w, 0), -MP_ERR_ARG);
-  var sh: T9Shared* = new T9Shared;
-  sh->feed = f;
-  sh->pager = p;
-  var h: int64 = CreateThread(0, 0, &t9_writer, (cstring)sh, 0, 0);
-  mp_expect("t9 thread", h != 0);
+  var c: MpChart* = t_line(3);
+  mp_chart_share(c);
+  mp_meo_watch_xy(w, db, "c", "id", "v", "g", c);
+  var sh: T12Shared* = new T12Shared;
+  sh->db = db;
+  var h: int64 = CreateThread(0, 0, &t12_writer, (cstring)sh, 0, 0);
+  mp_expect("t12 thread {tag}", h != 0);
   var polls: int32 = 0;
   var bad: int32 = 0;
   while (atomic_compare_exchange_i32(&sh->done, 1, 1) == 0) {
-    if (mp_meo_poll_locked(w, lock) < 0) { bad = bad + 1; }
+    if (mp_meo_poll(w) < 0) { bad = bad + 1; }
     polls = polls + 1;
   }
   thread_join_infinite(h);
   thread_close(h);
-  if (mp_meo_poll_locked(w, lock) < 0) { bad = bad + 1; }  // the tail
-  mp_expect_i64("t9 writer clean", sh->writer_err, 0);
-  mp_expect_i64("t9 no poll errors", bad, 0);
-  mp_expect("t9 polled", polls >= 1);
-  mp_expect("t9 reloaded at least once", r->reloads >= 1);
-  var st: MpMeoTableStats = t_stats(w, T_A);
-  mp_expect_i64("t9 every insert", st.insert_count,
-    (int64)T9_TXNS * (int64)T9_PER);
-  mp_expect_i64("t9 final commit seq", (int64)st.last_commit_seq,
-    (int64)meo_pager_commit_seq(p));
-  mp_expect_i64("t9 last commit is the writer's last", (int64)st.last_commit_seq,
-    (int64)T9_TXNS);
-  mp_expect_i64("t9 no gap", st.gap_count, 0);
-  mp_expect_i64("t9 lock released", lock[0], 0);
-  mp_expect("t9 live seq moved", mp_live_seq(lv) >= (int64)r->reloads);
+  if (mp_meo_poll(w) < 0) { bad = bad + 1; }
+  mp_expect_i64("t12 writer clean {tag}", sh->writer_err, 0);
+  mp_expect_i64("t12 no poll errors {tag}", bad, 0);
+  mp_expect("t12 polled {tag}", polls >= 1);
+  var st: MpMeoTableStats = t_stats(w, tc);
+  mp_expect("t12 reloaded {tag}", st.reload_count >= 1);
+  mp_expect("t12 fast path used {tag}", st.fast_count >= 1);
+  mp_expect_i64("t12 every insert {tag}", st.insert_count, (int64)T12_TXNS * (int64)T12_PER);
+  mp_expect_i64("t12 final commit seq {tag}", (int64)st.last_commit_seq,
+    (int64)meo_pager_commit_seq(db->pager));
+  mp_expect_i64("t12 no gap {tag}", st.gap_count, 0);
+  // Every row exactly once, with its final value.
+  var total: int64 = (int64)T12_TXNS * (int64)T12_PER;
+  var ok: bool = true;
+  var s: int32 = 0;
+  while (s < 3) {
+    var i: int64 = 0;
+    var id: int64 = 1;
+    while (id <= total) {
+      if (id % 3 == (int64)s && !t12_deleted(id)) {
+        if (i >= t_len(c, s) || t_x(c, s, i) != (float64)id ||
+            t_y(c, s, i) != t12_expected_v(id)) {
+          ok = false;
+        }
+        i = i + 1;
+      }
+      id = id + 1;
+    }
+    if (i != t_len(c, s)) { ok = false; }
+    s = s + 1;
+  }
+  mp_expect("t12 chart equals table {tag}", ok);
   mp_meo_watch_free(w);
-  meo_feed_free(f);
-  t_close(p);
-  mp_live_free(lv);
-  free(r);
+  t_close(db, f);
+  mp_chart_free(c);
   free(sh);
-  free(lock);
+}
+
+fn t12_threads() {
+  t12_run(T_DB_THR, false, "rollback");
+  t12_run(T_DB_THR, true, "wal");
 }
 
 fn t_fmt() {
@@ -593,6 +995,32 @@ fn t_fmt() {
     "updated 22:13:20 · commit 57");
   mp_expect_str("fmt subtitle 0", mp_meo_fmt_subtitle(0, (uint64)0, &buf[0], 64),
     "updated 00:00:00 · commit 0");
+
+  var f: MeoFeed* = 0;
+  var db: MeoDb* = t_open(T_DB, false, 64, &f);
+  if (db == 0) { return; }
+  var ta: uint32 = t_id(db, "a");
+  var w: MpMeoWatch* = mp_meo_watch_new(f);
+  var c: MpChart* = t_line(1);
+  mp_meo_watch_xy(w, db, "a", "id", "v", "", c);
+  mp_expect_i64("fmt set subtitle unwatched", mp_meo_set_subtitle(w, 999, c), MP_ERR_ARG);
+  mp_expect_i64("fmt set subtitle before", mp_meo_set_subtitle(w, ta, c), MP_OK);
+  var want0: string = mp_meo_fmt_subtitle(meo_feed_last_time(f), meo_feed_last_commit(f),
+    &buf[0], 64);
+  mp_expect_str("fmt subtitle from feed", c->subtitle, want0);
+  t_ins(db, "a", 1, 1.0);
+  mp_meo_poll(w);
+  mp_expect_i64("fmt set subtitle", mp_meo_set_subtitle(w, ta, c), MP_OK);
+  var st: MpMeoTableStats = t_stats(w, ta);
+  var want: string = mp_meo_fmt_subtitle(st.last_change_time_us, st.last_commit_seq,
+    &buf[0], 64);
+  mp_expect_str("fmt subtitle copied", c->subtitle, want);
+  var s1: int64 = mp_chart_seq(c);
+  mp_meo_set_subtitle(w, ta, c);
+  mp_expect_i64("fmt same subtitle keeps seq", mp_chart_seq(c), s1);
+  mp_meo_watch_free(w);
+  t_close(db, f);
+  mp_chart_free(c);
 }
 
 export fn main() -> int32 {
@@ -605,6 +1033,9 @@ export fn main() -> int32 {
   t6_unwatched();
   t7_reload_error();
   t8_probe();
-  t9_threads();
+  t9_fast_path();
+  t10_groups();
+  t11_wal();
+  t12_threads();
   return mp_summary();
 }
