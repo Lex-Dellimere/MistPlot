@@ -1,0 +1,437 @@
+// integrations/mythic/tests/mythic_test — headless MythicUI checks for the
+// MistPlot integration. Run from the repo root; writes
+// build/integrations/mythic/*.png.
+//
+// Layout (logical px, scale 1): a static line chart at (20, 20, 440, 280), a
+// live line chart at (480, 20, 440, 280), a clip probe at (20, 320, 120, 80) and
+// a static bar chart at (160, 320, 440, 260). Pixels are read back from the
+// headless framebuffer (0xAARRGGBB).
+
+import "std/io";
+import "std/mem";
+import "std/math";
+import "mythic/mythic";
+import "mistplot/harness";
+import "mistplot/core/color";
+import "mistplot/core/data";
+import "mistplot/core/text";
+import "mistplot/core/geom";
+import "mistplot/renderer/scene";
+import "mistplot/chart/spec";
+import "mistplot/chart/resolve";
+import "mistplot/live/stream";
+import "../mp_mythic";
+
+struct T {
+  st: MpMythicChart*;        // static line
+  sl: MpMythicChart*;        // live
+  sb: MpMythicChart*;        // static bar
+  lv: MpLive*;
+  ser: MpSeries*;            // 2 series for the static line chart
+  bars: MpSeries*;           // 1 series for the bar chart
+  probe: MpScene*;           // scene painted by the clip probe
+  pending: int32;            // samples to push on the next pass 0
+  pushed: int64;
+  dark_req: int32;           // 1 = switch to dark on next pass 0, 2 = light
+}
+
+fn ingest(ui: MythicUi*, t: T*) {
+  if (ui->pass != 0) { return; }
+  if (t->dark_req == 1) { mythic_set_theme(ui, mythic_theme_dark()); }
+  if (t->dark_req == 2) { mythic_set_theme(ui, mythic_theme_light()); }
+  t->dark_req = 0;
+  // deterministic x (0.05 s apart) so the pixels do not depend on frame timing
+  var k: int32 = 0;
+  while (k < t->pending) {
+    var x: float64 = (float64)t->pushed * 0.05;
+    mp_live_push(t->lv, 0, x, 50.0 + 30.0 * sin(x * 0.9));
+    mp_live_push(t->lv, 1, x, 40.0 + 20.0 * cos(x * 0.5));
+    t->pushed = t->pushed + 1;
+    k = k + 1;
+  }
+  t->pending = 0;
+}
+
+fn mp_mythic_test_probe_cb(ui: MythicUi*, p: MythicPainter*, r: MythicRect, ud: rawptr) {
+  var t: T* = (T*)ud;
+  mp_mythic_paint_scene(p, t->probe, r);
+}
+
+fn frame(ui: MythicUi*, ud: rawptr) {
+  var t: T* = (T*)ud;
+  ingest(ui, t);
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, t->ser, 2);
+  spec.title = "Static line";
+  spec.x_label = "x";
+  spec.y_label = "value";
+  mythic_column_begin(ui, { pad: mythic_pad(20), gap: 20 });
+    mythic_row_begin(ui, { gap: 20 });
+      mp_mythic_chart(ui, t->st, &spec, mythic_fixed(440), mythic_fixed(280));
+      mp_mythic_live(ui, t->sl, t->lv, mythic_fixed(440), mythic_fixed(280));
+    mythic_end(ui);
+    mythic_row_begin(ui, { gap: 20 });
+      mythic_box_begin(ui, { width: mythic_fixed(120), height: mythic_fixed(80) });
+      mythic_end(ui);
+      mythic_node_paint(ui, &mp_mythic_test_probe_cb, ud);
+      var bs: MpChartSpec = mp_chart_spec(MP_CHART_BAR, t->bars, 1);
+      bs.title = "Static bars";
+      bs.legend = MP_LEGEND_BOTTOM;
+      mp_mythic_chart(ui, t->sb, &bs, mythic_fixed(440), mythic_fixed(260));
+    mythic_end(ui);
+  mythic_end(ui);
+}
+
+fn px_at(app: MythicApp*, x: int32, y: int32) -> uint32 {
+  var fb: MythicFramebuffer = mythic_app_framebuffer(app);
+  if (x < 0 || y < 0 || x >= fb.w || y >= fb.h) { return (uint32)0; }
+  return fb.px[(int64)y * (int64)fb.stride + (int64)x];
+}
+
+fn count_color(app: MythicApp*, r: MythicRect, c: uint32) -> int64 {
+  var n: int64 = 0;
+  var y: int32 = (int32)r.y;
+  while (y < (int32)(r.y + r.h)) {
+    var x: int32 = (int32)r.x;
+    while (x < (int32)(r.x + r.w)) {
+      if (px_at(app, x, y) == c) { n = n + 1; }
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return n;
+}
+
+// Pixels in the 12 px ring around r (excluding r) that differ from `bg`.
+fn ring_dirty(app: MythicApp*, r: MythicRect, bg: uint32) -> int64 {
+  var n: int64 = 0;
+  var x0: int32 = (int32)r.x; var y0: int32 = (int32)r.y;
+  var x1: int32 = (int32)(r.x + r.w); var y1: int32 = (int32)(r.y + r.h);
+  var y: int32 = y0 - 12;
+  while (y < y1 + 12) {
+    var x: int32 = x0 - 12;
+    while (x < x1 + 12) {
+      var inside: bool = x >= x0 && x < x1 && y >= y0 && y < y1;
+      if (!inside && px_at(app, x, y) != bg) { n = n + 1; }
+      x = x + 1;
+    }
+    y = y + 1;
+  }
+  return n;
+}
+
+fn step(app: MythicApp*, t: T*, n: int32) {
+  var i: int32 = 0;
+  while (i < n) {
+    mythic_headless_advance_us(mythic_app_platform(app), 16667);
+    mythic_app_step(app, &frame, (rawptr)t, false);
+    i = i + 1;
+  }
+}
+
+fn save(app: MythicApp*, name: string) {
+  var path: string = "build/integrations/mythic/{name}.png";
+  mp_expect("png {name}", mythic_app_save_png(app, path));
+  println("wrote {path}");
+  free((rawptr)path.chars);
+}
+
+fn plot_of(s: MpScene*) -> MpRect {
+  var out: MpRect = mp_rect(0.0, 0.0, 0.0, 0.0);
+  var i: int64 = 0;
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (nd->kind == MP_NODE_RECT && nd->cls == MP_CLS_PLOT) {
+      return mp_rect(nd->x, nd->y, nd->w, nd->h);
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+fn argb(c: MpColor) -> uint32 {
+  return ((uint32)c.a << 24) | ((uint32)c.r << 16) | ((uint32)c.g << 8) | (uint32)c.b;
+}
+
+// Counts pixels in the column at device x, rows [y0, y1), equal to c.
+fn col_count(app: MythicApp*, x: int32, y0: int32, y1: int32, c: uint32) -> int64 {
+  var n: int64 = 0;
+  var y: int32 = y0;
+  while (y < y1) {
+    if (px_at(app, x, y) == c) { n = n + 1; }
+    y = y + 1;
+  }
+  return n;
+}
+
+fn frame2x(ui: MythicUi*, ud: rawptr) {
+  var t: T* = (T*)ud;
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, t->ser, 2);
+  spec.title = "Static line at 2x";
+  spec.x_label = "x";
+  spec.y_label = "value";
+  spec.legend = MP_LEGEND_BOTTOM;
+  mythic_column_begin(ui, { pad: mythic_pad(20), width: mythic_grow(), height: mythic_grow() });
+    mp_mythic_chart(ui, t->st, &spec, mythic_grow(), mythic_grow());
+  mythic_end(ui);
+}
+
+// HiDPI: the same static chart on a scale-2 headless window (device px = 2 x logical).
+fn run_2x(t: T*) {
+  var st: MpMythicChart* = t->st;
+  t->st = mp_mythic_chart_new();
+  var app: MythicApp* = mythic_app_create_headless(
+    { title: "mp_mythic_test_2x", width: 480.0, height: 320.0 }, 2.0);
+  mp_expect("2x app", app != 0);
+  if (app == 0) { return; }
+  var i: int32 = 0;
+  while (i < 3) {
+    mythic_headless_advance_us(mythic_app_platform(app), 16667);
+    mythic_app_step(app, &frame2x, (rawptr)t, false);
+    i = i + 1;
+  }
+  var ui: MythicUi* = mythic_app_ui(app);
+  var th: MythicTheme* = mythic_theme(ui);
+  var r: MythicRect = t->st->rect;
+  mp_expect("2x rect", r.x == 20.0 && r.y == 20.0 && r.w == 440.0 && r.h == 280.0);
+  mp_expect("2x measured at scale 2", t->st->scale == 2.0);
+  mp_expect("2x bg pixel", px_at(app, 46, 46) == th->colors.bg_surface);
+  var dr: MythicRect = { x: r.x * 2.0, y: r.y * 2.0, w: r.w * 2.0, h: r.h * 2.0 };
+  var n0: int64 = count_color(app, dr, argb(mp_palette_color(0)));
+  println("2x: series0 px {n0}");
+  mp_expect("2x series 0 pixels", n0 > 1200);
+  mp_expect_i64("2x nothing outside", ring_dirty(app, dr, th->colors.bg_window), 0);
+  save(app, "test_static_2x");
+  mythic_app_destroy(app);
+  mp_mythic_chart_free(t->st);
+  t->st = st;
+}
+
+// An app's own measurer (not exported: see README.md, Compiler issues).
+fn mp_mythic_test_measure_cb(ctx: rawptr, s: string, size: float64) -> float64 {
+  return (float64)s.length * size;
+}
+
+// Hover readout formats (pure: no window).
+fn check_hover_format() {
+  var b: uint8[64];
+  var info: MpChartInfo = mp_chart_info_empty();
+  info.x_format = MP_FMT_TIME;
+  info.x0 = 0.0;
+  info.x1 = 10.0;
+  mp_expect_str("hover x: short time span shows tenths",
+                mp_mythic_fmt_hover_x(&info, 3.45, &b[0], 64), "00:03.5");
+  info.x1 = 30.0;
+  mp_expect_str("hover x: 59.96 under a minute span",
+                mp_mythic_fmt_hover_x(&info, 59.96, &b[0], 64), "01:00.0");
+  info.x1 = 120.0;
+  mp_expect_str("hover x: long span rounds, never truncates",
+                mp_mythic_fmt_hover_x(&info, 59.6, &b[0], 64), "01:00");
+  mp_expect_str("hover x: long span whole seconds",
+                mp_mythic_fmt_hover_x(&info, 75.2, &b[0], 64), "01:15");
+  info.x_format = MP_FMT_TIME_TENTHS;
+  info.x1 = 2.0;
+  mp_expect_str("hover x: tenths axis", mp_mythic_fmt_hover_x(&info, 1.04, &b[0], 64), "00:01.0");
+  info.x_format = MP_FMT_AUTO;
+  mp_expect_str("hover x: auto axis", mp_mythic_fmt_hover_x(&info, 12.5, &b[0], 64), "12.5");
+  // y: decimals from the y domain (step ~ span/5, one digit finer than the
+  // axis labels), so every row of one readout has the same number of digits.
+  var yi: MpChartInfo = mp_chart_info_empty();
+  yi.valid = true;
+  yi.y0 = 0.0;
+  yi.y1 = 100.0;   // step 20 -> 1 decimal
+  mp_expect_str("hover y: 0..100 has one decimal",
+                mp_mythic_fmt_hover_y(&yi, 37.948, &b[0], 64), "37.9");
+  mp_expect_str("hover y: same digits for every row",
+                mp_mythic_fmt_hover_y(&yi, 32.1343, &b[0], 64), "32.1");
+  mp_expect_str("hover y: integer value keeps the decimal",
+                mp_mythic_fmt_hover_y(&yi, 40.0, &b[0], 64), "40.0");
+  yi.y1 = 0.001;   // step 0.0002 -> 6 decimals (the clamp)
+  mp_expect_str("hover y: small domain",
+                mp_mythic_fmt_hover_y(&yi, 0.000123456, &b[0], 64), "0.000123");
+  yi.y1 = 50000.0; // step 10000 -> 0 decimals
+  mp_expect_str("hover y: large domain has no decimals",
+                mp_mythic_fmt_hover_y(&yi, 12345.6, &b[0], 64), "12346");
+  mp_expect_str("hover y: no frame falls back to auto",
+                mp_mythic_fmt_hover_y(0, 52.3456789, &b[0], 64), "52.3457");
+}
+
+export fn main() -> int32 {
+  check_hover_format();
+  var t: T* = (T*)malloc(sizeof(T));
+  memset((rawptr)t, 0, sizeof(T));
+  t->st = mp_mythic_chart_new();
+  t->sl = mp_mythic_chart_new();
+  t->sb = mp_mythic_chart_new();
+  t->lv = mp_live_new(MP_CHART_LINE, 2, 4096);
+  mp_live_series_name(t->lv, 0, "cpu");
+  mp_live_series_name(t->lv, 1, "mem");
+  mp_live_window(t->lv, 10.0);
+  var lsp: MpChartSpec* = mp_live_spec(t->lv);
+  lsp->title = "Live";
+  lsp->x_format = MP_FMT_TIME;
+  lsp->y_fixed = true;
+  lsp->y_min = 0.0;
+  lsp->y_max = 100.0;
+  mp_live_touch(t->lv);
+
+  t->ser = (MpSeries*)malloc(sizeof(MpSeries) * 2);
+  var a: MpSeries* = mp_series_new("alpha", 64);
+  var b: MpSeries* = mp_series_new("beta", 64);
+  var i: int32 = 0;
+  while (i < 40) {
+    var x: float64 = (float64)i;
+    mp_series_push(a, x, 20.0 + 15.0 * sin(x * 0.3) + x);
+    mp_series_push(b, x, 30.0 + 10.0 * cos(x * 0.25));
+    i = i + 1;
+  }
+  t->ser[0] = *a;
+  t->ser[1] = *b;
+  t->bars = mp_series_new("sales", 16);
+  i = 0;
+  while (i < 7) {
+    mp_series_push(t->bars, (float64)i, 3.0 + (float64)((i * 5) % 7));
+    i = i + 1;
+  }
+  // clip probe: a rect and a line far larger than the 120x80 box
+  t->probe = mp_scene_new();
+  mp_scene_rect(t->probe, mp_rect(-60.0, -60.0, 400.0, 400.0), mp_color(200, 30, 40),
+                mp_color_a(0, 0, 0, 0), 0.0, MP_CLS_BG);
+  mp_scene_line(t->probe, -80.0, 40.0, 300.0, 40.0, mp_color(0, 0, 255), 4.0, MP_CLS_AXIS);
+  t->pending = 200;
+
+  var app: MythicApp* = mythic_app_create_headless(
+    { title: "mp_mythic_test", width: 940.0, height: 620.0 }, 1.0);
+  mp_expect("app", app != 0);
+  if (app == 0) { return mp_summary(); }
+  var ui: MythicUi* = mythic_app_ui(app);
+  // An app measurer installed before the frame must survive the chart
+  // renders (they save and restore it instead of resetting to the default).
+  var app_ctx: int32 = 7;
+  mp_text_set_measure(&mp_mythic_test_measure_cb, (rawptr)&app_ctx);
+  step(app, t, 3);
+  mp_expect("app measurer restored after the renders", mp_text_measure_ctx() == (rawptr)&app_ctx);
+  mp_expect_near("app measurer still measures", mp_text_width("ab", 10.0), 20.0, 1e-9);
+  mp_text_reset_measure();
+
+  // ---- static chart
+  var r: MythicRect = t->st->rect;
+  mp_expect("static rect x", r.x == 20.0 && r.y == 20.0 && r.w == 440.0 && r.h == 280.0);
+  mp_expect_i64("static renders once", t->st->renders, 1);
+  mp_expect_i64("static rc", (int64)t->st->last_rc, 0);
+  var th: MythicTheme* = mythic_theme(ui);
+  mp_expect("bg pixel = theme surface", px_at(app, 23, 23) == th->colors.bg_surface);
+  mp_expect("window bg outside", px_at(app, 10, 10) == th->colors.bg_window);
+  var c0: uint32 = argb(mp_palette_color(0));
+  var c1: uint32 = argb(mp_palette_color(1));
+  var n0: int64 = count_color(app, r, c0);
+  var n1: int64 = count_color(app, r, c1);
+  println("static: series0 px {n0}, series1 px {n1}");
+  mp_expect("series 0 pixels on polyline", n0 > 300);
+  mp_expect("series 1 pixels on polyline", n1 > 300);
+  mp_expect_i64("nothing outside static chart", ring_dirty(app, r, th->colors.bg_window), 0);
+
+  // ---- clip probe
+  var pr: MythicRect = { x: 20.0, y: 320.0, w: 120.0, h: 80.0 };
+  var probe_px: int64 = count_color(app, pr, 0xFFC81E28) + count_color(app, pr, 0xFF0000FF);
+  mp_expect_i64("probe fills its box", probe_px, 120 * 80);
+  mp_expect_i64("probe clipped to its box", ring_dirty(app, pr, th->colors.bg_window), 0);
+
+  // ---- bar chart
+  var br: MythicRect = t->sb->rect;
+  mp_expect("bar pixels", count_color(app, br, c0) > 2000);
+  mp_expect_i64("nothing outside bar chart", ring_dirty(app, br, th->colors.bg_window), 0);
+
+  // ---- live chart
+  var lr: MythicRect = t->sl->rect;
+  mp_expect("live rect", lr.x == 480.0 && lr.y == 20.0);
+  mp_expect_i64("live rendered once", t->sl->renders, 1);
+  mp_expect_i64("live rc", (int64)mp_live_error(t->lv), 0);
+  mp_expect("live series 0 pixels", count_color(app, lr, c0) > 300);
+  mp_expect("live series 1 pixels", count_color(app, lr, c1) > 300);
+  mp_expect_i64("nothing outside live chart", ring_dirty(app, lr, th->colors.bg_window), 0);
+  mp_expect("live requests frames", ui->next_frame_us > 0);
+  save(app, "test_light");
+
+  // ---- unchanged seq: frames keep coming (live requests them), no re-render
+  var lr0: int64 = t->sl->renders;
+  var lp0: int64 = t->sl->paints;
+  var sr0: int64 = t->st->renders;
+  var f0: int64 = mythic_app_frames(app);
+  step(app, t, 5);
+  mp_expect("frames ran", mythic_app_frames(app) - f0 >= 5);
+  mp_expect("live painted each frame", t->sl->paints - lp0 >= 5);
+  mp_expect_i64("live not re-rendered without push", t->sl->renders, lr0);
+  mp_expect_i64("static not re-rendered", t->st->renders, sr0);
+
+  // ---- push: exactly one re-render, picture changes
+  var seq0: int64 = mp_live_seq(t->lv);
+  t->pending = 20;
+  step(app, t, 1);
+  mp_expect("seq moved", mp_live_seq(t->lv) > seq0);
+  mp_expect_i64("live re-rendered after push", t->sl->renders, lr0 + 1);
+  mp_expect_i64("seq recorded", t->sl->live_seq, mp_live_seq(t->lv));
+  step(app, t, 2);
+  mp_expect_i64("and only once", t->sl->renders, lr0 + 1);
+
+  // ---- hover: mouse in the middle of the live plot
+  var lsc: MpScene* = mp_live_scene(t->lv);
+  var pl: MpRect = plot_of(lsc);
+  mp_expect("live plot found", pl.w > 100.0 && pl.h > 100.0);
+  var mx: float32 = lr.x + (float32)pl.x + (float32)(pl.w * 0.3);
+  var my: float32 = lr.y + (float32)pl.y + (float32)(pl.h * 0.8);
+  mx = mythic_floorf(mx) + 0.5;
+  var gx: int32 = (int32)mx;
+  var y0: int32 = (int32)(lr.y + (float32)pl.y) + 1;
+  var y1: int32 = (int32)(lr.y + (float32)(pl.y + pl.h)) - 1;
+  var tert: uint32 = th->colors.text_tertiary;
+  var guide_before: int64 = col_count(app, gx, y0, y1, tert);
+  var ev: MythicEvent = { kind: MYTHIC_EV_MOUSE_MOVE, x: mx * ui->scale, y: my * ui->scale };
+  mythic_headless_push(mythic_app_platform(app), ev);
+  step(app, t, 1);
+  mp_expect("hover drawn", t->sl->hover_on);
+  var linfo: MpChartInfo* = mp_live_info(t->lv);
+  mp_expect("live info valid", linfo->valid);
+  mp_expect("live info plot = scene plot", linfo->plot.x == pl.x && linfo->plot.w == pl.w);
+  mp_expect("hovered sample inside the window",
+            t->sl->hover_xv >= linfo->x0 && t->sl->hover_xv <= linfo->x1);
+  // the mouse sits at 30% of the plot: the readout's sample is the one there
+  var want_x: float64 = linfo->x0 + (linfo->x1 - linfo->x0) * 0.3;
+  mp_expect_near("hovered sample is nearest the mouse", t->sl->hover_xv, want_x, 0.06);
+  var guide_after: int64 = col_count(app, gx, y0, y1, tert);
+  print("hover: guide px before {guide_before}, after {guide_after}, ");
+  println("column {gx}, rows {y0}..{y1}");
+  mp_expect("guide column painted", guide_after > (int64)(y1 - y0) / 2);
+  mp_expect("guide not there before", guide_before < 10);
+  // the readout box's 1 px border is the only border_default-colored thing in the chart
+  mp_expect("readout box border present", count_color(app, lr, th->colors.border_default) > 100);
+  mp_expect_i64("hover did not re-render", t->sl->renders, lr0 + 1);
+  mp_expect_i64("nothing outside live chart (hover)", ring_dirty(app, lr, th->colors.bg_window), 0);
+  save(app, "test_hover");
+
+  // ---- dark theme: static re-renders, background follows
+  t->dark_req = 1;
+  var srd: int64 = t->st->renders;
+  step(app, t, 2);
+  th = mythic_theme(ui);
+  mp_expect("dark theme active", th->dark);
+  mp_expect("static re-rendered on theme", t->st->renders > srd);
+  mp_expect("dark bg pixel", px_at(app, 23, 23) == th->colors.bg_surface);
+  mp_expect("dark window bg", px_at(app, 10, 10) == th->colors.bg_window);
+  mp_expect_i64("nothing outside static chart (dark)", ring_dirty(app, r, th->colors.bg_window), 0);
+  mp_expect("dark series 0 pixels", count_color(app, r, c0) > 300);
+  save(app, "test_dark");
+
+  mythic_app_destroy(app);
+  run_2x(t);
+  mp_mythic_chart_free(t->st);
+  mp_mythic_chart_free(t->sl);
+  mp_mythic_chart_free(t->sb);
+  mp_live_free(t->lv);
+  mp_series_free(a);
+  mp_series_free(b);
+  mp_series_free(t->bars);
+  mp_scene_free(t->probe);
+  free((rawptr)t->ser);
+  free((rawptr)t);
+  return mp_summary();
+}

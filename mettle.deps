@@ -3,3 +3,4 @@
 # libraries the integrations build against.
 mistplot=./src
 raize=../raize_web
+mythic=../mythic_ui/src
