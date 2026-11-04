@@ -70,6 +70,7 @@ check_svg() { # mode
 for mode in debug release; do
   flag=""
   [ "$mode" = release ] && flag="--release"
+  rm -f "$OUT/meosql_test.$mode" "$OUT/meo_live_chart.$mode"   # a failed build must not leave an old binary to run
   step "build-test-$mode" "$METTLE" $flag --build \
     "$STAGE/tests/meosql_test.mettle" -o "$OUT/meosql_test.$mode"
   step "build-example-$mode" "$METTLE" $flag --build \

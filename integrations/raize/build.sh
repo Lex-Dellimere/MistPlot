@@ -37,6 +37,7 @@ step() { # name, command...
 for mode in debug release; do
   flag=""
   [ "$mode" = release ] && flag="--release"
+  rm -f "$OUT/raize_test.$mode" "$OUT/dashboard.$mode"   # a failed build must not leave an old binary to run
   step "build-test-$mode" "$METTLE" $flag --build \
     integrations/raize/tests/raize_test.mettle -o "$OUT/raize_test.$mode"
   step "build-example-$mode" "$METTLE" $flag --build \
