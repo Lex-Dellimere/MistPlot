@@ -3,7 +3,7 @@
 //! split a line into separate runs. Bar edges are snapped to device pixels (at least one
 //! device pixel for a non-zero value); lines, paths and markers are not snapped. Pixel
 //! coordinates live in the chart's scratch, so steady frames allocate nothing. Uses
-//! chart/frame_layout, data/smooth, scene and core.
+//! chart/layout, data/smooth, scene and core.
 //! @internal
 
 import "std/math";
@@ -15,7 +15,7 @@ import "mistplot/data/smooth";
 import "mistplot/scene/scene";
 import "mistplot/scene/snap";
 import "mistplot/chart/chart";
-import "mistplot/chart/frame_layout";
+import "mistplot/chart/layout";
 
 const MARKS_FILL_TOP: uint8 = 71;   // 0.28 * 255
 const MARKS_FILL_BOT: uint8 = 5;    // 0.02 * 255

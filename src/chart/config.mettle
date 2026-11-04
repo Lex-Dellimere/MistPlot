@@ -6,6 +6,7 @@
 import "std/math";
 import "mistplot/core/error";
 import "mistplot/core/str";
+import "mistplot/core/format";
 import "mistplot/core/color";
 import "mistplot/core/geom";
 import "mistplot/chart/chart";

@@ -1,8 +1,8 @@
 //! The legend: measuring it for the layout and drawing it. Entries are a swatch and the
 //! series name; the swatch is a square for bars, a marker for scatter and a short line
 //! (with the series' marker, if any) otherwise. TOP and BOTTOM wrap into at most three
-//! rows and drop what does not fit; RIGHT is one column. Uses chart/frame_layout and
-//! chart/frame_axis.
+//! rows and drop what does not fit; RIGHT is one column. Uses chart/layout and
+//! chart/axis.
 //! @internal
 
 import "std/math";
@@ -13,8 +13,8 @@ import "mistplot/core/target";
 import "mistplot/scene/scene";
 import "mistplot/scene/snap";
 import "mistplot/chart/chart";
-import "mistplot/chart/frame_layout";
-import "mistplot/chart/frame_axis";
+import "mistplot/chart/layout";
+import "mistplot/chart/axis";
 
 const LEGEND_MAX_ROWS: int32 = 3;
 

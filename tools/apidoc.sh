@@ -11,10 +11,10 @@
 #                                expected output there
 #
 # Inputs: src/**/*.mettle (not *_test.mettle) and integrations/*/mp_*.mettle,
-# in LC_ALL=C order. Files listed in tools/apidoc_legacy.txt still appear in the
-# reference (their plain // comments stand in for docs) but are exempt from the
-# rules. Options for tests: --root DIR (tree to read), --legacy FILE,
-# --out FILE.
+# in LC_ALL=C order. Files listed in an optional tools/apidoc_legacy.txt (absent:
+# none) still appear in the reference (their plain // comments stand in for docs)
+# but are exempt from the rules. Options for tests: --root DIR (tree to read),
+# --legacy FILE, --out FILE.
 
 set -u
 TOOLS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -8,7 +8,7 @@
 # Source rules (src/, cmd/, integrations/, examples/):
 #   1. no exported callback: `export fn <name>_cb(`
 #   2. a fn-pointer parameter is named mp_<thing>_cb (files listed in
-#      tools/apidoc_legacy.txt are exempt until they are rewritten)
+#      the optional tools/apidoc_legacy.txt are exempt until they are rewritten)
 #   3. no by-value Mp* module-scope var under examples/, cmd/, integrations/
 #      (release builds miscompile some of them: keep them behind a pointer)
 #   4. `import "std/thread"` in src/ only under src/sync/

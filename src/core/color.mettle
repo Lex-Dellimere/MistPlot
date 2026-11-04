@@ -26,7 +26,7 @@ export const MP_FONT_STACK: string = "system-ui, -apple-system, Segoe UI, Roboto
 
 /// Chart colours: surfaces, text roles and the series palette.
 ///
-/// @mem Plain value. name is a static literal (or a host-owned string) and is never freed.
+/// @mem Plain value; holds no pointers.
 export struct MpTheme {
   bg: MpColor;                   /// chart background
   title: MpColor;                /// title text
@@ -36,8 +36,6 @@ export struct MpTheme {
   axis: MpColor;                 /// baseline and tick marks
   palette: MpColor[10];          /// series colours; slots >= n_palette are unused
   n_palette: int32;              /// used palette slots, 1 .. MP_PALETTE_MAX
-  name: string;                  /// "light" or "dark"; read by the old chart engine only
-  fg: MpColor;                   /// old chart engine's text colour; use title / text instead
 }
 
 /// An opaque colour.
@@ -224,7 +222,7 @@ fn color_palette(t: MpTheme*) {
 
 /// The light theme: white background, grey-900 title, Observable-10 palette.
 ///
-/// @return The theme (name "light").
+/// @return The theme.
 export fn mp_theme_light() -> MpTheme {
   var t: MpTheme;
   t.bg = mp_hex(0xFFFFFF);
@@ -234,14 +232,12 @@ export fn mp_theme_light() -> MpTheme {
   t.grid = mp_hex(0xE5E7EB);
   t.axis = mp_hex(0x9CA3AF);
   color_palette(&t);
-  t.name = "light";
-  t.fg = mp_rgb(31, 41, 51);
   return t;
 }
 
 /// The dark theme: grey-900 background, near-white title, Observable-10 palette.
 ///
-/// @return The theme (name "dark").
+/// @return The theme.
 export fn mp_theme_dark() -> MpTheme {
   var t: MpTheme;
   t.bg = mp_hex(0x111827);
@@ -251,8 +247,6 @@ export fn mp_theme_dark() -> MpTheme {
   t.grid = mp_hex(0x1F2937);
   t.axis = mp_hex(0x4B5563);
   color_palette(&t);
-  t.name = "dark";
-  t.fg = mp_rgb(249, 250, 251);
   return t;
 }
 
@@ -274,7 +268,6 @@ export fn mp_theme_series(t: MpTheme*, i: int32) -> MpColor {
 }
 
 /// Whether two themes draw identically: every colour role and the used palette slots.
-/// The old-engine fields name and fg are not compared.
 ///
 /// @param a First theme. Valid: non-zero; 0 equals only 0.
 /// @param b Second theme. Valid: non-zero; 0 equals only 0.
@@ -295,59 +288,4 @@ export fn mp_theme_eq(a: MpTheme*, b: MpTheme*) -> bool {
     i = i + 1;
   }
   return true;
-}
-
-/// Old name of mp_rgb.
-///
-/// @param r Red. Valid: 0 .. 255.
-/// @param g Green. Valid: 0 .. 255.
-/// @param b Blue. Valid: 0 .. 255.
-/// @return mp_rgb(r, g, b).
-export fn mp_color(r: uint8, g: uint8, b: uint8) -> MpColor {
-  return mp_rgb(r, g, b);
-}
-
-/// Old name of mp_rgba.
-///
-/// @param r Red. Valid: 0 .. 255.
-/// @param g Green. Valid: 0 .. 255.
-/// @param b Blue. Valid: 0 .. 255.
-/// @param a Alpha. Valid: 0 .. 255.
-/// @return mp_rgba(r, g, b, a).
-export fn mp_color_a(r: uint8, g: uint8, b: uint8, a: uint8) -> MpColor {
-  return mp_rgba(r, g, b, a);
-}
-
-/// Old name of mp_hex.
-///
-/// @param h The colour as 0xRRGGBB. Valid: any; bits above 24 are ignored.
-/// @return mp_hex(h).
-export fn mp_color_from_hex(h: uint32) -> MpColor {
-  return mp_hex(h);
-}
-
-/// Size of the old chart engine's palette (8 Tableau colours); use mp_theme_series.
-///
-/// @return 8.
-export fn mp_palette_size() -> int32 {
-  return 8;
-}
-
-/// Colour i of the old chart engine's palette, repeating every 8; use mp_theme_series.
-///
-/// @param i Series index. Valid: any; negative indices wrap too.
-/// @return The colour.
-export fn mp_palette_color(i: int32) -> MpColor {
-  var k: int32 = i % 8;
-  if (k < 0) { k = k + 8; }
-  switch (k) {
-    case 0: { return mp_rgb(78, 121, 167); }
-    case 1: { return mp_rgb(242, 142, 43); }
-    case 2: { return mp_rgb(225, 87, 89); }
-    case 3: { return mp_rgb(118, 183, 178); }
-    case 4: { return mp_rgb(89, 161, 79); }
-    case 5: { return mp_rgb(237, 201, 72); }
-    case 6: { return mp_rgb(176, 122, 161); }
-    default: { return mp_rgb(255, 157, 167); }
-  }
 }

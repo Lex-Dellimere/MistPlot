@@ -112,11 +112,3 @@ export fn mp_clamp(v: float64, lo: float64, hi: float64) -> float64 {
   if (v > hi && hi >= lo) { return hi; }
   return lo;
 }
-
-/// A value limited to [0, 1].
-///
-/// @param v The value. Valid: any; NaN gives 0.
-/// @return mp_clamp(v, 0, 1).
-export fn mp_clamp01(v: float64) -> float64 {
-  return mp_clamp(v, 0.0, 1.0);
-}

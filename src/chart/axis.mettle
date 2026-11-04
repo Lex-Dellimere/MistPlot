@@ -1,7 +1,7 @@
 //! Axes of one frame: grid lines, the x baseline, x tick marks, tick labels thinned to a
 //! uniform stride, and the axis titles; plus mp_axis_text, the one placement rule for every
 //! text node of a chart. Grid lines, the baseline, tick marks and text baselines are
-//! snapped to device pixels. Uses chart/frame_layout, scene and core.
+//! snapped to device pixels. Uses chart/layout, scene and core.
 //! @internal
 
 import "std/math";
@@ -13,7 +13,7 @@ import "mistplot/core/target";
 import "mistplot/scene/scene";
 import "mistplot/scene/snap";
 import "mistplot/chart/chart";
-import "mistplot/chart/frame_layout";
+import "mistplot/chart/layout";
 
 fn axis_left(x: float64, w: float64, align: int32) -> float64 {
   if (align == MP_ALIGN_CENTER) { return x - w * 0.5; }

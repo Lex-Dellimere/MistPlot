@@ -473,11 +473,16 @@ export fn mp_fmt_u64(v: uint64, out: uint8*, cap: int64) -> string {
   return str_from_bytes((cstring)out, n);
 }
 
-// Format codes; the public names (MP_FMT_*) are declared by the chart layer.
-const FMT_CODE_SI: int32 = 1;
-const FMT_CODE_INT: int32 = 2;
-const FMT_CODE_TIME: int32 = 3;
-const FMT_CODE_TIME_TENTHS: int32 = 4;
+/// Label format: shortest of fixed and scientific (mp_fmt_auto).
+export const MP_FMT_AUTO: int32 = 0;
+/// Label format: SI suffixes, 1.5k, 2M (mp_fmt_si).
+export const MP_FMT_SI: int32 = 1;
+/// Label format: integer, rounded half away from zero.
+export const MP_FMT_INT: int32 = 2;
+/// Label format: seconds as a clock, mm:ss or h:mm:ss; a sub-second tick step shows tenths.
+export const MP_FMT_TIME: int32 = 3;
+/// Label format: seconds as a clock with tenths, mm:ss.t.
+export const MP_FMT_TIME_TENTHS: int32 = 4;
 
 /// One axis or readout label in a chart number format.
 /// Integers round half away from zero; a non-finite or out-of-range value is never cast but
@@ -485,7 +490,7 @@ const FMT_CODE_TIME_TENTHS: int32 = 4;
 ///
 /// @param v The value. Units: data units (seconds for the time formats). Valid: any.
 /// @param fmt Format: 0 auto, 1 SI, 2 integer, 3 clock, 4 clock with tenths (the MP_FMT_*
-///   codes). Valid: 0 .. 4; any other value formats as auto.
+///   codes). Valid: 0 .. 4; any other value formats as auto (MP_FMT_AUTO).
 /// @param out Destination bytes. Valid: non-zero, cap bytes writable.
 /// @param cap Size of out. Units: bytes. Valid: >= 32; smaller gives "".
 /// @return The text, or "" when out is 0 or cap < 32.
@@ -493,14 +498,14 @@ const FMT_CODE_TIME_TENTHS: int32 = 4;
 ///   Nothing is retained.
 /// @thread Safe from any thread (with distinct buffers).
 export fn mp_fmt_value(v: float64, fmt: int32, out: uint8*, cap: int64) -> string {
-  if (fmt == FMT_CODE_INT) {
+  if (fmt == MP_FMT_INT) {
     if (is_finite(v) != 0 && fabs(v) < 1e18) {
       return mp_fmt_int((int64)round(v), out, cap);
     }
     return mp_fmt_auto(v, out, cap);
   }
-  if (fmt == FMT_CODE_SI) { return mp_fmt_si(v, out, cap); }
-  if (fmt == FMT_CODE_TIME) { return mp_fmt_clock(v, out, cap); }
-  if (fmt == FMT_CODE_TIME_TENTHS) { return mp_fmt_clock_tenths(v, out, cap); }
+  if (fmt == MP_FMT_SI) { return mp_fmt_si(v, out, cap); }
+  if (fmt == MP_FMT_TIME) { return mp_fmt_clock(v, out, cap); }
+  if (fmt == MP_FMT_TIME_TENTHS) { return mp_fmt_clock_tenths(v, out, cap); }
   return mp_fmt_auto(v, out, cap);
 }

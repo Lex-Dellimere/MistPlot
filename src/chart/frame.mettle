@@ -6,6 +6,7 @@
 
 import "std/math";
 import "mistplot/core/error";
+import "mistplot/core/format";
 import "mistplot/core/color";
 import "mistplot/core/geom";
 import "mistplot/core/scale";
@@ -15,8 +16,8 @@ import "mistplot/data/summary";
 import "mistplot/scene/scene";
 import "mistplot/chart/chart";
 import "mistplot/chart/view";
-import "mistplot/chart/frame_layout";
-import "mistplot/chart/frame_axis";
+import "mistplot/chart/layout";
+import "mistplot/chart/axis";
 import "mistplot/chart/marks";
 import "mistplot/chart/legend";
 

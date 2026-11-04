@@ -66,7 +66,6 @@ export fn mp_mythic_theme(ui: MythicUi*) -> MpTheme {
   t.muted = mm_color(m->colors.text_secondary);
   t.grid = mm_color(m->colors.border_subtle);
   t.axis = mm_color(m->colors.border_strong);
-  t.fg = t.title;
   return t;
 }
 

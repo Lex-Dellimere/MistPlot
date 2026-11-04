@@ -246,9 +246,6 @@ fn check_color() {
   mp_expect("mix nan", mp_color_eq(mp_color_mix(a, b, NAN()), a));
   check_css("css opaque", mp_hex(0x4269D0), "#4269d0");
   check_css("css alpha", mp_rgba(1, 2, 3, 128), "rgba(1,2,3,0.502)");
-  mp_expect("aliases", mp_color_eq(mp_color(1, 2, 3), mp_rgb(1, 2, 3))
-            && mp_color_eq(mp_color_a(1, 2, 3, 4), mp_rgba(1, 2, 3, 4))
-            && mp_color_eq(mp_color_from_hex(0x010203), mp_rgb(1, 2, 3)));
   mp_expect_i64("font stack", (int64)MP_FONT_STACK.length, (int64)77);
   mp_expect_i64("str no leak in color", mp_alloc_live(), live0);
 }
@@ -283,8 +280,6 @@ fn check_theme() {
   l2.n_palette = 4;
   mp_expect("theme count ne", !mp_theme_eq(&l, &l2));
   mp_expect("theme null", mp_theme_eq(0, 0) && !mp_theme_eq(&l, 0));
-  mp_expect_str("legacy name", d.name, "dark");
-  mp_expect("legacy fg", mp_color_hex(l.fg) == (uint32)0x1F2933);
 }
 
 fn check_geom() {
@@ -293,7 +288,6 @@ fn check_geom() {
   mp_expect_near("clamp high", mp_clamp(9.0, -1.0, 1.0), 1.0, 0.0);
   mp_expect_near("clamp nan", mp_clamp(NAN(), 2.0, 3.0), 2.0, 0.0);
   mp_expect_near("clamp inverted", mp_clamp(9.0, 3.0, 2.0), 3.0, 0.0);
-  mp_expect_near("clamp01", mp_clamp01(1.5), 1.0, 0.0);
   var r: MpRect = mp_rect_shrink(mp_rect(0.0, 0.0, 100.0, 50.0),
                                  mp_insets(1.0, 2.0, 3.0, 4.0));
   mp_expect("shrink", r.x == 4.0 && r.y == 1.0 && r.w == 94.0 && r.h == 46.0);

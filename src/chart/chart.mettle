@@ -10,6 +10,7 @@ import "std/math";
 import "mistplot/core/error";
 import "mistplot/core/mem";
 import "mistplot/core/str";
+import "mistplot/core/format";
 import "mistplot/core/buf";
 import "mistplot/core/color";
 import "mistplot/core/geom";
@@ -46,17 +47,6 @@ export const MP_GRID_NONE: int32 = 1;
 export const MP_GRID_X: int32 = 2;
 /// Grid: both.
 export const MP_GRID_XY: int32 = 3;
-
-/// Label format: shortest of fixed and scientific (mp_fmt_auto).
-export const MP_FMT_AUTO: int32 = 0;
-/// Label format: SI suffixes, 1.5k, 2M (mp_fmt_si).
-export const MP_FMT_SI: int32 = 1;
-/// Label format: integer, rounded half away from zero.
-export const MP_FMT_INT: int32 = 2;
-/// Label format: seconds as a clock, mm:ss or h:mm:ss; a sub-second tick step shows tenths.
-export const MP_FMT_TIME: int32 = 3;
-/// Label format: seconds as a clock with tenths, mm:ss.t.
-export const MP_FMT_TIME_TENTHS: int32 = 4;
 
 /// Most series in one chart.
 export const MP_MAX_SERIES: int32 = 32;
