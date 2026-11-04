@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 400" width="640" height="400" style="max-width:100%;height:auto" role="img" aria-label="Latency vs payload" font-family="system-ui, -apple-system, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif">
+  <rect x="0" y="0" width="640" height="400" fill="#ffffff" class="mp-c-bg"/>
+  <rect x="39" y="63" width="503" height="287" fill="#ffffff" class="mp-c-plot"/>
+  <line x1="39" y1="292.5" x2="542" y2="292.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="235.5" x2="542" y2="235.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="177.5" x2="542" y2="177.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="120.5" x2="542" y2="120.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="63.5" x2="542" y2="63.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="350.5" x2="542" y2="350.5" stroke="#9ca3af" stroke-width="1" class="mp-c-axis"/>
+  <line x1="39.5" y1="350.5" x2="39.5" y2="354.5" stroke="#9ca3af" stroke-width="1" class="mp-c-tick"/>
+  <line x1="139.5" y1="350.5" x2="139.5" y2="354.5" stroke="#9ca3af" stroke-width="1" class="mp-c-tick"/>
+  <line x1="240.5" y1="350.5" x2="240.5" y2="354.5" stroke="#9ca3af" stroke-width="1" class="mp-c-tick"/>
+  <line x1="340.5" y1="350.5" x2="340.5" y2="354.5" stroke="#9ca3af" stroke-width="1" class="mp-c-tick"/>
+  <line x1="441.5" y1="350.5" x2="441.5" y2="354.5" stroke="#9ca3af" stroke-width="1" class="mp-c-tick"/>
+  <line x1="542.5" y1="350.5" x2="542.5" y2="354.5" stroke="#9ca3af" stroke-width="1" class="mp-c-tick"/>
+  <text x="31" y="354" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">0</text>
+  <text x="31" y="296" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">20</text>
+  <text x="31" y="239" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">40</text>
+  <text x="31" y="182" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">60</text>
+  <text x="31" y="124" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">80</text>
+  <text x="31" y="67" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">100</text>
+  <text x="39" y="367" fill="#6b7280" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">0</text>
+  <text x="139.6" y="367" fill="#6b7280" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">20</text>
+  <text x="240.2" y="367" fill="#6b7280" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">40</text>
+  <text x="340.8" y="367" fill="#6b7280" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">60</text>
+  <text x="441.4" y="367" fill="#6b7280" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">80</text>
+  <text x="542" y="367" fill="#6b7280" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">100</text>
+  <text x="290.5" y="385" fill="#374151" font-size="12" text-anchor="middle" class="mp-c-label">payload (KiB)</text>
+  <text x="12" y="45" fill="#374151" font-size="12" class="mp-c-label">ms</text>
+  <circle cx="49.06" cy="318.43" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="312.13" cy="231.76" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="496.73" cy="212.24" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="287.99" cy="240.94" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="338.79" cy="219.42" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="58.62" cy="284.85" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="524.4" cy="207.36" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="390.6" cy="221.42" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="238.19" cy="234.63" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="243.22" cy="233.77" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="538.48" cy="178.66" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="251.27" cy="251.27" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="183.36" cy="270.21" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="378.53" cy="237.21" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="83.26" cy="274.52" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="195.43" cy="285.43" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="271.39" cy="255.86" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="326.72" cy="214.25" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="46.55" cy="286" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <circle cx="190.91" cy="272.8" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-0"/>
+  <rect x="514.86" y="129.32" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="370.5" y="174.37" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="348.37" y="203.07" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="502.29" y="124.44" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="264.87" y="207.38" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="201.49" y="229.77" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="324.73" y="185.57" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="257.33" y="232.35" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="264.37" y="209.96" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="297.06" y="190.16" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="231.67" y="210.25" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="408.23" y="183.56" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="379.56" y="184.42" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="215.07" y="221.73" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="435.39" y="172.65" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="94.35" y="279.7" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="474.62" y="135.63" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="304.11" y="214.55" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="231.67" y="212.55" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <rect x="443.94" y="161.46" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-1"/>
+  <path d="M457.5,96.6 L461.5,100.6 L457.5,104.6 L453.5,100.6 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M304.58,157.73 L308.58,161.73 L304.58,165.73 L300.58,161.73 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M356.39,132.76 L360.39,136.76 L356.39,140.76 L352.39,136.76 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M231.65,195.61 L235.65,199.61 L231.65,203.61 L227.65,199.61 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M453.98,123.86 L457.98,127.86 L453.98,131.86 L449.98,127.86 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M349.35,149.4 L353.35,153.4 L349.35,157.4 L345.35,153.4 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M95.34,266.79 L99.34,270.79 L95.34,274.79 L91.34,270.79 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M486.17,109.23 L490.17,113.23 L486.17,117.23 L482.17,113.23 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M177.83,220.29 L181.83,224.29 L177.83,228.29 L173.83,224.29 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M406.19,133.62 L410.19,137.62 L406.19,141.62 L402.19,137.62 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M129.04,263.92 L133.04,267.92 L129.04,271.92 L125.04,267.92 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M482.14,98.32 L486.14,102.32 L482.14,106.32 L478.14,102.32 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M428.83,108.65 L432.83,112.65 L428.83,116.65 L424.83,112.65 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M84.27,264.78 L88.27,268.78 L84.27,272.78 L80.27,268.78 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M462.53,100.04 L466.53,104.04 L462.53,108.04 L458.53,104.04 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M146.14,229.48 L150.14,233.48 L146.14,237.48 L142.14,233.48 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M239.7,216.85 L243.7,220.85 L239.7,224.85 L235.7,220.85 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M380.03,126.16 L384.03,130.16 L380.03,134.16 L376.03,130.16 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M541.5,87.7 L545.5,91.7 L541.5,95.7 L537.5,91.7 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <path d="M369.97,165.48 L373.97,169.48 L369.97,173.48 L365.97,169.48 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-series mp-s-2"/>
+  <circle cx="558.32" cy="72.2" r="4" fill="#4269d0" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-legend"/>
+  <text x="572.32" y="76" fill="#374151" font-size="12" class="mp-c-legend">eu-west</text>
+  <rect x="554.32" y="86.6" width="8" height="8" fill="#efb118" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-legend"/>
+  <text x="572.32" y="95" fill="#374151" font-size="12" class="mp-c-legend">us-east</text>
+  <path d="M558.32,105 L562.32,109 L558.32,113 L554.32,109 Z" fill="#ff725c" fill-opacity="0.8" stroke="#ffffff" stroke-width="1" class="mp-c-legend"/>
+  <text x="572.32" y="113" fill="#374151" font-size="12" class="mp-c-legend">ap-south</text>
+  <text x="12" y="26" fill="#111827" font-size="15" font-weight="600" class="mp-c-title">Latency vs payload</text>
+</svg>

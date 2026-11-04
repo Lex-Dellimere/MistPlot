@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360" style="max-width:100%;height:auto" role="img" aria-label="CPU" font-family="system-ui, -apple-system, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif">
+  <rect x="0" y="0" width="640" height="360" fill="#ffffff" class="mp-c-bg"/>
+  <rect x="39" y="81" width="583" height="248" fill="#ffffff" class="mp-c-plot"/>
+  <line x1="39" y1="279.5" x2="622" y2="279.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="229.5" x2="622" y2="229.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="180.5" x2="622" y2="180.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="130.5" x2="622" y2="130.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="81.5" x2="622" y2="81.5" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="329.5" x2="622" y2="329.5" stroke="#9ca3af" stroke-width="1" class="mp-c-axis"/>
+  <line x1="48.5" y1="329.5" x2="48.5" y2="333.5" stroke="#9ca3af" stroke-width="1" class="mp-c-tick"/>
+  <line x1="243.5" y1="329.5" x2="243.5" y2="333.5" stroke="#9ca3af" stroke-width="1" class="mp-c-tick"/>
+  <line x1="437.5" y1="329.5" x2="437.5" y2="333.5" stroke="#9ca3af" stroke-width="1" class="mp-c-tick"/>
+  <text x="31" y="333" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">0</text>
+  <text x="31" y="283" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">20</text>
+  <text x="31" y="234" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">40</text>
+  <text x="31" y="184" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">60</text>
+  <text x="31" y="134" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">80</text>
+  <text x="31" y="85" fill="#6b7280" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">100</text>
+  <text x="48.72" y="345" fill="#6b7280" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">01:30</text>
+  <text x="243.05" y="345" fill="#6b7280" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">01:40</text>
+  <text x="437.38" y="345" fill="#6b7280" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">01:50</text>
+  <polyline points="39,136.69 39,136.69 48.72,142.11 58.43,159.73 68.15,179.8 77.87,191.71 87.58,191.16 97.3,183 107.02,177.82 116.73,184.65 126.45,204.68 136.17,230.34 145.88,250.27 155.6,256.98 165.32,251.73 175.03,243.59 184.75,243.14 194.47,255.15 204.18,275.25 213.9,292.81 223.62,298.09 233.33,288.84 243.05,271.78 252.77,258.02 262.48,255.53 272.2,263.73 281.92,273.96 291.63,275.43 301.35,262.62 311.07,239.17 320.78,215.51 330.5,201.87 340.22,201.47 349.93,208.49 359.65,212.11 369.37,204.05 379.08,184.32 388.8,161.32 398.52,146.26 408.23,145.63 417.95,156.86 427.67,170.16 437.38,175.19 447.1,168.16 456.82,154.39 466.53,144.68 476.25,147.95 485.97,165.11 495.68,188.37 505.4,206.45 515.12,212.17 524.83,207.17 534.55,200.73 544.27,203.29 553.98,219.2 563.7,243.68 573.42,265.88 583.13,276.16 592.85,272.51 602.57,261.81 612.28,255.05 622,259.77" fill="none" stroke="#4269d0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" class="mp-c-series mp-s-0"/>
+  <polyline points="39,269.77 39,269.77 48.72,270.94 58.43,272.95 68.15,275.67 77.87,278.93 87.58,282.52 97.3,286.23 107.02,289.83 116.73,293.08 126.45,295.79 136.17,297.79 145.88,298.96 155.6,299.22 165.32,298.55 175.03,297 184.75,294.67 194.47,291.7 204.18,288.26 213.9,284.59 223.62,280.9 233.33,277.43 243.05,274.39 252.77,271.96 262.48,270.31 272.2,269.54 281.92,269.68 291.63,270.74 301.35,272.64 311.07,275.27 320.78,278.47 330.5,282.03 340.22,285.74 349.93,289.36 359.65,292.67 369.37,295.47 379.08,297.57 388.8,298.86 398.52,299.24 408.23,298.69 417.95,297.26 427.67,295.02 437.38,292.12 447.1,288.74 456.82,285.08 466.53,281.38 476.25,277.87 485.97,274.76 495.68,272.24 505.4,270.48 515.12,269.59 524.83,269.61 534.55,270.54 544.27,272.34 553.98,274.89 563.7,278.02 573.42,281.55 583.13,285.25 592.85,288.9 602.57,292.26 612.28,295.13 622,297.34" fill="none" stroke="#efb118" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="8 6" class="mp-c-series mp-s-1"/>
+  <polyline points="12,58 28,58" fill="none" stroke="#4269d0" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" class="mp-c-legend"/>
+  <text x="34" y="62" fill="#374151" font-size="12" class="mp-c-legend">user</text>
+  <polyline points="77.84,58 93.84,58" fill="none" stroke="#efb118" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="8 6" class="mp-c-legend"/>
+  <text x="99.84" y="62" fill="#374151" font-size="12" class="mp-c-legend">system</text>
+  <text x="12" y="26" fill="#111827" font-size="15" font-weight="600" class="mp-c-title">CPU</text>
+  <text x="12" y="41" fill="#6b7280" font-size="12" class="mp-c-title">last 30 s</text>
+</svg>

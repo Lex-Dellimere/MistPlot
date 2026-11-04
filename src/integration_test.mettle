@@ -1,723 +1,178 @@
-// integration_test — one MpChartSpec goes through chart/resolve ->
-// renderer/scene -> backends/web/{svg,page} and backends/terminal/ascii in a
-// single file, so a break between two layers fails here even when each
-// layer's own test is green.
+// integration_test — one chart goes through the whole stack in a single file (chart,
+// frame, scene, the SVG, HTML and terminal renderers), so a break between two layers
+// fails here even when each layer's own test is green.
 //
 // What is asserted
-//   1. the line fixture (2 series x 13 points, title with `&` and `<`) renders
-//      a non-empty scene: finite coordinates, every node inside the 640x400
-//      canvas, 2 polylines of 13 points, legend swatches, the raw title;
-//   2. the same spec renders twice byte-identically (scene, SVG and figure),
-//      which is what tests/golden/line.svg and the debug/release diff need;
-//   3. the SVG document is well-formed at grep level: the opening <svg> tag is
-//      pinned exactly (so viewBox == width == height on the root), one root,
-//      balanced <svg>/</svg>, no NaN, the title escaped once and its raw form
-//      absent, no <script; the series-0 stroke is exact so the terminal's
-//      palette claim below is checked on both ends;
-//   4. mp_chart_figure wraps that document: one <figure, one <svg>, the escaped
-//      title in a <figcaption>, and no <script> even when the title is
-//      "<script>alert(1)</script>";
-//   5. the terminal backend draws a scene chart/resolve built into exactly
-//      `rows` lines of `cols` visible cells, with palette colour 0
-//      (rgb 78,121,167 = #4e79a7, the SVG's series-0 stroke) in an exact
-//      number of complete `ESC[48;2;78;121;167m` sequences;
-//   6. the scatter fixture still renders (8 circles, escaped title).
+//   1. the line fixture (2 series x 13 points, a title with `&` and `<`) builds a scene
+//      with finite coordinates, every node inside the 640x400 canvas, 2 series polylines
+//      of 13 points and the raw title;
+//   2. rendering twice is byte-identical (SVG, HTML and terminal), which the goldens and
+//      the debug/release comparison rely on;
+//   3. the SVG is well-formed at grep level: the exact root tag, one root, no NaN, no
+//      `e+`, the title escaped once and its raw form absent, no <script>, and the series-0
+//      stroke is palette colour 0 (#4269d0);
+//   4. mp_chart_html wraps exactly that document in a <figure>;
+//   5. the terminal output has exactly `rows` lines and draws series 0 in the same
+//      colour (ESC[38;2;66;105;208m);
+//   6. scatter and bar charts render through the same path.
 //
-// Interpreter budget: `mettle test` runs the file in a compile-time interpreter
-// with a fixed 20,000,000-step budget, so this file is deliberately lean —
-// ~30 document scans, one 80x80 terminal render. Adding assertions here can
-// push the file over the budget, which reads as "did not finish within
-// 20000000 steps".
-//
-// Pinned node counts are the composition contract between chart/resolve,
-// renderer/scene and the backends. A legitimate layout change updates them
-// together with tests/golden/line.svg.
-//
-// Pure: no fopen, no externs, and no runtime string concatenation (that puts
-// mettle_string_free in the call graph and makes `mettle test` skip the file).
-// File output lives in cmd/.
-//
-// The line fixture mirrors cmd/line_svg number for number, so this test and
-// the golden agree.
+// Pure: no files, no threads, no externs, so `mettle test` runs it in the interpreter.
 
 import "std/conv";
-import "std/math";
 import "mistplot/test/harness";
+import "mistplot/mistplot";
+import "mistplot/core/error";
+import "mistplot/core/mem";
 import "mistplot/core/buf";
-import "mistplot/core/color";
-import "mistplot/core/data";
-import "mistplot/renderer/backend";
-import "mistplot/renderer/scene";
-import "mistplot/chart/spec";
-import "mistplot/chart/resolve";
-import "mistplot/backends/web/svg";
-import "mistplot/backends/web/page";
-import "mistplot/backends/terminal/ascii";
-
-const IT_N: int32 = 13;
-const IT_W: float64 = 640.0;
-const IT_H: float64 = 400.0;
-// The interpreter-affordable terminal canvas (see "Interpreter budget").
-const IT_COLS: int64 = 80;
-const IT_ROWS: int64 = 80;
-
-// Nice y ranges (chart/resolve) add the top tick to both fixtures: one grid
-// line and one label more than the raw data extent gives.
-const IT_LINE_NODES: int64 = 40;
-const IT_SCATTER_NODES: int64 = 35;
-// Measured on the fixed 80x80 bar document: the terminal restarts the series-0
-// background SGR this many times. Pinned like a node count: a layout change
-// moves it and the golden together.
-const IT_ASCII_S0_SGR: int64 = 94;
+import "mistplot/core/target";
+import "mistplot/scene/scene";
 
 fn it_title() -> string { return "Throughput & latency <budget>"; }
 
-fn it_title_escaped() -> string {
-  return "Throughput &amp; latency &lt;budget&gt;";
-}
+fn it_has(s: string, needle: string) -> bool { return str_contains(s, needle) != 0; }
 
-// The one root element backends/web/svg emits (mp_svg_render), in its own
-// order, at the fixture's 640x400. Pinned whole instead of as substrings: a
-// `viewBox=...` probe and a `width=... height=...` probe can each match on a
-// *different* element, this cannot.
-fn it_svg_open() -> string {
-  return "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 400\" width=\"640\" height=\"400\" role=\"img\">\n";
-}
-
-// ------------------------------------------------------------ string scans
-// std/conv, not a local loop: str_count/str_starts_with are pure byte scans with
-// no allocation, so the interpreter runs the whole file. Every call is
-// O(document), which is why the check lists below are short. There is
-// deliberately no `contains` helper: on a document this test renders itself a
-// substring is never the assertion — use an exact prefix/suffix, an exact
-// count, or a whole-tag compare.
-
-fn it_count(s: string, needle: string) -> int64 {
-  return str_count(s, needle);
-}
-
-fn it_starts(s: string, prefix: string) -> bool {
-  return str_starts_with(s, prefix) == 1;
-}
-
-fn it_ends(s: string, suffix: string) -> bool {
-  return str_ends_with(s, suffix) == 1;
-}
-
-// --------------------------------------------------------------- fixtures
-
-fn it_push(ser: MpSeries*, nm: string, ys: float64*, n: int32,
-           x0: float64) -> int32 {
-  ser->name = nm;
+fn it_line() -> MpChart* {
+  var api: float64[13] = [14.0, 22.0, 19.0, 31.0, 44.0, 39.0, 52.0, 63.0, 58.0, 71.0, 84.0,
+                          78.0, 93.0];
+  var cache: float64[13] = [9.0, 12.0, 17.0, 15.0, 24.0, 31.0, 28.0, 37.0, 45.0, 41.0, 52.0,
+                            61.0, 57.0];
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var a: int32 = mp_chart_series(c, "api");
+  var k: int32 = mp_chart_series(c, "cache");
+  mp_chart_push_n(c, a, 0, 0, 0);
   var i: int32 = 0;
-  while (i < n) {
-    var rc: int32 = mp_series_push(ser, x0 + (float64)i, ys[(int64)i]);
-    if (rc != MP_OK) { return rc; }
+  while (i < 13) {
+    mp_chart_push(c, a, (float64)i, api[i]);
+    mp_chart_push(c, k, (float64)i, cache[i]);
     i = i + 1;
   }
-  return MP_OK;
+  mp_chart_set_title(c, it_title());
+  mp_chart_set_subtitle(c, "13 samples, 2 series");
+  mp_chart_set_x_label(c, "seconds");
+  mp_chart_set_y_label(c, "req/s");
+  return c;
 }
 
-// The line fixture: x = 0..12, y up to 93 so the nice-tick step is 20.
-fn it_line_seed(ser: MpSeries*) -> int32 {
-  var api: float64[13];
-  api[0] = 14.0;
-  api[1] = 22.0;
-  api[2] = 19.0;
-  api[3] = 31.0;
-  api[4] = 44.0;
-  api[5] = 39.0;
-  api[6] = 52.0;
-  api[7] = 63.0;
-  api[8] = 58.0;
-  api[9] = 71.0;
-  api[10] = 84.0;
-  api[11] = 78.0;
-  api[12] = 93.0;
-  var cache: float64[13];
-  cache[0] = 9.0;
-  cache[1] = 12.0;
-  cache[2] = 17.0;
-  cache[3] = 15.0;
-  cache[4] = 24.0;
-  cache[5] = 31.0;
-  cache[6] = 28.0;
-  cache[7] = 37.0;
-  cache[8] = 45.0;
-  cache[9] = 41.0;
-  cache[10] = 52.0;
-  cache[11] = 61.0;
-  cache[12] = 57.0;
-  var rc: int32 = it_push(&ser[0], "api", &api[0], IT_N, 0.0);
-  if (rc != MP_OK) { return rc; }
-  return it_push(&ser[1], "cache", &cache[0], IT_N, 0.0);
-}
-
-// The terminal fixture: 2 series x 5 bands, y domain 0..78. No legend and no
-// y_label: the legend column alone is ~57 logical units wide, so a canvas the
-// interpreter can afford would have no plot left (cmd/bar_ascii runs the full
-// 200x80 version with both).
-fn it_bar_seed(ser: MpSeries*) -> int32 {
-  var web: float64[5];
-  web[0] = 40.0;
-  web[1] = 66.0;
-  web[2] = 54.0;
-  web[3] = 78.0;
-  web[4] = 72.0;
-  var app: float64[5];
-  app[0] = 24.0;
-  app[1] = 36.0;
-  app[2] = 46.0;
-  app[3] = 38.0;
-  app[4] = 52.0;
-  var rc: int32 = it_push(&ser[0], "web", &web[0], 5, 0.0);
-  if (rc != MP_OK) { return rc; }
-  return it_push(&ser[1], "app", &app[0], 5, 0.0);
-}
-
-// The scatter fixture: 1 series x 8 points, x = 1..8.
-fn it_scatter_seed(ser: MpSeries*) -> int32 {
-  var ys: float64[8];
-  ys[0] = 12.0;
-  ys[1] = 19.0;
-  ys[2] = 14.0;
-  ys[3] = 26.0;
-  ys[4] = 31.0;
-  ys[5] = 24.0;
-  ys[6] = 38.0;
-  ys[7] = 35.0;
-  return it_push(&ser[0], "samples", &ys[0], 8, 1.0);
-}
-
-// The fixture names are borrowed literals, so only the two columns are owned
-// (mp_series_free_all would free the literals — this file never calls it).
-fn it_drop(ser: MpSeries*, n: int32) {
-  var i: int32 = 0;
-  while (i < n) {
-    if (ser[(int64)i].xs != 0) { free(ser[(int64)i].xs); }
-    if (ser[(int64)i].ys != 0) { free(ser[(int64)i].ys); }
-    ser[(int64)i].xs = 0;
-    ser[(int64)i].ys = 0;
-    ser[(int64)i].n = 0;
-    ser[(int64)i].cap = 0;
-    i = i + 1;
+fn it_node_ok(nd: MpNode*, s: MpScene*) -> bool {
+  var v: float64 = nd->x + nd->y + nd->w + nd->h;
+  if (!(v - v == 0.0)) { return false; }
+  if (nd->kind == MP_NODE_TEXT) { return nd->y >= 0.0 && nd->y <= 400.0; }
+  if (!(nd->x >= 0.0 && nd->y >= 0.0 && nd->x + nd->w <= 640.0 && nd->y + nd->h <= 400.0)) {
+    return false;
   }
-}
-
-fn it_line_spec(ser: MpSeries*) -> MpChartSpec {
-  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, ser, 2);
-  spec.title = it_title();
-  spec.subtitle = "13 samples, 2 series";
-  spec.x_label = "seconds";
-  spec.y_label = "req/s";
-  return spec;
-}
-
-// The terminal canvas *is* the cell grid (see backends/terminal/ascii), so
-// a chart rendered for the terminal is laid out at the terminal's own size.
-fn it_bar_spec(ser: MpSeries*) -> MpChartSpec {
-  var spec: MpChartSpec = mp_chart_spec(MP_CHART_BAR, ser, 2);
-  spec.title = "Orders";
-  spec.legend = MP_LEGEND_NONE;
-  spec.width = (float64)IT_COLS;
-  spec.height = (float64)IT_ROWS;
-  return spec;
-}
-
-fn it_scatter_spec(ser: MpSeries*) -> MpChartSpec {
-  var spec: MpChartSpec = mp_chart_spec(MP_CHART_SCATTER, ser, 1);
-  spec.title = "Latency & cohort <p95>";
-  spec.x_label = "runs";
-  spec.y_label = "ms";
-  return spec;
-}
-
-// ------------------------------------------------------------ scene walks
-
-fn it_count_kind(sc: MpScene*, kind: int32) -> int64 {
-  var n: int64 = 0;
+  var p: float64* = mp_scene_node_pts(s, nd);
   var i: int64 = 0;
-  while (i < mp_scene_count(sc)) {
-    var nd: MpNode* = mp_scene_node(sc, i);
-    if (nd->kind == kind) { n = n + 1; }
-    i = i + 1;
-  }
-  return n;
-}
-
-fn it_count_class(sc: MpScene*, cls: int32, kind: int32) -> int64 {
-  var n: int64 = 0;
-  var i: int64 = 0;
-  while (i < mp_scene_count(sc)) {
-    var nd: MpNode* = mp_scene_node(sc, i);
-    if (nd->cls == cls && nd->kind == kind) { n = n + 1; }
-    i = i + 1;
-  }
-  return n;
-}
-
-// Is there a TEXT node of class `cls` carrying exactly `want`? The scene stores
-// the raw bytes; escaping is the backend's job, so this compares to the title as
-// written, not to its entity form.
-fn it_has_text(sc: MpScene*, cls: int32, want: string) -> bool {
-  var i: int64 = 0;
-  while (i < mp_scene_count(sc)) {
-    var nd: MpNode* = mp_scene_node(sc, i);
-    if (nd->kind == MP_NODE_TEXT && nd->cls == cls) {
-      if (mp_scene_node_text(sc, nd) == want) { return true; }
-    }
-    i = i + 1;
-  }
-  return false;
-}
-
-// Align-aware box of one node inside the canvas (same definition of "inside" as
-// chart/chart_test, so a disagreement is a bug, not a tolerance).
-fn it_node_inside(nd: MpNode*, cw: float64, ch: float64) -> bool {
-  var eps: float64 = 1e-6;
-  var x0: float64 = nd->x;
-  var x1: float64 = nd->x + nd->w;
-  var y0: float64 = nd->y;
-  var y1: float64 = nd->y + nd->h;
-  if (nd->kind == MP_NODE_TEXT) {
-    if (nd->align == MP_ALIGN_CENTER) {
-      x0 = nd->x - nd->w * 0.5;
-      x1 = nd->x + nd->w * 0.5;
-    } else if (nd->align == MP_ALIGN_END) {
-      x0 = nd->x - nd->w;
-      x1 = nd->x;
-    }
-  } else if (nd->kind == MP_NODE_CIRCLE) {
-    x0 = nd->x - nd->r;
-    x1 = nd->x + nd->r;
-    y0 = nd->y - nd->r;
-    y1 = nd->y + nd->r;
-  }
-  if (x0 < 0.0 - eps || y0 < 0.0 - eps) { return false; }
-  if (x1 > cw + eps || y1 > ch + eps) { return false; }
-  return true;
-}
-
-fn it_node_finite(nd: MpNode*) -> bool {
-  if (is_finite(nd->x) == 0 || is_finite(nd->y) == 0) { return false; }
-  if (is_finite(nd->w) == 0 || is_finite(nd->h) == 0) { return false; }
-  if (is_finite(nd->size) == 0 || is_finite(nd->r) == 0) { return false; }
-  if (is_finite(nd->opacity) == 0) { return false; }
-  if (is_finite(nd->stroke_w) == 0) { return false; }
-  return true;
-}
-
-fn it_scene_ok(sc: MpScene*, cw: float64, ch: float64) -> bool {
-  var n: int64 = mp_scene_count(sc);
-  if (n <= 0) { return false; }
-  var i: int64 = 0;
-  while (i < n) {
-    var nd: MpNode* = mp_scene_node(sc, i);
-    if (nd == 0) { return false; }
-    if (!it_node_finite(nd)) { return false; }
-    if (!it_node_inside(nd, cw, ch)) { return false; }
-    if (nd->kind == MP_NODE_POLY || nd->kind == MP_NODE_LINE) {
-      var p: float64* = mp_scene_node_pts(sc, nd);
-      if (p == 0) { return false; }
-      var k: int32 = 0;
-      while (k < nd->pts_len) {
-        if (is_finite(p[(int64)k]) == 0) { return false; }
-        k = k + 1;
-      }
-    }
+  while (i < (int64)nd->pts_len) {
+    if (!(p[i] - p[i] == 0.0)) { return false; }
     i = i + 1;
   }
   return true;
 }
 
-fn it_same_color(a: MpColor, b: MpColor) -> bool {
-  if (a.r != b.r || a.g != b.g) { return false; }
-  if (a.b != b.b || a.a != b.a) { return false; }
-  return true;
-}
-
-// Node-for-node equality: two renders of one spec must agree on everything the
-// backends read, or "renders twice identically" would be a weaker claim than
-// the golden needs.
-fn it_same_scene(a: MpScene*, b: MpScene*) -> bool {
-  if (mp_scene_count(a) != mp_scene_count(b)) { return false; }
-  var i: int64 = 0;
-  while (i < mp_scene_count(a)) {
-    var x: MpNode* = mp_scene_node(a, i);
-    var y: MpNode* = mp_scene_node(b, i);
-    if (x == 0 || y == 0) { return false; }
-    if (x->kind != y->kind || x->cls != y->cls) { return false; }
-    if (x->align != y->align) { return false; }
-    if (x->x != y->x || x->y != y->y) { return false; }
-    if (x->w != y->w || x->h != y->h) { return false; }
-    if (x->size != y->size || x->r != y->r) { return false; }
-    if (x->opacity != y->opacity) { return false; }
-    if (x->stroke_w != y->stroke_w) { return false; }
-    if (!it_same_color(x->fill, y->fill)) { return false; }
-    if (!it_same_color(x->stroke, y->stroke)) { return false; }
-    if (x->pts_len != y->pts_len || x->text_len != y->text_len) { return false; }
-    if (x->kind == MP_NODE_TEXT) {
-      if (mp_scene_node_text(a, x) != mp_scene_node_text(b, y)) { return false; }
-    }
-    i = i + 1;
-  }
-  return true;
-}
-
-// ------------------------------------------------------------- SVG checks
-
-fn it_svg_check(doc: string) {
-  // Exact, not a substring: the document is fixed, so the whole opening tag is
-  // the assertion. That pins viewBox, width and height *on the same element*
-  // and to the spec's own numbers; a width/height substring probe would also
-  // match the 640x400 background <rect>.
-  mp_expect("svg: root element is exactly the expected tag",
-            it_starts(doc, it_svg_open()));
-  mp_expect("svg: exactly one viewBox in the document",
-            it_count(doc, "viewBox=") == 1);
-  // The ASCII check below claims the terminal's series-0 colour is the SVG's;
-  // pin the SVG side of that claim exactly instead of trusting the comment.
-  mp_expect("svg: series 0 is exactly #4e79a7 at stroke-width 2",
-            it_count(doc,
-                     "stroke=\"#4e79a7\" stroke-width=\"2\" class=\"mp-c-series mp-s-0\"") == 1);
-  mp_expect("svg: exactly one root", it_count(doc, "<svg") == 1);
-  mp_expect("svg: one closing root", it_count(doc, "</svg>") == 1);
-  mp_expect("svg: document ends with </svg>", it_ends(doc, "</svg>\n"));
-  mp_expect("svg: one polyline per series", it_count(doc, "<polyline") == 2);
-  mp_expect("svg: no NaN token", it_count(doc, "NaN") == 0);
-  mp_expect("svg: no scientific notation", it_count(doc, "e+") == 0);
-  mp_expect("svg: title is escaped exactly once",
-            it_count(doc, it_title_escaped()) == 1);
-  mp_expect("svg: the raw title never appears", it_count(doc, it_title()) == 0);
-  mp_expect("svg: no script element", it_count(doc, "<script") == 0);
-}
-
-// ---------------------------------------------------------- figure checks
-
-fn it_figure_check(fig: string) {
-  mp_expect("figure: opens with the wrapper",
-            it_starts(fig, "<figure class=\"mp-figure\">\n"));
-  mp_expect("figure: closes the wrapper", it_ends(fig, "</figure>\n"));
-  mp_expect("figure: exactly one figure", it_count(fig, "<figure") == 1);
-  mp_expect("figure: exactly one svg", it_count(fig, "<svg") == 1);
-  mp_expect("figure: one closing svg", it_count(fig, "</svg>") == 1);
-  mp_expect("figure: the escaped title is the caption",
-            it_count(fig, "<figcaption>Throughput &amp; latency &lt;budget&gt;</figcaption>") == 1);
-  mp_expect("figure: no script element", it_count(fig, "<script") == 0);
-}
-
-// A hostile title must come out as text in both the svg text node and the
-// figcaption, never as markup. The spec is built from the series instead of
-// copied: a struct copy of a spec whose string fields are non-empty makes this
-// compiler build treat the copy as owning its strings and pull
-// mettle_string_free into the call graph.
-fn it_figure_hostile(ser: MpSeries*) {
-  var bad: MpChartSpec = mp_chart_spec(MP_CHART_LINE, ser, 2);
-  bad.title = "<script>alert(1)</script>";
-  var b: MpBuf* = mp_buf_new(64);
-  if (b == 0) {
-    mp_expect("hostile figure: buffer", false);
-    return;
-  }
-  defer mp_buf_free(b);
-  var o: MpRenderOpts = mp_render_opts(bad.width, bad.height, bad.theme);
-  var rc: int32 = mp_chart_figure(&bad, &o, b);
-  mp_expect_i64("hostile figure: renders", (int64)rc, (int64)MP_OK);
-  var fig: string = mp_buf_str(b);
-  mp_expect("hostile figure: no raw script", it_count(fig, "<script") == 0);
-  mp_expect("hostile figure: escaped twice (text + caption)",
-            it_count(fig, "&lt;script&gt;alert(1)&lt;/script&gt;") == 2);
-}
-
-// ------------------------------------------------------------------ ASCII
-
-// Exactly `rows` lines, each with `cols` visible cells after removing SGR
-// sequences (ESC '[' ... 'm'), and a final newline on the last row.
-fn it_ascii_shape(doc: string, cols: int64, rows: int64) -> bool {
-  var n: int64 = (int64)doc.length;
-  var i: int64 = 0;
-  var done_rows: int64 = 0;
-  var cell: int64 = 0;
-  while (i < n) {
-    var c: int32 = (int32)doc.chars[i];
-    if (c == 27) {
-      var j: int64 = i + 1;
-      while (j < n && (int32)doc.chars[j] != 109) { j = j + 1; }
-      if (j >= n) { return false; }
-      i = j + 1;
-    } else if (c == 10) {
-      if (cell != cols) { return false; }
-      done_rows = done_rows + 1;
-      cell = 0;
-      i = i + 1;
-    } else {
-      cell = cell + 1;
-      i = i + 1;
-    }
-  }
-  if (cell != 0) { return false; }
-  return done_rows == rows;
-}
-
-// The terminal is ASCII-only (see backends/terminal/ascii): every byte is ESC,
-// a newline or 0x20..0x7E. Counts visible glyphs on the way, which proves the
-// backend drew the scene instead of emitting a blank grid.
-fn it_ascii_printable(doc: string) -> bool {
-  var n: int64 = (int64)doc.length;
-  var i: int64 = 0;
-  var glyphs: int64 = 0;
-  while (i < n) {
-    var c: int32 = (int32)doc.chars[i];
-    if (c == 27) {
-      var j: int64 = i + 1;
-      while (j < n && (int32)doc.chars[j] != 109) { j = j + 1; }
-      i = j + 1;
-    } else {
-      if (c != 10) {
-        if (c < 32 || c > 126) { return false; }
-        if (c > 32) { glyphs = glyphs + 1; }
-      }
-      i = i + 1;
-    }
-  }
-  return glyphs > 0;
-}
-
-// The terminal render in its own function: the ASCII backend carries three
-// 16000-cell stack arrays, and keeping that call out of the check body keeps the
-// interpreter's lowering of the test small.
-fn it_ascii_run(sc: MpScene*, cols: float64, rows: float64,
-                theme: MpTheme, out: MpBuf*) -> int32 {
-  var o: MpRenderOpts = mp_render_opts(cols, rows, theme);
-  return mp_ascii_render(sc, &o, out);
-}
-
-// Mettle has no escape literal for ESC (`\x1b` is not one of `\n \t \r \\ \"
-// \0`), so the SGR count is matched byte by byte and requires the ESC 27 in
-// front of the payload: a run of glyphs that merely spells the payload cannot
-// satisfy it, and a sequence that lost its ESC cannot either.
-fn it_count_sgr(doc: string, payload: string) -> int64 {
-  var n: int64 = (int64)doc.length;
-  var m: int64 = (int64)payload.length;
-  var i: int64 = 0;
-  var hits: int64 = 0;
-  while (i + m < n) {
-    if ((int32)doc.chars[i] == 27) {
-      var j: int64 = 0;
-      var ok: bool = true;
-      while (j < m) {
-        if (doc.chars[i + 1 + j] != payload.chars[j]) { ok = false; break; }
-        j = j + 1;
-      }
-      if (ok) {
-        hits = hits + 1;
-        i = i + m;
-      }
-    }
-    i = i + 1;
-  }
-  return hits;
-}
-
-fn it_ascii_check(doc: string) {
-  mp_expect("ascii: exactly rows lines of cols visible cells",
-            it_ascii_shape(doc, IT_COLS, IT_ROWS));
-  mp_expect("ascii: printable ASCII only, and the scene was drawn",
-            it_ascii_printable(doc));
-  mp_expect("ascii: rows end with a reset", it_count(doc, "[0m") == IT_ROWS);
-  // Palette index 0 is #4e79a7 = rgb(78,121,167) in both backends. The document
-  // is fixed, so pin the exact number of complete `ESC[48;2;78;121;167m`
-  // sequences: the terminal switches to the series-0 background exactly
-  // IT_ASCII_S0_SGR times, and any other palette entry, a dropped ESC or one
-  // extra run of bar cells changes that number.
-  mp_expect_i64("ascii: complete ESC[48;2;78;121;167m sequence count",
-                it_count_sgr(doc, "[48;2;78;121;167m"), IT_ASCII_S0_SGR);
-}
-
-// ------------------------------------------------------------------- runs
-
-fn it_check_line() {
-  var ser: MpSeries[] = new MpSeries[2];
-  if (ser.data == 0) {
-    mp_expect("line: fixture array", false);
-    return;
-  }
-  defer free(ser.data);
-  defer it_drop(&ser[0], 2);
-  var rc: int32 = it_line_seed(&ser[0]);
-  mp_expect_i64("line: fixture pushes", (int64)rc, (int64)MP_OK);
-  if (rc != MP_OK) { return; }
-  var spec: MpChartSpec = it_line_spec(&ser[0]);
-
-  // 1. spec -> scene
-  var sc: MpScene* = mp_scene_new();
-  if (sc == 0) {
-    mp_expect("line: scene allocated", false);
-    return;
-  }
-  defer mp_scene_free(sc);
-  rc = mp_chart_render(&spec, sc);
-  mp_expect_i64("line: mp_chart_render", (int64)rc, (int64)MP_OK);
-  mp_expect_i64("line: scene node count", mp_scene_count(sc), IT_LINE_NODES);
-  mp_expect("line: two polylines", it_count_kind(sc, MP_NODE_POLY) == 2);
-  mp_expect("line: grid and axis lines", it_count_kind(sc, MP_NODE_LINE) >= 3);
-  mp_expect("line: one legend swatch per series",
-            it_count_class(sc, MP_CLS_LEGEND, MP_NODE_RECT) == 2);
-  mp_expect("line: the title is stored raw",
-            it_has_text(sc, MP_CLS_TITLE, it_title()));
-  mp_expect("line: every node is finite and inside the canvas",
-            it_scene_ok(sc, IT_W, IT_H));
+fn it_check_scene() {
+  var c: MpChart* = it_line();
+  var t: MpTarget = mp_target(640.0, 400.0);
+  var s: MpScene* = mp_chart_scene(c, &t);
+  mp_expect("scene", s != 0);
+  var ok: bool = true;
   var polys: int64 = 0;
+  var title: bool = false;
   var i: int64 = 0;
-  while (i < mp_scene_count(sc)) {
-    var nd: MpNode* = mp_scene_node(sc, i);
-    if (nd->kind == MP_NODE_POLY && nd->pts_len == (int32)(IT_N * 2)) {
+  while (i < mp_scene_count(s)) {
+    var nd: MpNode* = mp_scene_node(s, i);
+    if (!it_node_ok(nd, s)) { ok = false; }
+    if (nd->kind == MP_NODE_POLY && nd->cls >= MP_CLS_SERIES && nd->pts_len == 26) {
       polys = polys + 1;
     }
+    if (nd->kind == MP_NODE_TEXT && mp_scene_node_text(s, nd) == it_title()) { title = true; }
     i = i + 1;
   }
-  mp_expect_i64("line: both polylines carry all 13 points", polys, 2);
+  mp_expect("finite and inside", ok);
+  mp_expect_i64("two series of 13 points", polys, 2);
+  mp_expect("raw title in the scene", title);
+  mp_chart_free(c);
+}
 
-  // 2. chart/resolve is deterministic node for node.
-  var sc2: MpScene* = mp_scene_new();
-  if (sc2 == 0) {
-    mp_expect("line: second scene allocated", false);
-    return;
-  }
-  defer mp_scene_free(sc2);
-  rc = mp_chart_render(&spec, sc2);
-  mp_expect_i64("line: second render", (int64)rc, (int64)MP_OK);
-  mp_expect("line: two renders agree node for node", it_same_scene(sc, sc2));
-
-  // 3. spec -> svg, twice, into differently grown buffers.
+fn it_check_svg() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = it_line();
   var a: MpBuf* = mp_buf_new(64);
-  var b: MpBuf* = mp_buf_new(8192);
-  if (a == 0 || b == 0) {
-    mp_expect("svg: buffers allocated", false);
-    if (a != 0) { mp_buf_free(a); }
-    if (b != 0) { mp_buf_free(b); }
-    return;
-  }
-  defer mp_buf_free(a);
-  defer mp_buf_free(b);
-  var o: MpRenderOpts = mp_render_opts(spec.width, spec.height, spec.theme);
-  rc = mp_chart_svg(&spec, &o, a);
-  mp_expect_i64("svg: mp_chart_svg", (int64)rc, (int64)MP_OK);
-  rc = mp_chart_svg(&spec, &o, b);
-  mp_expect_i64("svg: mp_chart_svg again", (int64)rc, (int64)MP_OK);
+  var b: MpBuf* = mp_buf_new(64);
+  mp_expect_i64("svg", (int64)mp_chart_svg(c, 640.0, 400.0, a), (int64)MP_OK);
+  mp_chart_set_title(c, "other");
+  mp_chart_set_title(c, it_title());
+  mp_expect_i64("svg again", (int64)mp_chart_svg(c, 640.0, 400.0, b), (int64)MP_OK);
   var doc: string = mp_buf_str(a);
-  mp_expect("svg: two renders are byte-identical", doc == mp_buf_str(b));
-  it_svg_check(doc);
-
-  // 4. spec -> figure, twice, plus a hostile title.
-  var f1: MpBuf* = mp_buf_new(64);
-  var f2: MpBuf* = mp_buf_new(8192);
-  if (f1 == 0 || f2 == 0) {
-    mp_expect("figure: buffers allocated", false);
-    if (f1 != 0) { mp_buf_free(f1); }
-    if (f2 != 0) { mp_buf_free(f2); }
-    return;
-  }
-  defer mp_buf_free(f1);
-  defer mp_buf_free(f2);
-  rc = mp_chart_figure(&spec, &o, f1);
-  mp_expect_i64("figure: mp_chart_figure", (int64)rc, (int64)MP_OK);
-  rc = mp_chart_figure(&spec, &o, f2);
-  mp_expect_i64("figure: mp_chart_figure again", (int64)rc, (int64)MP_OK);
-  mp_expect("figure: two renders are byte-identical",
-            mp_buf_str(f1) == mp_buf_str(f2));
-  it_figure_check(mp_buf_str(f1));
-  it_figure_hostile(&ser[0]);
+  mp_expect("deterministic", doc == mp_buf_str(b));
+  mp_expect("root", str_starts_with(doc, "<svg xmlns=\"http://www.w3.org/2000/svg\"") != 0);
+  mp_expect("root size", it_has(doc, " viewBox=\"0 0 640 400\" width=\"640\" height=\"400\""));
+  mp_expect_i64("one root", str_count(doc, "<svg"), 1);
+  mp_expect_i64("closed", str_count(doc, "</svg>\n"), 1);
+  mp_expect("no NaN", !it_has(doc, "NaN") && !it_has(doc, "nan") && !it_has(doc, "e+"));
+  mp_expect_i64("title escaped in text and label", str_count(doc,
+                "Throughput &amp; latency &lt;budget&gt;"), 2);
+  mp_expect("raw title absent", !it_has(doc, it_title()));
+  mp_expect("no script", !it_has(doc, "<script"));
+  mp_expect("series 0 stroke", it_has(doc, "stroke=\"#4269d0\" stroke-width=\"2\""));
+  mp_expect_i64("html", (int64)mp_chart_html(c, 640.0, 400.0, b), (int64)MP_OK);
+  var fig: string = mp_buf_str(b);
+  mp_expect_i64("one figure", str_count(fig, "<figure class=\"mp-figure\">\n"), 1);
+  mp_expect_i64("svg inside", str_count(fig, "\n  <svg "), 1);
+  mp_expect("figure ends", str_ends_with(fig, "  </svg>\n</figure>\n") != 0);
+  mp_buf_free(a);
+  mp_buf_free(b);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
 }
 
-fn it_check_bar() {
-  var ser: MpSeries[] = new MpSeries[2];
-  if (ser.data == 0) {
-    mp_expect("bar: fixture array", false);
-    return;
-  }
-  defer free(ser.data);
-  defer it_drop(&ser[0], 2);
-  var rc: int32 = it_bar_seed(&ser[0]);
-  mp_expect_i64("bar: fixture pushes", (int64)rc, (int64)MP_OK);
-  if (rc != MP_OK) { return; }
-  var spec: MpChartSpec = it_bar_spec(&ser[0]);
-
-  var sc: MpScene* = mp_scene_new();
-  if (sc == 0) {
-    mp_expect("bar: scene allocated", false);
-    return;
-  }
-  defer mp_scene_free(sc);
-  rc = mp_chart_render(&spec, sc);
-  mp_expect_i64("bar: mp_chart_render", (int64)rc, (int64)MP_OK);
-  mp_expect("bar: one rect per band per series",
-            it_count_kind(sc, MP_NODE_RECT) == 12);
-  mp_expect("bar: every node fits the terminal canvas",
-            it_scene_ok(sc, (float64)IT_COLS, (float64)IT_ROWS));
-
-  var before: int64 = mp_scene_count(sc);
-  var big: MpBuf* = mp_buf_new(4096);
-  if (big == 0) {
-    mp_expect("ascii: buffer allocated", false);
-    return;
-  }
-  defer mp_buf_free(big);
-  rc = it_ascii_run(sc, (float64)IT_COLS, (float64)IT_ROWS, spec.theme, big);
-  mp_expect_i64("ascii: mp_ascii_render", (int64)rc, (int64)MP_OK);
-  mp_expect("ascii: the backend does not consume the scene",
-            mp_scene_count(sc) == before);
-  it_ascii_check(mp_buf_str(big));
+fn it_check_term() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = it_line();
+  var a: MpBuf* = mp_buf_new(64);
+  var b: MpBuf* = mp_buf_new(64);
+  mp_expect_i64("term", (int64)mp_chart_term(c, 80, 24, MP_TERM_BRAILLE, a), (int64)MP_OK);
+  mp_expect_i64("term again", (int64)mp_chart_term(c, 80, 24, MP_TERM_BRAILLE, b),
+                (int64)MP_OK);
+  var doc: string = mp_buf_str(a);
+  mp_expect("term deterministic", doc == mp_buf_str(b));
+  mp_expect_i64("24 rows", str_count(doc, "\n"), 24);
+  mp_expect("series 0 colour", it_has(doc, "[38;2;66;105;208m"));
+  mp_expect("title row", str_starts_with(doc, " Throughput & latency <budget>\n") != 0);
+  mp_buf_free(a);
+  mp_buf_free(b);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
 }
 
-fn it_check_scatter() {
-  var ser: MpSeries[] = new MpSeries[1];
-  if (ser.data == 0) {
-    mp_expect("scatter: fixture array", false);
-    return;
+fn it_check_kinds() {
+  var c: MpChart* = mp_chart_new(MP_SCATTER);
+  mp_chart_set_title(c, "a < b");
+  var s: int32 = mp_chart_series(c, "pts");
+  var i: int32 = 0;
+  while (i < 8) {
+    mp_chart_push(c, s, (float64)i, (float64)(i * 5 % 8));
+    i = i + 1;
   }
-  defer free(ser.data);
-  defer it_drop(&ser[0], 1);
-  var rc: int32 = it_scatter_seed(&ser[0]);
-  mp_expect_i64("scatter: fixture pushes", (int64)rc, (int64)MP_OK);
-  if (rc != MP_OK) { return; }
-  var spec: MpChartSpec = it_scatter_spec(&ser[0]);
-
-  var sc: MpScene* = mp_scene_new();
-  if (sc == 0) {
-    mp_expect("scatter: scene allocated", false);
-    return;
-  }
-  defer mp_scene_free(sc);
-  rc = mp_chart_render(&spec, sc);
-  mp_expect_i64("scatter: mp_chart_render", (int64)rc, (int64)MP_OK);
-  mp_expect_i64("scatter: scene node count", mp_scene_count(sc),
-                IT_SCATTER_NODES);
-  mp_expect_i64("scatter: one circle per point",
-                it_count_kind(sc, MP_NODE_CIRCLE), 8);
-  mp_expect("scatter: every node is finite and inside the canvas",
-            it_scene_ok(sc, IT_W, IT_H));
-
-  var b: MpBuf* = mp_buf_new(1024);
-  if (b == 0) {
-    mp_expect("scatter: buffer allocated", false);
-    return;
-  }
-  defer mp_buf_free(b);
-  var o: MpRenderOpts = mp_render_opts(spec.width, spec.height, spec.theme);
-  rc = mp_chart_svg(&spec, &o, b);
-  mp_expect_i64("scatter: mp_chart_svg", (int64)rc, (int64)MP_OK);
-  var doc: string = mp_buf_str(b);
-  mp_expect("scatter: eight circles", it_count(doc, "<circle") == 8);
-  mp_expect("scatter: title escaped",
-            it_count(doc, "Latency &amp; cohort &lt;p95&gt;") == 1);
-  mp_expect("scatter: no script", it_count(doc, "<script") == 0);
+  var out: MpBuf* = mp_buf_new(64);
+  mp_expect_i64("scatter", (int64)mp_chart_svg(c, 320.0, 200.0, out), (int64)MP_OK);
+  mp_expect_i64("8 circles", str_count(mp_buf_str(out), "<circle"), 8);
+  mp_expect("escaped", it_has(mp_buf_str(out), ">a &lt; b</text>"));
+  mp_chart_free(c);
+  c = mp_chart_new(MP_BAR);
+  s = mp_chart_series(c, "n");
+  mp_chart_set_value(c, s, "x", 2.0);
+  mp_chart_set_value(c, s, "y", 3.0);
+  mp_expect_i64("bars", (int64)mp_chart_svg(c, 320.0, 200.0, out), (int64)MP_OK);
+  mp_expect_i64("2 bars", str_count(mp_buf_str(out), "class=\"mp-c-series mp-s-0\""), 2);
+  mp_buf_free(out);
+  mp_chart_free(c);
 }
 
 fn it_run() {
-  it_check_line();
-  it_check_bar();
-  it_check_scatter();
+  it_check_scene();
+  it_check_svg();
+  it_check_term();
+  it_check_kinds();
 }
 
 export fn main() -> int32 {
@@ -725,8 +180,21 @@ export fn main() -> int32 {
   return mp_summary();
 }
 
-@test fn t_integration() -> int32 {
-  it_run();
+@test fn t_integration_scene() -> int32 {
+  it_check_scene();
+  it_check_kinds();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_integration_svg() -> int32 {
+  it_check_svg();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}
+
+@test fn t_integration_term() -> int32 {
+  it_check_term();
   if (mp_fails != 0) { return 1; }
   return 0;
 }

@@ -2,66 +2,194 @@
 //
 //   golden <fixture>        e.g. `golden line` prints tests/golden/line.svg
 //
-// tools/golden.sh builds this in debug and release and byte-compares every
-// file in tests/golden/ with the output of the fixture named by its stem, so
-// the goldens are enforced instead of documentary. Unknown fixture: exit 2.
+// tools/golden.sh builds this in debug and release and byte-compares every file in
+// tests/golden/ with the output of the fixture named by its stem. Every fixture is
+// deterministic: fixed data (a small LCG where noise is wanted), no clock. Unknown
+// fixture: exit 2.
 
 import "std/io";
-import "std/mem";
 import "std/conv";
+import "std/math";
 import "mistplot/core/buf";
 import "mistplot/core/color";
-import "mistplot/core/data";
-import "mistplot/renderer/backend";
-import "mistplot/chart/spec";
-import "mistplot/backends/web/page";
+import "mistplot/core/target";
+import "mistplot/mistplot";
 
-fn push(ser: MpSeries*, ys: float64*) {
-  var i: int32 = 0;
-  while (i < 13) { mp_series_push(ser, (float64)i, ys[(int64)i]); i = i + 1; }
-}
-
-// The names are literals, so only the columns are freed.
-fn drop(ser: MpSeries*) {
-  if (ser->xs != 0) { free(ser->xs); }
-  if (ser->ys != 0) { free(ser->ys); }
-}
-
-// Two series of 13 points, a title with `&` and `<`, both axis titles: the
-// chart src/integration_test.mettle renders.
-fn fixture_line() -> int32 {
-  var api: float64[13] = [14.0, 22.0, 19.0, 31.0, 44.0, 39.0, 52.0, 63.0, 58.0,
-                          71.0, 84.0, 78.0, 93.0];
-  var cache: float64[13] = [9.0, 12.0, 17.0, 15.0, 24.0, 31.0, 28.0, 37.0, 45.0,
-                            41.0, 52.0, 61.0, 57.0];
-  var ser: MpSeries[] = new MpSeries[2];
-  ser[0].name = "api"; ser[0].xs = 0; ser[0].ys = 0; ser[0].n = 0; ser[0].cap = 0;
-  ser[1].name = "cache"; ser[1].xs = 0; ser[1].ys = 0; ser[1].n = 0; ser[1].cap = 0;
-  defer free(ser.data);
-  push(&ser[0], &api[0]);
-  push(&ser[1], &cache[0]);
-  defer drop(&ser[0]);
-  defer drop(&ser[1]);
-  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, &ser[0], 2);
-  spec.title = "Throughput & latency <budget>";
-  spec.subtitle = "13 samples, 2 series";
-  spec.x_label = "seconds";
-  spec.y_label = "req/s";
-  var o: MpRenderOpts = mp_render_opts(640.0, 400.0, spec.theme);
-  var b: MpBuf* = mp_buf_new(8192);
-  if (b == 0) { return 1; }
-  defer mp_buf_free(b);
-  if (mp_chart_svg(&spec, &o, b) != MP_OK) { return 1; }
-  var s: string = mp_buf_str(b);
-  print("{s}");
+fn emit(rc: int32, b: MpBuf*) -> int32 {
+  if (rc != MP_OK) {
+    print_err("golden: render failed\n");
+    return 1;
+  }
+  print(mp_buf_str(b));
   return 0;
+}
+
+fn svg(c: MpChart*, w: float64, h: float64) -> int32 {
+  var b: MpBuf* = mp_buf_new(16384);
+  var rc: int32 = mp_chart_svg(c, w, h, b);
+  if (mp_chart_error(c) != MP_OK) { rc = mp_chart_error(c); }
+  var r: int32 = emit(rc, b);
+  mp_buf_free(b);
+  mp_chart_free(c);
+  return r;
+}
+
+fn term(c: MpChart*, cols: int32, rows: int32, mode: int32) -> int32 {
+  var b: MpBuf* = mp_buf_new(16384);
+  var rc: int32 = mp_chart_term(c, cols, rows, mode, b);
+  if (mp_chart_error(c) != MP_OK) { rc = mp_chart_error(c); }
+  var r: int32 = emit(rc, b);
+  mp_buf_free(b);
+  mp_chart_free(c);
+  return r;
+}
+
+// Two series of 13 points, a title with `&` and `<`, both axis titles.
+fn chart_line() -> MpChart* {
+  var api: float64[13] = [14.0, 22.0, 19.0, 31.0, 44.0, 39.0, 52.0, 63.0, 58.0, 71.0, 84.0,
+                          78.0, 93.0];
+  var cache: float64[13] = [9.0, 12.0, 17.0, 15.0, 24.0, 31.0, 28.0, 37.0, 45.0, 41.0, 52.0,
+                            61.0, 57.0];
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var a: int32 = mp_chart_series(c, "api");
+  var k: int32 = mp_chart_series(c, "cache");
+  var i: int32 = 0;
+  while (i < 13) {
+    mp_chart_push(c, a, (float64)i, api[i]);
+    mp_chart_push(c, k, (float64)i, cache[i]);
+    i = i + 1;
+  }
+  mp_chart_set_title(c, "Throughput & latency <budget>");
+  mp_chart_set_subtitle(c, "13 samples, 2 series");
+  mp_chart_set_x_label(c, "seconds");
+  mp_chart_set_y_label(c, "req/s");
+  return c;
+}
+
+fn fixture_area_smooth() -> int32 {
+  var c: MpChart* = mp_chart_new(MP_AREA);
+  mp_chart_set_title(c, "Memory in use");
+  mp_chart_set_subtitle(c, "smoothed, 24 samples");
+  mp_chart_set_y_label(c, "MiB");
+  var s: int32 = mp_chart_series(c, "heap");
+  mp_series_set_smooth(c, s, true);
+  var i: int32 = 0;
+  while (i < 24) {
+    var t: float64 = (float64)i;
+    mp_chart_push(c, s, t, 180.0 + 60.0 * sin(t * 0.45) + 4.0 * t);
+    i = i + 1;
+  }
+  return svg(c, 640.0, 360.0);
+}
+
+fn chart_bars() -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_BAR);
+  mp_chart_set_title(c, "Requests by region");
+  mp_chart_set_y_format(c, MP_FMT_SI);
+  var a: int32 = mp_chart_series(c, "2025");
+  var b: int32 = mp_chart_series(c, "2026");
+  mp_chart_set_value(c, a, "north", 42000.0);
+  mp_chart_set_value(c, a, "south", 31000.0);
+  mp_chart_set_value(c, a, "east", 51500.0);
+  mp_chart_set_value(c, a, "west", 27250.0);
+  mp_chart_set_value(c, b, "north", 47800.0);
+  mp_chart_set_value(c, b, "south", 29900.0);
+  mp_chart_set_value(c, b, "east", 60100.0);
+  mp_chart_set_value(c, b, "west", 33000.0);
+  return c;
+}
+
+fn fixture_bar_dark() -> int32 {
+  var c: MpChart* = chart_bars();
+  mp_chart_set_theme(c, mp_theme_dark());
+  return svg(c, 640.0, 400.0);
+}
+
+fn lcg(state: uint32*) -> float64 {
+  *state = *state * (uint32)1664525 + (uint32)1013904223;
+  return (float64)(*state >> 8) / 16777216.0;
+}
+
+fn fixture_scatter_markers() -> int32 {
+  var c: MpChart* = mp_chart_new(MP_SCATTER);
+  mp_chart_set_title(c, "Latency vs payload");
+  mp_chart_set_x_label(c, "payload (KiB)");
+  mp_chart_set_y_label(c, "ms");
+  mp_chart_set_legend(c, MP_LEGEND_RIGHT);
+  var seed: uint32 = (uint32)12345;
+  var shapes: int32[3] = [MP_MARK_CIRCLE, MP_MARK_SQUARE, MP_MARK_DIAMOND];
+  var names: string[3] = ["eu-west", "us-east", "ap-south"];
+  var k: int32 = 0;
+  while (k < 3) {
+    var s: int32 = mp_chart_series(c, names[k]);
+    mp_series_set_marker(c, s, shapes[k], 4.0);
+    var i: int32 = 0;
+    while (i < 20) {
+      var x: float64 = lcg(&seed) * 100.0;
+      var y: float64 = 10.0 + x * (0.4 + 0.2 * (float64)k) + lcg(&seed) * 15.0;
+      mp_chart_push(c, s, floor(x * 10.0) / 10.0, floor(y * 10.0) / 10.0);
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+  return svg(c, 640.0, 400.0);
+}
+
+// 120 s of two signals at 2 Hz, a 30 s window over a 600-sample ring.
+fn chart_live() -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_set_title(c, "CPU");
+  mp_chart_set_subtitle(c, "last 30 s");
+  mp_chart_set_x_format(c, MP_FMT_TIME);
+  mp_chart_set_y_range(c, 0.0, 100.0);
+  mp_chart_keep(c, 600);
+  mp_chart_window(c, 30.0);
+  var u: int32 = mp_chart_series(c, "user");
+  var y: int32 = mp_chart_series(c, "system");
+  mp_series_set_dash(c, y, MP_DASH_DASHED);
+  var i: int32 = 0;
+  while (i < 240) {
+    var t: float64 = (float64)i * 0.5;
+    mp_chart_push(c, u, t, 45.0 + 25.0 * sin(t * 0.3) + 8.0 * sin(t * 1.7));
+    mp_chart_push(c, y, t, 18.0 + 6.0 * sin(t * 0.5 + 1.0));
+    i = i + 1;
+  }
+  return c;
+}
+
+fn fixture_hidpi() -> int32 {
+  var c: MpChart* = chart_line();
+  var t: MpTarget = mp_target_hidpi(640.0, 400.0, 1.5);
+  var b: MpBuf* = mp_buf_new(16384);
+  var rc: int32 = mp_chart_svg_target(c, &t, b);
+  var r: int32 = emit(rc, b);
+  mp_buf_free(b);
+  mp_chart_free(c);
+  return r;
+}
+
+fn run(name: string) -> int32 {
+  if (name == "line") { return svg(chart_line(), 640.0, 400.0); }
+  if (name == "area_smooth") { return fixture_area_smooth(); }
+  if (name == "bar_dark") { return fixture_bar_dark(); }
+  if (name == "scatter_markers") { return fixture_scatter_markers(); }
+  if (name == "live_window") { return svg(chart_live(), 640.0, 360.0); }
+  if (name == "hidpi_1_5") { return fixture_hidpi(); }
+  if (name == "term_braille") { return term(chart_line(), 100, 28, MP_TERM_BRAILLE); }
+  if (name == "term_blocks") { return term(chart_bars(), 80, 24, MP_TERM_BLOCKS); }
+  if (name == "term_ascii") { return term(chart_line(), 80, 24, MP_TERM_ASCII); }
+  if (name == "term_plain") {
+    return term(chart_live(), 80, 24, MP_TERM_BRAILLE | MP_TERM_PLAIN);
+  }
+  return 2;
 }
 
 export fn main(argc: int32, argv: cstring*) -> int32 {
   if (argc == 2) {
-    var name: string = str_from_cstr(argv[1]);
-    if (name == "line") { return fixture_line(); }
+    var r: int32 = run(str_from_cstr(argv[1]));
+    if (r != 2) { return r; }
   }
-  print_err("usage: golden <fixture>   (fixtures: line)\n");
+  print_err("usage: golden <fixture>   (line area_smooth bar_dark scatter_markers ");
+  print_err("live_window hidpi_1_5 term_braille term_blocks term_ascii term_plain)\n");
   return 2;
 }

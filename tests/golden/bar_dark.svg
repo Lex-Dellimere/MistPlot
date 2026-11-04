@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 400" width="640" height="400" style="max-width:100%;height:auto" role="img" aria-label="Requests by region" font-family="system-ui, -apple-system, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif">
+  <rect x="0" y="0" width="640" height="400" fill="#111827" class="mp-c-bg"/>
+  <rect x="39" y="67" width="589" height="302" fill="#111827" class="mp-c-plot"/>
+  <line x1="39" y1="293.5" x2="628" y2="293.5" stroke="#1f2937" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="218.5" x2="628" y2="218.5" stroke="#1f2937" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="142.5" x2="628" y2="142.5" stroke="#1f2937" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="67.5" x2="628" y2="67.5" stroke="#1f2937" stroke-width="1" class="mp-c-grid"/>
+  <line x1="39" y1="369.5" x2="628" y2="369.5" stroke="#4b5563" stroke-width="1" class="mp-c-axis"/>
+  <line x1="112.5" y1="369.5" x2="112.5" y2="373.5" stroke="#4b5563" stroke-width="1" class="mp-c-tick"/>
+  <line x1="259.5" y1="369.5" x2="259.5" y2="373.5" stroke="#4b5563" stroke-width="1" class="mp-c-tick"/>
+  <line x1="407.5" y1="369.5" x2="407.5" y2="373.5" stroke="#4b5563" stroke-width="1" class="mp-c-tick"/>
+  <line x1="554.5" y1="369.5" x2="554.5" y2="373.5" stroke="#4b5563" stroke-width="1" class="mp-c-tick"/>
+  <text x="31" y="373" fill="#9ca3af" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">0</text>
+  <text x="31" y="297" fill="#9ca3af" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">20k</text>
+  <text x="31" y="222" fill="#9ca3af" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">40k</text>
+  <text x="31" y="146" fill="#9ca3af" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">60k</text>
+  <text x="31" y="71" fill="#9ca3af" font-size="11" text-anchor="end" style="font-variant-numeric:tabular-nums" class="mp-c-tick">80k</text>
+  <text x="112.63" y="385" fill="#9ca3af" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">north</text>
+  <text x="259.88" y="385" fill="#9ca3af" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">south</text>
+  <text x="407.13" y="385" fill="#9ca3af" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">east</text>
+  <text x="554.38" y="385" fill="#9ca3af" font-size="11" text-anchor="middle" style="font-variant-numeric:tabular-nums" class="mp-c-tick">west</text>
+  <rect x="54" y="210" width="59" height="159" fill="#4269d0" class="mp-c-series mp-s-0"/>
+  <rect x="201" y="252" width="59" height="117" fill="#4269d0" class="mp-c-series mp-s-0"/>
+  <rect x="348" y="175" width="59" height="194" fill="#4269d0" class="mp-c-series mp-s-0"/>
+  <rect x="495" y="266" width="59" height="103" fill="#4269d0" class="mp-c-series mp-s-0"/>
+  <rect x="113" y="189" width="59" height="180" fill="#efb118" class="mp-c-series mp-s-1"/>
+  <rect x="260" y="256" width="59" height="113" fill="#efb118" class="mp-c-series mp-s-1"/>
+  <rect x="407" y="142" width="59" height="227" fill="#efb118" class="mp-c-series mp-s-1"/>
+  <rect x="554" y="244" width="59" height="125" fill="#efb118" class="mp-c-series mp-s-1"/>
+  <rect x="15" y="38" width="10" height="10" fill="#4269d0" class="mp-c-legend"/>
+  <text x="34" y="47" fill="#d1d5db" font-size="12" class="mp-c-legend">2025</text>
+  <rect x="81" y="38" width="10" height="10" fill="#efb118" class="mp-c-legend"/>
+  <text x="99.84" y="47" fill="#d1d5db" font-size="12" class="mp-c-legend">2026</text>
+  <text x="12" y="26" fill="#f9fafb" font-size="15" font-weight="600" class="mp-c-title">Requests by region</text>
+</svg>
