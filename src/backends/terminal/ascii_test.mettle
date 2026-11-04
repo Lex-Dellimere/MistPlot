@@ -1,7 +1,8 @@
 // backends/terminal/ascii_test — the cell contract of the terminal backend.
 //
-// Pure: scenes are built directly with mp_scene_* (chart/ is not imported: the
-// backend's input is the display list). Every fixture asserts the whole
+// Scenes are built directly with mp_scene_*, except check_grid_chart, which
+// lays a real chart out at mp_ascii_chart_width/height to pin what the grid
+// path is for. Every fixture asserts the whole
 // document, not a substring, so a backend that dropped a row, an SGR or a
 // reset still fails.
 //
@@ -18,15 +19,20 @@
 // one rect -> exact SGR prefix and interior; a horizontal line -> exact `-`
 // row; a diagonal -> `/`; text clipping at both edges; the 200x80 cap
 // rejection; determinism. Plus circle sizes, POLY, plain mode and the
-// argument errors.
+// argument errors, and the grid path: a laid-out chart, text overlap and the
+// grid size errors.
 
 import "std/conv";
+import "std/mem";
 import "mistplot/harness";
 import "mistplot/core/buf";
 import "mistplot/core/color";
 import "mistplot/core/geom";
 import "mistplot/renderer/scene";
+import "mistplot/core/data";
 import "mistplot/renderer/backend";
+import "mistplot/chart/spec";
+import "mistplot/chart/resolve";
 import "mistplot/backends/terminal/ascii";
 
 const ESC: int32 = 27;
@@ -520,6 +526,153 @@ fn check_determinism() {
   mp_expect("plain and ansi differ", p1 != d1);
 }
 
+// ------------------------------------------------------- grid path
+
+// One series filled from a column pair; the name is a literal view.
+fn grid_series(sr: MpSeries*, nm: string, y0: float64, y1: float64,
+               y2: float64, y3: float64) {
+  sr->name = nm;
+  sr->xs = 0;
+  sr->ys = 0;
+  sr->n = 0;
+  sr->cap = 0;
+  var ok: bool = mp_series_push(sr, 0.0, y0) == MP_OK;
+  ok = ok && mp_series_push(sr, 1.0, y1) == MP_OK;
+  ok = ok && mp_series_push(sr, 2.0, y2) == MP_OK;
+  ok = ok && mp_series_push(sr, 3.0, y3) == MP_OK;
+  mp_expect("grid series filled", ok);
+}
+
+fn grid_series_drop(sr: MpSeries*) {
+  if (sr->xs != 0) { free(sr->xs); }
+  if (sr->ys != 0) { free(sr->ys); }
+}
+
+// A 60x16 chart laid out at mp_ascii_chart_width/height: the title is row 0,
+// the y title has its own row, the y tick labels end left of the axis on the
+// row of their tick, the x tick labels and the x title each get a row below
+// the plot, and the right legend names sit beside it.
+fn check_grid_chart() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(4096);
+  var want: MpBuf* = new_buf(4096);
+  var ser: MpSeries[] = new MpSeries[2];
+  if (sc == 0 || b == 0 || want == 0 || ser.data == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+  defer mp_buf_free(want);
+  defer free(ser.data);
+  grid_series(&ser[0], "cpu", 10.0, 30.0, 20.0, 40.0);
+  grid_series(&ser[1], "mem", 25.0, 15.0, 35.0, 30.0);
+  defer grid_series_drop(&ser[0]);
+  defer grid_series_drop(&ser[1]);
+
+  mp_expect_near("chart width for 60 cols", mp_ascii_chart_width(60), 420.0,
+                 1e-12);
+  mp_expect_near("chart height for 16 rows", mp_ascii_chart_height(16), 256.0,
+                 1e-12);
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, &ser[0], 2);
+  spec.title = "Load";
+  spec.x_label = "t";
+  spec.y_label = "pct";
+  spec.grid = false;
+  spec.width = mp_ascii_chart_width(60);
+  spec.height = mp_ascii_chart_height(16);
+  mp_expect_i64("chart renders", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+
+  var o: MpRenderOpts = mp_render_opts(spec.width, spec.height, spec.theme);
+  o.pad = -1.0;
+  var rc: int32 = mp_ascii_render_grid(sc, &o, 60, 16, b);
+  mp_expect_i64("grid render returns MP_OK", (int64)rc, (int64)MP_OK);
+  wp(want, "                            Load\n");
+  wp(want, "\n");
+  wp(want, "pct\n");
+  wp(want, "40 |                                              --   cpu\n");
+  wp(want, "   |                              --------\\    --/     mem\n");
+  wp(want, "30 |              ---\\         --/         ---+-----\n");
+  wp(want, "   +-\\         --/    ----\\---/         --/\n");
+  wp(want, "   |  ----\\---/         --/-----\\    --/\n");
+  wp(want, "20 |    --/-----\\    --/         ---/\n");
+  wp(want, "   | --/         ---/\n");
+  wp(want, "10 +/\n");
+  wp(want, "   |\n");
+  wp(want, " 0 +------------------------------------------------\n");
+  wp(want, "   0               1               2               3\n");
+  wp(want, "                           t\n");
+  wp(want, "\n");
+  var doc: string = mp_buf_str(b);
+  mp_expect_str("60x16 chart on the grid", doc, mp_buf_str(want));
+  mp_expect_i64("sixteen rows", count_ch(doc, 10), (int64)16);
+
+  // ANSI: same rows, and two renders are byte-identical.
+  o.pad = 8.0;
+  rc = mp_ascii_render_grid(sc, &o, 60, 16, b);
+  mp_expect_i64("ansi grid render returns MP_OK", (int64)rc, (int64)MP_OK);
+  var a1: string = mp_buf_str(b);
+  mp_expect_i64("ansi grid has sixteen rows", count_ch(a1, 10), (int64)16);
+  var b2: MpBuf* = new_buf(64);
+  if (b2 == 0) { return; }
+  defer mp_buf_free(b2);
+  rc = mp_ascii_render_grid(sc, &o, 60, 16, b2);
+  mp_expect("two ansi grid renders are byte-identical", a1 == mp_buf_str(b2));
+}
+
+// Overlapping texts on one row: the later node wins cell by cell, and the
+// earlier one shows wherever the later one does not reach.
+fn check_grid_text() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+
+  // 10x2 cells over a 70x32 scene: 7 units per column, 16 per row. The box
+  // middle of a size-12 text at y = 16 is 23.2, so both land on row 1.
+  add_text(sc, 0.0, 16.0, "abcdefgh", 12.0, MP_ALIGN_START, mp_color(1, 2, 3));
+  add_text(sc, 35.0, 16.0, "XY", 12.0, MP_ALIGN_CENTER, mp_color(4, 5, 6));
+  add_text(sc, 70.0, 16.0, "!!", 12.0, MP_ALIGN_END, mp_color(7, 8, 9));
+  var o: MpRenderOpts = mp_render_opts(70.0, 32.0, mp_theme_light());
+  o.pad = -1.0;
+  var rc: int32 = mp_ascii_render_grid(sc, &o, 10, 2, b);
+  mp_expect_i64("text grid render returns MP_OK", (int64)rc, (int64)MP_OK);
+  mp_expect_str("later text wins cell by cell", mp_buf_str(b),
+                "\nabcdXYgh!!\n");
+}
+
+fn check_grid_sizes() {
+  var sc: MpScene* = new_scene();
+  var b: MpBuf* = new_buf(64);
+  if (sc == 0 || b == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(b);
+
+  var o: MpRenderOpts = mp_render_opts(1400.0, 1280.0, mp_theme_light());
+  mp_expect_i64("200x80 grid is accepted",
+                (int64)mp_ascii_render_grid(sc, &o, 200, 80, b), (int64)MP_OK);
+  mp_expect_i64("201 grid cols is MP_ERR_ARG",
+                (int64)mp_ascii_render_grid(sc, &o, 201, 8, b),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("a rejected grid clears out", mp_buf_len(b), (int64)0);
+  mp_expect_i64("81 grid rows is MP_ERR_ARG",
+                (int64)mp_ascii_render_grid(sc, &o, 20, 81, b),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("zero grid cols is MP_ERR_ARG",
+                (int64)mp_ascii_render_grid(sc, &o, 0, 8, b),
+                (int64)MP_ERR_ARG);
+  o = mp_render_opts(0.0, 128.0, mp_theme_light());
+  mp_expect_i64("zero scene width is MP_ERR_ARG",
+                (int64)mp_ascii_render_grid(sc, &o, 20, 8, b),
+                (int64)MP_ERR_ARG);
+  o = mp_render_opts(140.0, 128.0, mp_theme_light());
+  mp_expect_i64("null scene on the grid is MP_ERR_ARG",
+                (int64)mp_ascii_render_grid(0, &o, 20, 8, b),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("null out on the grid is MP_ERR_ARG",
+                (int64)mp_ascii_render_grid(sc, &o, 20, 8, 0),
+                (int64)MP_ERR_ARG);
+}
+
 fn run_all() {
   check_empty();
   check_rect();
@@ -531,6 +684,9 @@ fn run_all() {
   check_circle();
   check_sizes();
   check_determinism();
+  check_grid_chart();
+  check_grid_text();
+  check_grid_sizes();
 }
 
 export fn main() -> int32 {

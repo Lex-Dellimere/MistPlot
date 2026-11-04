@@ -58,7 +58,9 @@ mp_chart_svg(&spec, &o, out);        // or mp_chart_figure for HTML
 
 The spec borrows its series and strings, so keep them alive while it is used.
 `mp_chart_render` gives you the scene itself, for `mp_ascii_render`,
-`mp_export_svg` or your own backend. Bars take category names through
+`mp_export_svg` or your own backend. For a terminal, size the spec with
+`mp_ascii_chart_width(cols)` / `mp_ascii_chart_height(rows)` and draw it with
+`mp_ascii_render_grid`, so each line of chart text takes one row. Bars take category names through
 `spec.categories` / `spec.n_categories`; `x_fixed` / `y_fixed` pin an axis
 range; `MP_FMT_TIME` labels seconds as `mm:ss`.
 

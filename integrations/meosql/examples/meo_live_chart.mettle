@@ -72,8 +72,8 @@ const DEMO_COMMIT_MS: uint32 = 200;
 const DEMO_POLL_MS: uint32 = 50;
 const DEMO_WINDOW_S: float64 = 30.0;
 const DEMO_RING: int64 = 4096;
-const DEMO_TERM_COLS: float64 = 100.0;
-const DEMO_TERM_ROWS: float64 = 24.0;
+const DEMO_TERM_COLS: int32 = 100;
+const DEMO_TERM_ROWS: int32 = 24;
 
 struct Demo {
   db_lock: int32;       // spin lock: writer txns vs reload scans
@@ -85,9 +85,10 @@ struct Demo {
   commits: int32;       // writer's committed txns
   t0_us: int64;         // wall clock at start (x = seconds since)
   lv: MpLive*;          // the SVG chart (bound to the watch)
-  term: MpLive*;        // the same data laid out for the terminal
+  term: MpLive*;        // the same data laid out for the terminal grid
   w: MpMeoWatch*;
   sub: uint8*;          // subtitle bytes, borrowed by lv's template
+  term_sub: uint8*;     // its ASCII copy, borrowed by term's spec
   rows: int64;          // rows the last reload scanned
   scan_err: int32;
 }
@@ -165,6 +166,26 @@ fn demo_key_int(p: uint8*) -> int64 {
   return (int64)(x ^ ((uint64)1 << (uint64)63));
 }
 
+// `s` with each multi-byte UTF-8 sequence replaced by one `-`, into `out`.
+// The terminal backend draws every non-ASCII byte as `?`, so the subtitle's
+// middle dot would otherwise show as `??`.
+fn demo_ascii(s: string, out: uint8*, cap: int64) -> string {
+  var n: int64 = 0;
+  var i: int64 = 0;
+  while (i < (int64)s.length && n < cap) {
+    var c: uint8 = s.chars[i];
+    if (c < 128) {
+      out[n] = c;
+      n = n + 1;
+    } else if (c >= 192) {
+      out[n] = 45;
+      n = n + 1;
+    }
+    i = i + 1;
+  }
+  return str_from_bytes((cstring)out, n);
+}
+
 // The reload callback: under db_lock, walk the whole readings table from the
 // smallest key and rebuild both MpLives, then set the subtitle from the
 // watch's stats.
@@ -216,6 +237,7 @@ fn demo_reload(ctx: rawptr, table_id: uint32, lv: MpLive*) -> int32 {
     var subtitle: string = mp_meo_fmt_subtitle(st.last_change_time_us,
       st.last_commit_seq, d->sub, 80);
     mp_live_spec(d->lv)->subtitle = subtitle;
+    mp_live_spec(d->term)->subtitle = demo_ascii(subtitle, d->term_sub, 80);
   }
   return MP_OK;
 }
@@ -264,12 +286,12 @@ fn demo_arg_is(a: cstring, s: string) -> bool {
 // Renders and prints the terminal view (plain text, no escapes).
 fn demo_print_term(d: Demo*, out: MpBuf*) -> int32 {
   mp_live_update(d->term);
-  var o: MpRenderOpts = mp_render_opts(DEMO_TERM_COLS, DEMO_TERM_ROWS,
-    mp_theme_light());
+  var sp: MpChartSpec* = mp_live_spec(d->term);
+  var o: MpRenderOpts = mp_render_opts(sp->width, sp->height, sp->theme);
   o.pad = -1.0;
-  var rc: int32 = mp_ascii_render(mp_live_scene(d->term), &o, out);
+  var rc: int32 = mp_ascii_render_grid(mp_live_scene(d->term), &o,
+    DEMO_TERM_COLS, DEMO_TERM_ROWS, out);
   if (rc != MP_OK) { return rc; }
-  println("{mp_live_spec(d->lv)->title}  [{mp_live_spec(d->lv)->subtitle}]");
   print(mp_buf_str(out));
   return MP_OK;
 }
@@ -293,6 +315,7 @@ fn demo_free(d: Demo*) {
   if (d->lv != 0) { mp_live_free(d->lv); }
   if (d->term != 0) { mp_live_free(d->term); }
   if (d->sub != 0) { free(d->sub); }
+  if (d->term_sub != 0) { free(d->term_sub); }
   free(d);
 }
 
@@ -335,30 +358,16 @@ fn main(argc: int32, argv: cstring*) -> int32 {
   d->pager = meo_pager_open(str_from_cstr(db), 64, MEO_PAGER_CREATE);
   d->feed = meo_feed_new(4096);
   d->sub = (uint8*)malloc(80);
+  d->term_sub = (uint8*)malloc(80);
   d->lv = demo_live(640.0, 400.0);
-  d->term = demo_live(DEMO_TERM_COLS, DEMO_TERM_ROWS);
-  if (d->pager == 0 || d->feed == 0 || d->sub == 0 || d->lv == 0 ||
-      d->term == 0) {
+  d->term = demo_live(mp_ascii_chart_width(DEMO_TERM_COLS),
+    mp_ascii_chart_height(DEMO_TERM_ROWS));
+  if (d->pager == 0 || d->feed == 0 || d->sub == 0 || d->term_sub == 0 ||
+      d->lv == 0 || d->term == 0) {
     println("setup failed");
     demo_free(d);
     return 1;
   }
-  // The terminal canvas is the cell grid and chart text is laid out at a
-  // fixed 12-unit size, so text would eat most of the rows: the terminal view
-  // drops the chart's own text (title and subtitle are printed as lines) and
-  // uses fixed margins that leave room for the tick labels.
-  var tsp: MpChartSpec* = mp_live_spec(d->term);
-  tsp->legend = MP_LEGEND_NONE;
-  tsp->grid = false;
-  tsp->title = "";
-  tsp->x_label = "";
-  tsp->y_label = "";
-  tsp->margin_auto = false;
-  tsp->margins.top = 1.0;
-  tsp->margins.right = 3.0;
-  tsp->margins.bottom = 2.0;
-  tsp->margins.left = 6.0;
-  mp_live_touch(d->term);
   if (meo_feed_attach(d->pager, d->feed) != MEO_OK) {
     println("feed attach failed");
     demo_free(d);

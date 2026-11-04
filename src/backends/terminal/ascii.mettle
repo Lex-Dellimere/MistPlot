@@ -11,11 +11,14 @@
 // allocation is `out`'s growth and there is nothing to free.
 //
 // Determinism: the bytes are a pure function of the scene, the two viewport
-// numbers, the theme and the sign of o->pad. No ids, no time, no addresses, no
-// locale — two renders of one scene are byte-identical.
+// numbers, the grid size, the theme and the sign of o->pad. No ids, no time,
+// no addresses, no locale — two renders of one scene are byte-identical.
 //
 // Interpretation:
-//   * canvas: cols = (int32)o->width, rows = (int32)o->height, truncated; a
+//   * canvas: mp_ascii_render uses cols = (int32)o->width, rows =
+//     (int32)o->height, truncated; mp_ascii_render_grid takes cols and rows
+//     and maps the o->width x o->height scene onto them (lay the chart out at
+//     mp_ascii_chart_width/height for text to fit one line per row). A
 //     non-finite, non-positive or > 200x80 size is MP_ERR_ARG (after clear);
 //   * mapping: col = floor(x / o->width * cols), row = floor(y / o->height *
 //     rows) — the divisor is the float viewport, not the truncated cell count;
@@ -36,10 +39,12 @@
 //     square and the aspect ratio is not corrected;
 //   * TEXT: one cell per byte, clipped per cell to the canvas. The glyph row is
 //     the row containing the baseline y + size*0.8 (the same baseline choice
-//     backends/web/svg documents); the column is the anchor, shifted left by
-//     len/2 for CENTER and by len for END. Text is ASCII-only: bytes
-//     0x20..0x7E are drawn as themselves and every other byte (control or
-//     >= 0x80, i.e. every UTF-8 continuation byte) becomes `?`;
+//     backends/web/svg documents), or on the grid path the box middle
+//     y + size*0.6; a later text overwrites an earlier one cell by cell. The
+//     column is the anchor, shifted left by len/2 for CENTER and by len for
+//     END. Text is ASCII-only: bytes 0x20..0x7E are drawn as themselves and
+//     every other byte (control or >= 0x80, i.e. every UTF-8 continuation
+//     byte) becomes `?`;
 //   * ANSI: `ESC[38;2;r;g;bm` foreground, `ESC[48;2;r;g;bm` background, and
 //     `ESC[0m` at the end of every row (the last row's reset is the document's
 //     final reset). SGR is emitted only when a cell's colour differs from the
@@ -58,6 +63,11 @@ export const MP_ASCII_MAX_COLS: int32 = 200;
 export const MP_ASCII_MAX_ROWS: int32 = 80;
 export const MP_ASCII_MAX_CELLS: int32 = 16000;
 
+// One cell of mp_ascii_chart_width/height. The width matches the default text
+// measure (0.58 * 12 = 6.96 per byte), the height fits one 14.4 text line.
+export const MP_ASCII_CELL_W: float64 = 7.0;
+export const MP_ASCII_CELL_H: float64 = 16.0;
+
 // A mapped cell coordinate is clamped here before rasterizing: the canvas is at
 // most 200x80, so anything beyond this is off-canvas anyway and the clamp only
 // bounds the Bresenham loop.
@@ -66,6 +76,11 @@ const MP_ASCII_CELL_LIMIT: int32 = 4096;
 // The scene's TEXT y is the top of the box; the glyph row is the row holding
 // the baseline, at 0.8 of the em box (the choice backends/web/svg documents).
 const MP_ASCII_BASELINE: float64 = 0.8;
+
+// On a laid-out grid a text box (1.2 em) is shorter than a row, so the row is
+// the one holding the box's middle: a y tick label then shares the row of its
+// tick, where the baseline can fall into the x tick label row below.
+const MP_ASCII_TEXT_MID: float64 = 0.6;
 
 const MP_ASCII_SPACE: uint8 = 32;
 const MP_ASCII_PLUS: uint8 = 43;
@@ -86,6 +101,7 @@ struct AsciiGrid {
   bg: MpColor*;
   cols: int32;
   rows: int32;
+  text_dy: float64;   // em fraction below the box top that picks the row
 }
 
 fn ascii_none() -> MpColor {
@@ -262,7 +278,7 @@ fn ascii_rect(g: AsciiGrid*, nd: MpNode*, w: float64, h: float64) {
 fn ascii_text(g: AsciiGrid*, nd: MpNode*, s: string, w: float64, h: float64) {
   var n: int64 = (int64)s.length;
   if (n == 0) { return; }
-  var row: int32 = ascii_cell(nd->y + nd->size * MP_ASCII_BASELINE, h, g->rows);
+  var row: int32 = ascii_cell(nd->y + nd->size * g->text_dy, h, g->rows);
   if (row < 0 || row >= g->rows) { return; }
   var col: int32 = ascii_cell(nd->x, w, g->cols);
   if (nd->align == MP_ALIGN_CENTER) {
@@ -405,15 +421,23 @@ fn ascii_emit_row(g: AsciiGrid*, out: MpBuf*, row: int32,
   return mp_buf_putc(out, 10);
 }
 
-export fn mp_ascii_render(s: MpScene*, o: MpRenderOpts*, out: MpBuf*) -> int32 {
-  if (out == 0) { return MP_ERR_ARG; }
-  mp_buf_clear(out);
-  if (s == 0 || o == 0) { return MP_ERR_ARG; }
+// Recommended chart size for a cols x rows grid: lay the spec out at this size
+// and render it with mp_ascii_render_grid, so a 12-unit text line lands on one
+// row and a label's measured width is about its length in cells.
+export fn mp_ascii_chart_width(cols: int32) -> float64 {
+  return (float64)cols * MP_ASCII_CELL_W;
+}
+
+export fn mp_ascii_chart_height(rows: int32) -> float64 {
+  return (float64)rows * MP_ASCII_CELL_H;
+}
+
+// The validated core of both entry points; `out` is already cleared.
+fn ascii_render(s: MpScene*, o: MpRenderOpts*, cols: int32, rows: int32,
+                text_dy: float64, out: MpBuf*) -> int32 {
   if (o->width != o->width || o->height != o->height) { return MP_ERR_ARG; }
   if (o->width <= 0.0 || o->height <= 0.0) { return MP_ERR_ARG; }
   if (o->width > 1e9 || o->height > 1e9) { return MP_ERR_ARG; }
-  var cols: int32 = (int32)o->width;
-  var rows: int32 = (int32)o->height;
   if (cols <= 0 || rows <= 0) { return MP_ERR_ARG; }
   if (cols > MP_ASCII_MAX_COLS || rows > MP_ASCII_MAX_ROWS) {
     return MP_ERR_ARG;
@@ -428,6 +452,7 @@ export fn mp_ascii_render(s: MpScene*, o: MpRenderOpts*, out: MpBuf*) -> int32 {
   g.bg = &bgs[0];
   g.cols = cols;
   g.rows = rows;
+  g.text_dy = text_dy;
   ascii_blank(&g, o->theme.fg);
 
   var i: int64 = 0;
@@ -448,4 +473,23 @@ export fn mp_ascii_render(s: MpScene*, o: MpRenderOpts*, out: MpBuf*) -> int32 {
     row = row + 1;
   }
   return MP_OK;
+}
+
+export fn mp_ascii_render(s: MpScene*, o: MpRenderOpts*, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (s == 0 || o == 0) { return MP_ERR_ARG; }
+  if (o->width != o->width || o->height != o->height) { return MP_ERR_ARG; }
+  if (o->width <= 0.0 || o->height <= 0.0) { return MP_ERR_ARG; }
+  if (o->width > 1e9 || o->height > 1e9) { return MP_ERR_ARG; }
+  return ascii_render(s, o, (int32)o->width, (int32)o->height,
+                      MP_ASCII_BASELINE, out);
+}
+
+export fn mp_ascii_render_grid(s: MpScene*, o: MpRenderOpts*, cols: int32,
+                               rows: int32, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (s == 0 || o == 0) { return MP_ERR_ARG; }
+  return ascii_render(s, o, cols, rows, MP_ASCII_TEXT_MID, out);
 }
