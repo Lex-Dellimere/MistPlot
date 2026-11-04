@@ -32,12 +32,12 @@ import "mistplot/chart/spec";
 import "mistplot/backends/web/page";
 import "mistplot/live/stream";
 import "mistplot/backends/web/live";
-import "raize/framework/str/str";
-import "raize/framework/context/context";
-import "raize/framework/router/router";
-import "raize/framework/template/template";
-import "raize/framework/template/vars";
-import "raize/framework/channel/channel";
+import "raize_core/str/str";
+import "raize_core/context/context";
+import "raize_core/router/router";
+import "raize_core/template/template";
+import "raize_core/template/vars";
+import "raize_realtime/channel/channel";
 import "../mp_raize";
 
 var g_rt: RzRouter* = 0;

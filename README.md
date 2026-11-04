@@ -89,7 +89,7 @@ counts changes and is what the web and MythicUI integrations use to skip work.
 
 ## RaizeWeb
 
-`integrations/raize/mp_raize.mettle`. Your app maps RaizeWeb as `raize`.
+`integrations/raize/mp_raize.mettle`. Your app maps RaizeWeb's `raize_core` and `raize_realtime`.
 
 ```mettle
 fn h_chart(ctx: RzContext*) -> int32 { return mp_raize_svg(ctx, g_spec, g_opts); }

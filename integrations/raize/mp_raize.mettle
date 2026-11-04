@@ -1,8 +1,8 @@
 // integrations/raize/mp_raize — MistPlot charts served by RaizeWeb handlers.
 //
-// Dependencies: raize/framework/context/context (RzContext, RzResponse,
-// rz_ctx_*, rz_req_header, rz_resp_header_set), raize/framework/template/vars
-// (RzVarMap), raize/framework/channel/channel (RzChanRouter, RzChanCtx,
+// Dependencies: raize_core/context/context (RzContext, RzResponse,
+// rz_ctx_*, rz_req_header, rz_resp_header_set), raize_core/template/vars
+// (RzVarMap), raize_realtime/channel/channel (RzChanRouter, RzChanCtx,
 // rz_chan_define, rz_chan_reply_json, rz_chan_post_broadcast; the hub only
 // through it), mistplot/backends/web/{page,live}, mistplot/live/stream,
 // mistplot/core/buf, std/mem, std/thread (spin_lock). The core library under
@@ -44,9 +44,9 @@
 
 import "std/mem";
 import "std/thread";
-import "raize/framework/context/context";
-import "raize/framework/template/vars";
-import "raize/framework/channel/channel";
+import "raize_core/context/context";
+import "raize_core/template/vars";
+import "raize_realtime/channel/channel";
 import "mistplot/core/buf";
 import "mistplot/renderer/backend";
 import "mistplot/chart/spec";

@@ -76,7 +76,7 @@ done
 
 step golden tools/golden.sh
 
-if [ -d ../raize_web/framework ]; then
+if [ -d ../raize_web/libs/core ]; then
   step integration-raize integrations/raize/build.sh
 else
   echo "skip  integration-raize (no ../raize_web)"

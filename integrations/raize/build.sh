@@ -4,7 +4,7 @@
 # channel push end to end with python (RaizeWeb's ws_client.py, imported from
 # ../raize_web) and checks both embed scripts with node. Prints PASS or FAIL.
 #
-# Needs ../raize_web next to this repo (integrations/mettle.deps maps raize=).
+# Needs ../raize_web next to this repo (integrations/mettle.deps maps raize_core= and raize_realtime=).
 # Env: METTLE (compiler, default ../Mettle/bin/mettle next to this repo),
 #      SMOKE_PORT (default derived from the process id; the push check uses SMOKE_PORT + 1).
 
@@ -16,7 +16,7 @@ OUT="build/integrations/raize"
 SMOKE_PORT="${SMOKE_PORT:-$((20000 + $$ % 20000))}"   # per process, so parallel runs differ
 mkdir -p "$OUT"
 
-if [ ! -d ../raize_web/framework ]; then
+if [ ! -d ../raize_web/libs/core ]; then
   echo "FAIL  ../raize_web not found"
   echo "FAIL"
   exit 1
