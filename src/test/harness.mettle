@@ -1,4 +1,4 @@
-// harness: the whole test vocabulary. Pure — no externs, no files, no threads,
+// test/harness: the whole test vocabulary. Pure — no externs, no files, no threads,
 // so every test file that imports it runs in the compile-time interpreter too.
 //
 // A test file exports `main` (so the compiled gate can run it) and declares

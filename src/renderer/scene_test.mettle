@@ -7,7 +7,7 @@
 
 import "std/conv";
 import "std/mem";
-import "mistplot/harness";
+import "mistplot/test/harness";
 import "mistplot/core/buf";
 import "mistplot/core/color";
 import "mistplot/core/geom";

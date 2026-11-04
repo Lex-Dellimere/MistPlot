@@ -11,7 +11,7 @@ import "std/io";
 import "std/mem";
 import "std/math";
 import "mythic/mythic";
-import "mistplot/harness";
+import "mistplot/test/harness";
 import "mistplot/core/color";
 import "mistplot/core/data";
 import "mistplot/core/text";
