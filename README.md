@@ -179,3 +179,7 @@ Known head-compiler bugs MistPlot works around:
   to `mp_text_set_measure` should not be exported.
 - A literal `0` can't be passed for a function-pointer parameter; use
   `mp_text_reset_measure()` instead of `mp_text_set_measure(0, 0)`.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).

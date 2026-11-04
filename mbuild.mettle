@@ -15,6 +15,7 @@ import "mbuild/api";
 
 fn project() {
   mb_package("mistplot", "0.1.0");
+  mb_meta("license", "Apache-2.0");
   mb_targets("linux");
   mb_import_root("src");
 }
