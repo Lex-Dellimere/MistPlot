@@ -12,7 +12,6 @@ src/chart/axis.mettle
 src/chart/layout.mettle
 src/chart/resolve.mettle
 src/chart/spec.mettle
-src/core/buf.mettle
 src/core/color.mettle
 src/core/data.mettle
 src/core/format.mettle

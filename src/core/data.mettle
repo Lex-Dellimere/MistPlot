@@ -1,10 +1,10 @@
-// core/data — MpSeries (numeric columns) and MpExtent (bounding box).
+// core/data — MpSeries (numeric columns); MpExtent itself lives in core/extent.
 //
 // Dependencies: core/buf for the MP_* error codes; std/mem, std/conv.
 // Data borrows nothing: the series *copies* its name at construction so a
 // temporary label cannot dangle.
 //
-// Contract: mp_extent_add ignores non-finite pairs (a NaN/inf sample is
+// Contract (core/extent): mp_extent_add ignores non-finite pairs (a NaN/inf sample is
 // skipped, not stored), so one bad sample cannot turn a domain into NaN and
 // collapse every mark onto the range midpoint. A series of only non-finite
 // pairs therefore has no valid extent.
@@ -21,12 +21,10 @@
 import "std/mem";
 import "std/conv";
 import "mistplot/core/buf";
+import "mistplot/core/extent";
 
 export struct MpSeries { name: string; xs: float64*; ys: float64*;
                          n: int64; cap: int64; }
-
-export struct MpExtent { min_x: float64; max_x: float64; min_y: float64;
-                         max_y: float64; valid: bool; }
 
 const MP_SERIES_DEFAULT_CAP: int64 = 16;
 
@@ -167,52 +165,6 @@ export fn mp_series_set(s: MpSeries*, i: int64, x: float64,
   s->xs[i] = x;
   s->ys[i] = y;
   return MP_OK;
-}
-
-export fn mp_extent_empty() -> MpExtent {
-  var e: MpExtent;
-  e.min_x = 0.0;
-  e.max_x = 0.0;
-  e.min_y = 0.0;
-  e.max_y = 0.0;
-  e.valid = false;
-  return e;
-}
-
-export fn mp_extent_add(e: MpExtent*, x: float64, y: float64) {
-  if (e == 0) { return; }
-  // Non-finite samples are dropped here, not in the chart layer (see header).
-  if (x != x || y != y) { return; }
-  if (x > 1e308 || x < 0.0 - 1e308) { return; }
-  if (y > 1e308 || y < 0.0 - 1e308) { return; }
-  if (!e->valid) {
-    e->min_x = x;
-    e->max_x = x;
-    e->min_y = y;
-    e->max_y = y;
-    e->valid = true;
-    return;
-  }
-  if (x < e->min_x) { e->min_x = x; }
-  if (x > e->max_x) { e->max_x = x; }
-  if (y < e->min_y) { e->min_y = y; }
-  if (y > e->max_y) { e->max_y = y; }
-}
-
-export fn mp_extent_union(a: MpExtent, b: MpExtent) -> MpExtent {
-  if (!a.valid) { return b; }
-  if (!b.valid) { return a; }
-  var e: MpExtent;
-  e.min_x = a.min_x;
-  if (b.min_x < e.min_x) { e.min_x = b.min_x; }
-  e.max_x = a.max_x;
-  if (b.max_x > e.max_x) { e.max_x = b.max_x; }
-  e.min_y = a.min_y;
-  if (b.min_y < e.min_y) { e.min_y = b.min_y; }
-  e.max_y = a.max_y;
-  if (b.max_y > e.max_y) { e.max_y = b.max_y; }
-  e.valid = true;
-  return e;
 }
 
 export fn mp_extent_pad(e: MpExtent, frac: float64) -> MpExtent {
