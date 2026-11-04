@@ -1,0 +1,18 @@
+//! Fixture: an internal module.
+//! @internal
+
+/// Internal ring.
+///
+/// @mem Owns its buffer.
+export struct MpRing {
+  buf: float64*;   /// the samples
+  n: int64;        /// sample count
+}
+
+/// Pushes one sample.
+///
+/// @param r The ring.
+/// @param v The sample.
+/// @mem Nothing is retained.
+export fn mp_ring_push(r: MpRing*, v: float64) {
+}

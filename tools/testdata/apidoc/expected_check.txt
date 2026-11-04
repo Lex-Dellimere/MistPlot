@@ -1,0 +1,21 @@
+legacy.txt:3: src/gone.mettle is listed but does not exist
+integrations/demo/mp_demo.mettle:9: mp_demo_notify: takes a chart or integration object but has no @thread
+src/core/bad.mettle:3: bad_nodoc: export has no /// doc block
+src/core/bad.mettle:7: bad_period: summary does not end with a period
+src/core/bad.mettle:12: bad_nosummary: missing summary
+src/core/bad.mettle:21: bad_params: @param 1 is b, the signature has a
+src/core/bad.mettle:21: bad_params: @param 2 is a, the signature has b
+src/core/bad.mettle:21: bad_params: @param z is not a parameter
+src/core/bad.mettle:27: bad_missing: parameter b has no @param
+src/core/bad.mettle:31: bad_noreturn: missing @return
+src/core/bad.mettle:38: bad_voidreturn: @return on a function that returns nothing
+src/core/bad.mettle:44: bad_noerror: @return mentions MP_OK but there is no @error
+src/core/bad.mettle:51: bad_nomem: pointer, string or rawptr in the signature but no @mem
+src/core/bad.mettle:58: bad_nothread: takes a chart or integration object but has no @thread
+src/core/bad.mettle:64: bad_tag: unknown tag @retrun
+src/core/bad.mettle:68: BadStruct: struct has no @mem
+src/core/bad.mettle:69: BadStruct.a: field has no trailing /// doc
+src/core/bad.mettle:70: BadStruct.c: one field per line
+src/core/bad.mettle:74: BAD_CONST: summary does not end with a period
+src/core/bad.mettle:77: bad_var: export has no /// doc block
+src/nodoc.mettle:1: no //! module doc

@@ -1,0 +1,77 @@
+//! Fixture: one export per rule violation.
+
+export fn bad_nodoc() {
+}
+
+/// no period here
+export fn bad_period() {
+}
+
+///
+/// @return Nothing useful.
+export fn bad_nosummary() -> int32 {
+  return 0;
+}
+
+/// Parameters out of order.
+///
+/// @param b Second.
+/// @param a First.
+/// @param z Extra.
+export fn bad_params(a: int32, b: int32) {
+}
+
+/// Missing a parameter.
+///
+/// @param a First.
+export fn bad_missing(a: int32, b: int32) {
+}
+
+/// Non-void without @return.
+export fn bad_noreturn() -> int32 {
+  return 0;
+}
+
+/// Void with @return.
+///
+/// @return Something.
+export fn bad_voidreturn() {
+}
+
+/// MP_OK without errors.
+///
+/// @return MP_OK always.
+export fn bad_noerror() -> int32 {
+  return 0;
+}
+
+/// Pointer without @mem.
+///
+/// @param s A string.
+export fn bad_nomem(s: string) {
+}
+
+/// Object without @thread.
+///
+/// @param c The chart.
+/// @mem Borrowed.
+export fn bad_nothread(c: MpChart*) {
+}
+
+/// Unknown tag.
+///
+/// @retrun Oops.
+export fn bad_tag() {
+}
+
+/// Struct without @mem and with bad fields.
+export struct BadStruct {
+  a: int32;
+  b: int32; c: int32;   /// two on one line
+}
+
+/// Const without a period
+export const BAD_CONST: int32 = 1;
+
+// plain comment is not a doc block
+export var bad_var: int32 = 0;

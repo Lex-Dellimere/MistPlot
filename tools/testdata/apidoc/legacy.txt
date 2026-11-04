@@ -1,0 +1,3 @@
+# files exempt from the doc rules
+src/old.mettle
+src/gone.mettle   # deleted

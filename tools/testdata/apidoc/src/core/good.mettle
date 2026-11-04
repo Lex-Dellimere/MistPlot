@@ -1,0 +1,86 @@
+//! Fixture: a module written to the doc rules. It covers multi-line
+//! signatures, fn-pointer parameters, string constants with commas and
+//! braces, documented struct fields, a var and an extern.
+//!
+//! A second paragraph of module doc.
+
+import "std/core";
+
+/// Font stack used when the chart sets none.
+export const MP_FONT_STACK: string = "system-ui, -apple-system, \"Segoe UI\", Roboto";
+
+/// A constant whose value has braces, a semicolon and a pipe.
+export const MP_SCRIPT: string = "f(){{ return a | b; }}";
+
+/// Largest element count.
+export const MP_MAX_COUNT: int64 = 268435456;   // 2^28
+
+/// Untyped literal constant.
+export const MP_KIND = 3;
+
+/// A point with documented fields.
+///
+/// @mem Plain value; holds no pointers.
+export struct MpPoint {
+  x: float64;   /// x in px
+  y: float64;   /// y in px, from the top
+  method len2() -> float64 {
+    return this.x * this.x + this.y * this.y;
+  }
+}
+
+/// Number of renders so far.
+export var mp_renders: int64 = 0;
+
+/// Thread id from the runtime.
+///
+/// @return The id of the calling thread.
+export extern fn mp_thread_id() -> uint32 with none = "mettle_thread_current_id";
+
+/// Draws a chart into a target.
+/// Second line of the summary paragraph.
+///
+/// More detail in a body paragraph.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param mp_measure_cb Text measurer. Units: px.
+///   Continues on a second line.
+/// @param ctx Passed to the measurer.
+/// @param out Result, cleared first.
+/// @return MP_OK, or an error code.
+/// @error MP_ERR_ARG c is 0; nothing changes.
+/// @error MP_ERR_ALLOC out of memory; out is empty.
+/// @mem out belongs to the caller.
+/// @thread One thread at a time.
+/// @cost O(n).
+export fn mp_draw(c: MpChart*,
+                  mp_measure_cb: fn(rawptr, string, float64) -> float64,
+                  ctx: rawptr,
+                  out: Result<int32, string>*) -> int32 {
+  return 0;
+}
+
+/// Returns a measurer, decorated.
+///
+/// @return The default measurer.
+/// @mem Returns a code address; nothing to free.
+@inline export fn mp_measurer() -> fn(rawptr, string, float64) -> float64 {
+  return 0;
+}
+
+/// Resets everything.
+export fn mp_reset() {
+}
+
+/// Host-only hook.
+///
+/// @param on Whether to enable it.
+/// @internal
+export fn mp_host_hook(on: bool) {
+}
+
+/// Line join style.
+export enum MpJoin { Miter = 0, Round = 1 }
+
+/// A percentage.
+export type MpPercent = int32 where value >= 0 && value <= 100;

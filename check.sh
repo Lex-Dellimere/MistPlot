@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # check.sh — the whole MistPlot gate in one command:
-#   1. `mbuild test` (every src/**/*_test.mettle in the compile-time interpreter)
-#   2. every unit test built and run natively in debug and release
+#   1. tools/lint.sh, tools/apidoc.sh --selftest and --check (doc rules, and
+#      docs/API.md matches the sources)
+#   2. `mbuild test` (every src/**/*_test.mettle in the compile-time interpreter)
+#   3. every unit test built and run natively in debug and release
 #      (release builds have miscompiles, so both run)
-#   3. cmd/line_svg in debug and release, byte-compared with tests/golden/line.svg
-#   4. the raize, mythic and meosql integration builds (each skipped when
+#   4. cmd/line_svg in debug and release, byte-compared with tests/golden/line.svg
+#   5. the raize, mythic and meosql integration builds (each skipped when
 #      ../raize_web, ../mythic_ui or the MeoSQL checkout is missing;
 #      MEOSQL_DIR picks the checkout, default ../meosql)
+#   6. no memory-analyser warning (warning[M01..]) for a MistPlot file in any
+#      build log of this run
 #
 #   ./check.sh                  # from anywhere; cds to the repo root
 #   METTLE=/path/to/mettle ./check.sh
@@ -41,6 +45,14 @@ if [ ! -x "$METTLE" ]; then
   echo "FAIL  no compiler at $METTLE (set METTLE)"
   exit 1
 fi
+
+# Logs of earlier runs (or of a skipped integration) must not reach the
+# memory-warning scan at the end.
+rm -f "$OUT"/*.log build/golden/*.log build/integrations/*/*.log
+
+step lint tools/lint.sh
+step apidoc-selftest tools/apidoc.sh --selftest
+step apidoc tools/apidoc.sh --check
 
 step mbuild-test "$MBUILD" test
 
@@ -86,6 +98,8 @@ if [ -f "$MEOSQL_DIR/src/feed/feed.mettle" ]; then
 else
   echo "skip  integration-meosql (no change feed in $MEOSQL_DIR)"
 fi
+
+step memory-warnings tools/lint.sh --logs "$OUT" build/golden build/integrations
 
 if [ "$fails" = 0 ]; then
   echo "PASS"

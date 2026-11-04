@@ -1,0 +1,20 @@
+// old — a legacy module with plain comments.
+//
+// Its header stands in for the module doc.
+
+import "std/io";
+
+// Legacy constant.
+export const OLD_K: int32 = 4;
+export const OLD_W: float64 = 2.0;  // trailing comment as description
+
+export struct OldPair { a: int32; b: string; }
+
+// Legacy function with a
+// two-line comment.
+export fn old_fn(p: OldPair*, n: int32) -> int32 {
+  return n;
+}
+
+export fn old_undoc() {
+}

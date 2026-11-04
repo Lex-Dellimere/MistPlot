@@ -1,0 +1,2 @@
+/// Documented item in a module without a module doc.
+export const NODOC_K: int32 = 1;

@@ -1,0 +1,11 @@
+//! Fixture: an integration module.
+
+/// Notifies the page.
+///
+/// @param r The live object.
+/// @return MP_OK.
+/// @error MP_ERR_STATE never registered.
+/// @mem Borrows r.
+export fn mp_demo_notify(r: MpRaizeLive*) -> int32 {
+  return 0;
+}

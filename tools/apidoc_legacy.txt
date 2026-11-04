@@ -1,0 +1,29 @@
+# Files not yet rewritten to the doc rules of tools/apidoc.sh: they are exempt
+# from its checks and from lint's callback-naming rule. Remove a file when it is
+# rewritten or deleted; the list must end up empty.
+integrations/meosql/mp_meo.mettle
+integrations/mythic/mp_mythic.mettle
+integrations/raize/mp_raize.mettle
+src/backends/terminal/ascii.mettle
+src/backends/web/live.mettle
+src/backends/web/page.mettle
+src/backends/web/svg.mettle
+src/chart/axis.mettle
+src/chart/layout.mettle
+src/chart/resolve.mettle
+src/chart/spec.mettle
+src/core/buf.mettle
+src/core/color.mettle
+src/core/data.mettle
+src/core/format.mettle
+src/core/geom.mettle
+src/core/scale.mettle
+src/core/text.mettle
+src/core/ticks.mettle
+src/export/svg_file.mettle
+src/live/decimate.mettle
+src/live/ring.mettle
+src/live/stream.mettle
+src/renderer/backend.mettle
+src/renderer/scene.mettle
+src/test/harness.mettle
