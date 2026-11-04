@@ -4514,6 +4514,7 @@ Draws a scene into a grid of terminal cells and writes it as UTF-8 text, with AN
 | `MP_TERM_THEME` | `int32` | `64` | Mode flag: the chart has a theme, so text, ticks and grid use the scene's colours and background (MP_CLS_BG, MP_CLS_PLOT) rects are painted. Without it text uses the terminal's own foreground, ticks and grid are dim and no background is painted. |
 | `MP_TERM_MAX_COLS` | `int32` | `1000` | Most columns mp_term_scene accepts. |
 | `MP_TERM_MAX_ROWS` | `int32` | `500` | Most rows mp_term_scene accepts. |
+| `MP_TERM_CELL_BYTES` | `int64` | `32` | Bytes per cell of the grid that mp_term_scene_grid draws into. |
 
 ### `mp_term_scene`
 
@@ -4539,11 +4540,68 @@ Writes a scene as terminal text, one line per row of a cols x rows cell grid. Th
 - `MP_ERR_STATE` a polyline or path is still open; out is empty.
 - `MP_ERR_ALLOC` the cell grid could not be allocated (out is empty) or out could not grow (out holds the rows written so far).
 
-**Memory:** out belongs to the caller; nothing is retained from the arguments. The cell grid (32 bytes per cell) is allocated and freed inside every call.
+**Memory:** out belongs to the caller; nothing is retained from the arguments. The cell grid (MP_TERM_CELL_BYTES per cell) is allocated and freed inside every call; use mp_term_scene_grid to supply it instead.
 
 **Threads:** One thread at a time per scene and per out.
 
 **Cost:** O(nodes + points + cells); one allocation for the grid plus the growth of out.
+
+### `mp_term_grid_bytes`
+
+```mettle
+fn mp_term_grid_bytes(t: MpTarget*) -> int64
+```
+
+Bytes of cell grid that mp_term_scene_grid needs for a target: cols x rows x MP_TERM_CELL_BYTES, with the grid size computed as in mp_term_scene.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `t` | `MpTarget*` | The target. Valid: non-zero, as for mp_term_scene. |
+
+**Returns:** The byte count, or 0 when t is 0 or its size is invalid or over the limits.
+
+**Memory:** Reads *t only.
+
+**Cost:** O(1).
+
+### `mp_term_scene_grid`
+
+```mettle
+fn mp_term_scene_grid(
+  s: MpScene*,
+  t: MpTarget*,
+  mode: int32,
+  grid: uint8*,
+  cap: int64,
+  out: MpBuf*
+) -> int32
+```
+
+As mp_term_scene, drawing into a cell grid the caller provides, so repeated frames allocate nothing but the growth of out. The output is identical to mp_term_scene's.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `s` | `MpScene*` | The scene. Valid: non-zero, with no polyline or path open. |
+| `t` | `MpTarget*` | The target. Valid: as for mp_term_scene. |
+| `mode` | `int32` | Mode plus flags. Valid: as for mp_term_scene. |
+| `grid` | `uint8*` | Cell storage, cleared by this call. Valid: 0 (then a grid is allocated and freed inside the call, as mp_term_scene does), or 8-byte aligned with at least mp_term_grid_bytes(t) bytes. |
+| `cap` | `int64` | Bytes at grid. Valid: >= mp_term_grid_bytes(t) when grid is non-zero; ignored when grid is 0. |
+| `out` | `MpBuf*` | Receives the text. Valid: non-zero; cleared first. |
+
+**Returns:** MP_OK, or an error code.
+
+**Errors:**
+
+- `MP_ERR_ARG` s, t or out is 0, mode is unknown, the size is not finite or rounds to 0 cells, or grid is non-zero and cap is too small; out is empty.
+- `MP_ERR_LIMIT` more than MP_TERM_MAX_COLS columns or MP_TERM_MAX_ROWS rows; out is empty.
+- `MP_ERR_STATE` a polyline or path is still open; out is empty.
+- `MP_ERR_ALLOC` grid is 0 and the grid could not be allocated (out is empty), or out could not grow (out holds the rows written so far).
+
+**Memory:** grid stays the caller's and is only borrowed for the call; its contents afterwards are unspecified. out belongs to the caller.
+
+**Threads:** One thread at a time per scene, per grid and per out.
+
+**Cost:** O(nodes + points + cells); no allocation besides the growth of out when grid is given.
 
 ### `mp_chart_term`
 
@@ -4569,7 +4627,7 @@ Renders a chart as terminal text of cols x rows cells, laid out on the cell grid
 - `MP_ERR_LIMIT` cols or rows is above its maximum; out is empty.
 - `MP_ERR_ALLOC` the frame, the cell grid or out could not grow; out is empty or partial.
 
-**Memory:** out belongs to the caller. The cell grid is allocated and freed inside the call.
+**Memory:** out belongs to the caller. The cell grid lives in the chart's scratch, which only grows, so repeated frames of one size allocate nothing but the growth of out.
 
 **Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
 
