@@ -4268,7 +4268,7 @@ Writes a scene as an SVG document sized to the target. The root carries viewBox,
 |---|---|---|
 | `s` | `MpScene*` | The scene. Valid: non-zero, with no polyline or path open. |
 | `t` | `MpTarget*` | The target; only width and height are read. Valid: non-zero, width and height finite and in (0, 1e9). |
-| `font` | `string` | CSS font-family list for every text node. Valid: any; "" uses a system-ui stack. |
+| `font` | `string` | CSS font-family list for every text node. Valid: any; "" uses MP_FONT_STACK. |
 | `label` | `string` | Accessible name (usually the chart title). Valid: any; "" omits it. |
 | `out` | `MpBuf*` | Receives the document. Valid: non-zero; cleared first. |
 

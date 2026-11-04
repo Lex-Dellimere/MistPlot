@@ -9,8 +9,8 @@ import "mistplot/core/geom";
 import "mistplot/scene/scene";
 import "mistplot/scene/path";
 
-fn red() -> MpColor { return mp_color_a(255, 0, 0, 255); }
-fn none() -> MpColor { return mp_color_a(0, 0, 0, 0); }
+fn red() -> MpColor { return mp_rgba(255, 0, 0, 255); }
+fn none() -> MpColor { return mp_rgba(0, 0, 0, 0); }
 
 fn check_basic() {
   var live0: int64 = mp_alloc_live();

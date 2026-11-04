@@ -322,9 +322,9 @@ fn scene_blank(kind: int32, cls: int32) -> MpNode {
   nd.size = 0.0;
   nd.r = 0.0;
   nd.stroke_w = 0.0;
-  nd.fill = mp_color_a(0, 0, 0, 0);
-  nd.fill2 = mp_color_a(0, 0, 0, 0);
-  nd.stroke = mp_color_a(0, 0, 0, 0);
+  nd.fill = mp_rgba(0, 0, 0, 0);
+  nd.fill2 = mp_rgba(0, 0, 0, 0);
+  nd.stroke = mp_rgba(0, 0, 0, 0);
   nd.pts_off = (int32)0;
   nd.pts_len = (int32)0;
   nd.cmd_off = (int32)0;

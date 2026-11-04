@@ -16,15 +16,15 @@ fn wp(b: MpBuf*, s: string) {
   if (mp_buf_puts(b, s) != MP_OK) { mp_expect("expected document append", false); }
 }
 
-fn none() -> MpColor { return mp_color_a(0, 0, 0, 0); }
-fn blue() -> MpColor { return mp_color_a(66, 105, 208, 255); }
+fn none() -> MpColor { return mp_rgba(0, 0, 0, 0); }
+fn blue() -> MpColor { return mp_rgba(66, 105, 208, 255); }
 
 fn build_sample(s: MpScene*) {
-  mp_scene_rect(s, mp_rect(0.0, 0.0, 120.0, 80.0), mp_color_a(255, 255, 255, 255), none(),
+  mp_scene_rect(s, mp_rect(0.0, 0.0, 120.0, 80.0), mp_rgba(255, 255, 255, 255), none(),
                 0.0, MP_CLS_BG);
-  mp_scene_line(s, 10.0, 60.5, 110.0, 60.5, mp_color_a(229, 231, 235, 255), 1.0,
+  mp_scene_line(s, 10.0, 60.5, 110.0, 60.5, mp_rgba(229, 231, 235, 255), 1.0,
                 MP_CLS_GRID);
-  mp_scene_path_begin(s, 4, 4, mp_color_a(66, 105, 208, 71), mp_color_a(66, 105, 208, 5),
+  mp_scene_path_begin(s, 4, 4, mp_rgba(66, 105, 208, 71), mp_rgba(66, 105, 208, 5),
                       none(), 0.0, 0, MP_NF_GRADIENT, MP_CLS_SERIES);
   mp_scene_path_move(s, 10.0, 60.0);
   mp_scene_path_cubic(s, 30.0, 20.0, 50.0, 20.0, 70.0, 40.0);
@@ -36,13 +36,13 @@ fn build_sample(s: MpScene*) {
   mp_scene_poly_add(s, 40.125, 33.333);
   mp_scene_poly_add(s, 70.0, 40.0);
   mp_scene_poly_end(s);
-  mp_scene_marker(s, 40.0, 30.0, 3.5, MP_MARK_CIRCLE, mp_color_a(66, 105, 208, 204),
-                  mp_color_a(255, 255, 255, 255), 1.0, MP_CLS_SERIES + 1);
+  mp_scene_marker(s, 40.0, 30.0, 3.5, MP_MARK_CIRCLE, mp_rgba(66, 105, 208, 204),
+                  mp_rgba(255, 255, 255, 255), 1.0, MP_CLS_SERIES + 1);
   mp_scene_marker(s, 50.0, 30.0, 3.0, MP_MARK_DIAMOND, blue(), none(), 0.0,
                   MP_CLS_SERIES + 2);
-  mp_scene_text(s, 12.0, 15.0, "Q&A <1>", 15.0, mp_color_a(17, 24, 39, 255),
+  mp_scene_text(s, 12.0, 15.0, "Q&A <1>", 15.0, mp_rgba(17, 24, 39, 255),
                 MP_ALIGN_START, MP_NF_BOLD, MP_CLS_TITLE, 50.0);
-  mp_scene_text(s, 110.0, 75.0, "1.5k", 11.0, mp_color_a(107, 114, 128, 255),
+  mp_scene_text(s, 110.0, 75.0, "1.5k", 11.0, mp_rgba(107, 114, 128, 255),
                 MP_ALIGN_END, MP_NF_TABULAR, MP_CLS_TICK, 20.0);
 }
 
@@ -50,7 +50,7 @@ fn want_sample(w: MpBuf*) {
   wp(w, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 120 80\" width=\"120\"");
   wp(w, " height=\"80\" style=\"max-width:100%;height:auto\" role=\"img\"");
   wp(w, " aria-label=\"Q&amp;A &quot;chart&quot;\" font-family=\"system-ui,");
-  wp(w, " -apple-system, Segoe UI, Roboto, Arial, sans-serif\">\n");
+  wp(w, " -apple-system, Segoe UI, Roboto, Helvetica Neue, Arial, sans-serif\">\n");
   wp(w, "  <rect x=\"0\" y=\"0\" width=\"120\" height=\"80\" fill=\"#ffffff\"");
   wp(w, " class=\"mp-c-bg\"/>\n");
   wp(w, "  <line x1=\"10\" y1=\"60.5\" x2=\"110\" y2=\"60.5\" stroke=\"#e5e7eb\"");
@@ -108,8 +108,8 @@ fn check_gradients() {
   if (s == 0 || out == 0 || w == 0) { return; }
   var k: int32 = 0;
   while (k < 3) {
-    var top: MpColor = mp_color_a(255, 0, 0, 255);
-    if (k == 2) { top = mp_color_a(0, 0, 255, 128); }
+    var top: MpColor = mp_rgba(255, 0, 0, 255);
+    if (k == 2) { top = mp_rgba(0, 0, 255, 128); }
     mp_scene_path_begin(s, 2, 2, top, none(), none(), 0.0, 0, MP_NF_GRADIENT, 0);
     mp_scene_path_move(s, 0.0, 0.0);
     mp_scene_path_line(s, 1.0, 1.0);
@@ -152,7 +152,8 @@ fn check_dotted_square() {
   mp_svg_scene(s, &t, "", "", out);
   wp(w, "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 8 8\" width=\"8\"");
   wp(w, " height=\"8\" style=\"max-width:100%;height:auto\" role=\"img\"");
-  wp(w, " font-family=\"system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif\">\n");
+  wp(w, " font-family=\"system-ui, -apple-system, Segoe UI, Roboto, Helvetica Neue,");
+  wp(w, " Arial, sans-serif\">\n");
   wp(w, "  <polyline points=\"0,2 4,2\" fill=\"none\" stroke=\"#4269d0\" stroke-width=\"1.5\"");
   wp(w, " stroke-linecap=\"round\" stroke-dasharray=\"0.01 3\" class=\"mp-c-series mp-s-12\"/>\n");
   wp(w, "  <rect x=\"3\" y=\"3\" width=\"4\" height=\"4\" fill=\"none\" stroke=\"#4269d0\"");

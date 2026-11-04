@@ -13,8 +13,6 @@ import "mistplot/core/target";
 import "mistplot/scene/scene";
 import "mistplot/scene/path";
 
-const SVG_FONT_DEFAULT: string = "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
-
 // Gradient ids already written in this document; more distinct gradients than this are
 // written again before each use (same id, same definition, so still correct).
 const SVG_MAX_GRADS: int32 = 32;
@@ -360,7 +358,7 @@ fn svg_root(st: SvgState*, w: float64, h: float64, font: string, label: string) 
     svg_c(st, 34);
   }
   svg_s(st, " font-family=\"");
-  if (font.length > 0) { svg_esc(st, font); } else { svg_esc(st, SVG_FONT_DEFAULT); }
+  if (font.length > 0) { svg_esc(st, font); } else { svg_esc(st, MP_FONT_STACK); }
   svg_s(st, "\">\n");
 }
 
@@ -374,8 +372,8 @@ fn svg_root(st: SvgState*, w: float64, h: float64, font: string, label: string) 
 /// @param s The scene. Valid: non-zero, with no polyline or path open.
 /// @param t The target; only width and height are read. Valid: non-zero, width and height
 ///   finite and in (0, 1e9).
-/// @param font CSS font-family list for every text node. Valid: any; "" uses a system-ui
-///   stack.
+/// @param font CSS font-family list for every text node. Valid: any; "" uses
+///   MP_FONT_STACK.
 /// @param label Accessible name (usually the chart title). Valid: any; "" omits it.
 /// @param out Receives the document. Valid: non-zero; cleared first.
 /// @return MP_OK, or an error code.
