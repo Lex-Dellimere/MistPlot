@@ -1,19 +1,19 @@
 // backends/web/page — the two symbols a web handler calls: chart -> SVG bytes,
 // and chart -> an HTML <figure> fragment.
 //
-// Dependencies (docs/02-seams.md §5, docs/04-integration.md §8): this is the
-// only module allowed to import both chart/{spec,resolve} and backends/web/svg.
-// It owns no rendering logic of its own: mp_chart_render fills a scene,
-// mp_svg_render serializes it, and this file only adds the <figure> wrapper.
+// Dependencies: this is the only module allowed to import both
+// chart/{spec,resolve} and backends/web/svg. It owns no rendering logic of its
+// own: mp_chart_render fills a scene, mp_svg_render serializes it, and this
+// file only adds the <figure> wrapper.
 //
 // Ownership: both entry points clear `out` and write only into it. The scene
 // and the intermediate SVG buffer are allocated here and freed here (one owner
 // each, `defer` right after the null check), so a handler only owns `out` and
-// gets a borrowed `string` back (docs/04-integration.md §1: a template that
-// keeps the bytes copies them). On failure the return is the failing step's
-// error code with a partial or empty `out`; nothing is leaked.
+// gets a borrowed `string` back (a template that keeps the bytes copies them).
+// On failure the return is the failing step's error code with a partial or
+// empty `out`; nothing is leaked.
 //
-// Fragment shape (docs/03-phase1.md §7 indentation, extended one level):
+// Fragment shape (the SVG's indentation, extended one level):
 //   <figure class="mp-figure">
 //     <svg ...>            <- the standalone document, every line +2 spaces
 //       <rect ... />

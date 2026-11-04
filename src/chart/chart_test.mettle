@@ -1,5 +1,6 @@
 // chart/chart_test — layout margins, the clamp path, pinned ticks, the three
-// chart kinds, bar geometry and the resolver's argument contract.
+// chart kinds, bar geometry, the resolver's argument contract, fixed axis
+// domains, out-of-domain marks and the MP_FMT_TIME labels.
 //
 // Pure: no files, no externs. The same checks run in the compile-time
 // interpreter (`mbuild test`) and as a compiled program (debug and release,
@@ -385,17 +386,25 @@ fn check_layout() {
   mp_expect("the plot shrinks when the margin grows",
             f2.plot.w < f.plot.w);
 
-  // ... and with the y axis title (7 chars = 48.72 > 20.88).
+  // ... and with the y axis title (7 chars = 48.72): it is horizontal and sits
+  // in its own band above the plot, so it costs th + 4 = 18.4 of height and no
+  // width, and never overlaps a y tick label (the top one reaches th/2 above
+  // plot.y).
   spec.y_label = "Revenue";
   var f3: MpFrame;
   mp_layout_compute(&spec, &xv[0], 3, &yv[0], 3, xs, ys, &f3);
-  mp_expect_near("auto left from a y title", f3.plot.x, 58.72, 1e-9);
-  mp_expect("left margin grows with the y title", f3.plot.x > f.plot.x);
-  mp_expect_near("y title band is the left margin minus its pad",
-                 f3.y_label.w, 48.72, 1e-9);
-  mp_expect_near("y title is centred on the plot",
-                 f3.y_label.y + f3.y_label.h * 0.5,
-                 f3.plot.y + f3.plot.h * 0.5, 1e-9);
+  mp_expect_near("a y title does not widen the left margin", f3.plot.x,
+                 f.plot.x, 1e-9);
+  mp_expect_near("a y title adds one th + 4 band on top", f3.plot.y,
+                 f.plot.y + 18.4, 1e-9);
+  mp_expect_near("y title rect is its measured width", f3.y_label.w, 48.72,
+                 1e-9);
+  mp_expect_near("y title starts at the canvas edge", f3.y_label.x, 0.0,
+                 1e-12);
+  mp_expect("y title clears the top y tick label",
+            f3.y_label.y + f3.y_label.h <=
+            f3.plot.y - mp_layout_text_h() * 0.5 + 1e-9);
+  mp_expect("y title stays below the canvas top", f3.y_label.y >= 0.0);
   spec.y_label = "";
 
   // ... and with the title / subtitle (top).
@@ -557,8 +566,9 @@ fn check_ticks_pinned() {
   mp_expect_near("0..97 tick 3", out[3], 60.0, 1e-12);
   mp_expect_near("0..97 tick 4", out[4], 80.0, 1e-12);
 
-  // The same domain through the chart layer: y = 0..97 renders exactly those
-  // five labels, in order, right-aligned against the value axis.
+  // The same data through the chart layer: an auto y domain 0..97 is extended
+  // to the next tick (nice range), so the axis reads 0..100 and the top tick
+  // is labelled — six labels, in order, right-aligned against the value axis.
   var ser: MpSeries[] = new MpSeries[1];
   if (ser.data == 0) {
     mp_expect("tick fixture", false);
@@ -584,23 +594,36 @@ fn check_ticks_pinned() {
                 (int64)MP_OK);
   var labels: string[8];
   var got: int32 = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_END, &labels[0], 8);
-  mp_expect_i64("0..97 y tick label count", (int64)got, (int64)5);
-  if (got == 5) {
+  mp_expect_i64("0..97 y tick label count (nice top tick)", (int64)got,
+                (int64)6);
+  if (got == 6) {
     mp_expect_str("0..97 y label 0", labels[0], "0");
     mp_expect_str("0..97 y label 1", labels[1], "20");
     mp_expect_str("0..97 y label 2", labels[2], "40");
     mp_expect_str("0..97 y label 3", labels[3], "60");
     mp_expect_str("0..97 y label 4", labels[4], "80");
+    mp_expect_str("0..97 nice range labels the top tick", labels[5], "100");
   }
-  // The step shows up as the pixel spacing of the grid lines: 80 units of a
-  // 0..97 domain inside a 367.6 px plot.
+  // The step shows up as the pixel spacing of the grid lines: 20 units of the
+  // nice 0..100 domain; the 100 tick lies exactly on the plot top.
   var plot: MpRect = t_plot_rect(sc);
   var g0: MpNode* = t_nth_kind(sc, MP_NODE_LINE, 0);
   var g1: MpNode* = t_nth_kind(sc, MP_NODE_LINE, 1);
   if (g0 != 0 && g1 != 0) {
     // y grows downwards, so the second tick sits 20 units *above* the first.
     mp_expect_near("0..97 grid spacing is 20 units",
-                   g0->y - g1->y, 20.0 * plot.h / 97.0, 1e-9);
+                   g0->y - g1->y, 20.0 * plot.h / 100.0, 1e-9);
+  }
+  var g5: MpNode* = t_nth_kind(sc, MP_NODE_LINE, 5);
+  if (g5 != 0) {
+    mp_expect_near("0..97 nice top grid line is the plot top", g5->y, plot.y,
+                   1e-9);
+  }
+  // The data maximum (97) no longer touches the plot top.
+  var pl: MpNode* = t_nth_kind(sc, MP_NODE_POLY, 0);
+  if (pl != 0) {
+    var pp: float64* = mp_scene_node_pts(sc, pl);
+    mp_expect("0..97 tallest point is below the plot top", pp[5] > plot.y);
   }
   mp_scene_free(sc);
   t_series_drop(&ser[0]);
@@ -935,18 +958,20 @@ fn check_legend_bottom() {
   free(ser.data);
 }
 
-// Wave-5 B3: the right legend's vertical clamp must test the box the swatch is
-// *drawn* in. chart_legend_item draws at `row_y + 3`; the old guard tested
-// `row_y + 12`, so the last row before the cutoff overflowed the canvas by up
-// to 3 px. Fixture: 3 series x 5 bands (y = 10/20/30 + 3j, x = 0..4),
-// 200x80, title "Orders & returns", y_label "orders", right legend.
+// The right legend's vertical clamp must test the box the swatch is *drawn*
+// in: chart_legend_item draws at `row_y + 3`, and a guard on `row_y + 12` lets
+// the last row before the cutoff overflow the canvas by up to 3 px. Fixture:
+// 3 series x 5 bands (y = 10/20/30 + 3j, x = 0..4), 200x80, title
+// "Orders & returns", y_label "orders", right legend.
 //
 // Layout, all exact (th = 14.4, one char = 6.96):
 //   top    = 1.6*th + 8                = 23.04 + 8      = 31.04
-//   left   = max("40"=13.92, "orders"=41.76) + 10        = 51.76
+//   left   = widest y tick "50"=13.92 + 10               = 23.92
 //   right  = legend_w + 12 = (13.92+24) + 12            = 49.92
 //   bottom = th + 10                                     = 24.4
-//   plot   = (51.76, 31.04, 98.32, 24.56)
+//   plot   = (23.92, 31.04, 126.16, 24.56)
+// (No y title: it would take its own th + 4 band on top and leave a 6 px plot,
+// which tests nothing about the legend.)
 //   legend = (200-49.92+6 = 156.08, 31.04, 37.92, 3*18 = 54)
 // Rows sit at 31.04, 49.04, 67.04; swatch tops at +3, so the third bottom is
 // 70.04 + 12 = 82.04 > 80: the third row must be dropped, not drawn.
@@ -979,7 +1004,6 @@ fn check_legend_overflow() {
   spec.width = 200.0;
   spec.height = 80.0;
   spec.title = "Orders & returns";
-  spec.y_label = "orders";
   var sc: MpScene* = mp_scene_new();
   if (sc == 0) {
     mp_expect("legend overflow scene", false);
@@ -989,7 +1013,7 @@ fn check_legend_overflow() {
                 (int64)mp_chart_render(&spec, sc), (int64)MP_OK);
   var plot: MpRect = t_plot_rect(sc);
   t_rect_near("legend overflow plot", t_nth_kind(sc, MP_NODE_RECT, 1),
-              51.76, 31.04, 98.32, 24.56);
+              23.92, 31.04, 126.16, 24.56);
   mp_expect_near("legend overflow plot right", plot.x + plot.w, 150.08, 1e-9);
   // The band still reserves all three rows (3*18); only two are drawn.
   mp_expect_i64("legend overflow: two swatches, the third row is dropped",
@@ -1014,7 +1038,19 @@ fn check_legend_overflow() {
   }
   mp_expect_i64("legend overflow: 19 rects (bg, plot, 15 bars, 2 swatches)",
                 t_count_kind(sc, MP_NODE_RECT), (int64)19);
-  mp_expect_i64("legend overflow node count", mp_scene_count(sc), (int64)45);
+  // y data 0..42 is extended to the nice domain 0..50: six y ticks and six
+  // grid lines, but the 24.56 px plot cannot hold six 14.4 px labels, so the
+  // labels are thinned to the uniform stride 4: "0" and "40" (42 nodes = 46
+  // with every label, minus four).
+  mp_expect_i64("legend overflow node count", mp_scene_count(sc), (int64)42);
+  var ylabs: string[8];
+  var nyl: int32 = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_END, &ylabs[0], 8);
+  mp_expect_i64("legend overflow: y labels thinned to stride 4", (int64)nyl,
+                (int64)2);
+  if (nyl == 2) {
+    mp_expect_str("legend overflow: first y label", ylabs[0], "0");
+    mp_expect_str("legend overflow: second y label", ylabs[1], "40");
+  }
   mp_expect_i64("legend overflow series rects",
                 t_count_series(sc), (int64)15);
   // Every node, with align-aware TEXT boxes and no epsilon, is inside
@@ -1299,7 +1335,625 @@ fn check_stress() {
   free(ser.data);
 }
 
-// ------------------------------------------------------------------- main
+// ------------------------------------------------------ fixed domains
+
+// Defaults: nothing is fixed.
+fn check_fixed_defaults() {
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, 0, 0);
+  mp_expect("x_fixed defaults to false", !spec.x_fixed);
+  mp_expect("y_fixed defaults to false", !spec.y_fixed);
+  mp_expect_near("x_min default", spec.x_min, 0.0, 0.0);
+  mp_expect_near("x_max default", spec.x_max, 0.0, 0.0);
+  mp_expect_near("y_min default", spec.y_min, 0.0, 0.0);
+  mp_expect_near("y_max default", spec.y_max, 0.0, 0.0);
+}
+
+// Pinned clamping: 600x400 with margins (10,20,30,40) puts the plot at
+// (40,10,540,360). x is fixed to [0.5,1.5] (540 px per unit) and y to
+// [1.5,2.5] (360 px per unit), so (1,2) is the plot centre and (0,1) / (2,3)
+// land outside and are clamped onto the corners.
+fn check_fixed_line() {
+  var ser: MpSeries[] = new MpSeries[2];
+  if (ser.data == 0) {
+    mp_expect("fixed line fixture", false);
+    return;
+  }
+  t_fixture(&ser[0]);
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, &ser[0], 2);
+  spec.width = 600.0;
+  spec.height = 400.0;
+  spec.margin_auto = false;
+  spec.margins = mp_insets(10.0, 20.0, 30.0, 40.0);
+  spec.legend = MP_LEGEND_NONE;
+  spec.x_fixed = true;
+  spec.x_min = 0.5;
+  spec.x_max = 1.5;
+  spec.y_fixed = true;
+  spec.y_min = 1.5;
+  spec.y_max = 2.5;
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("fixed line scene", false);
+    return;
+  }
+  mp_expect_i64("fixed line rc", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+  var plot: MpRect = t_plot_rect(sc);
+  mp_expect_near("fixed line plot x", plot.x, 40.0, 1e-12);
+  mp_expect_near("fixed line plot h", plot.h, 360.0, 1e-12);
+  mp_expect_i64("fixed line keeps both polylines",
+                t_count_kind(sc, MP_NODE_POLY), (int64)2);
+  mp_expect_i64("clamped points stay inside the plot",
+                t_poly_outside(sc, plot), (int64)0);
+  var nd: MpNode* = t_nth_kind(sc, MP_NODE_POLY, 0);
+  if (nd != 0) {
+    mp_expect_i64("clamping keeps every point", (int64)nd->pts_len, (int64)6);
+    var p: float64* = mp_scene_node_pts(sc, nd);
+    mp_expect_near("(0,1) clamps to the left edge", p[0], 40.0, 1e-9);
+    mp_expect_near("(0,1) clamps to the bottom edge", p[1], 370.0, 1e-9);
+    mp_expect_near("(1,2) maps to the centre x", p[2], 310.0, 1e-9);
+    mp_expect_near("(1,2) maps to the centre y", p[3], 190.0, 1e-9);
+    mp_expect_near("(2,3) clamps to the right edge", p[4], 580.0, 1e-9);
+    mp_expect_near("(2,3) clamps to the top edge", p[5], 10.0, 1e-9);
+  }
+  mp_scene_free(sc);
+  t_drop_fixture(&ser[0]);
+  free(ser.data);
+}
+
+// The fixed domain drives the ticks (and y_start_at_zero is ignored), and a
+// fixed log domain still picks the log ticks.
+fn check_fixed_ticks() {
+  var ser: MpSeries[] = new MpSeries[2];
+  if (ser.data == 0) {
+    mp_expect("fixed tick fixture", false);
+    return;
+  }
+  t_fixture(&ser[0]);
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, &ser[0], 2);
+  spec.legend = MP_LEGEND_NONE;
+  spec.y_fixed = true;
+  spec.y_min = 10.0;
+  spec.y_max = 20.0;
+  spec.x_fixed = true;
+  spec.x_min = 100.0;
+  spec.x_max = 200.0;
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("fixed tick scene", false);
+    return;
+  }
+  mp_expect_i64("fixed tick rc", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+  var labels: string[16];
+  var got: int32 = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_END, &labels[0],
+                                  16);
+  mp_expect_i64("fixed y [10,20] label count", (int64)got, (int64)6);
+  if (got == 6) {
+    mp_expect_str("fixed y label 0 (no zero baseline)", labels[0], "10");
+    mp_expect_str("fixed y label 1", labels[1], "12");
+    mp_expect_str("fixed y label 5", labels[5], "20");
+  }
+  got = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_CENTER, &labels[0], 16);
+  mp_expect_i64("fixed x [100,200] label count", (int64)got, (int64)6);
+  if (got == 6) {
+    mp_expect_str("fixed x label 0", labels[0], "100");
+    mp_expect_str("fixed x label 5", labels[5], "200");
+  }
+  // All data is left of the x domain: every point clamps onto the left edge.
+  var plot: MpRect = t_plot_rect(sc);
+  mp_expect_i64("out-of-domain points still inside the plot",
+                t_poly_outside(sc, plot), (int64)0);
+
+  spec.x_fixed = false;
+  spec.y_kind = MP_SCALE_LOG;
+  spec.y_min = 1.0;
+  spec.y_max = 1000.0;
+  mp_expect_i64("fixed log rc", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+  got = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_END, &labels[0], 16);
+  mp_expect_i64("fixed log label count", (int64)got, (int64)4);
+  if (got == 4) {
+    mp_expect_str("fixed log label 0", labels[0], "1");
+    mp_expect_str("fixed log label 3", labels[3], "1000");
+  }
+  mp_scene_free(sc);
+  t_drop_fixture(&ser[0]);
+  free(ser.data);
+}
+
+// Scatter points outside a fixed domain are skipped, not clamped.
+fn check_fixed_scatter() {
+  var ser: MpSeries[] = new MpSeries[2];
+  if (ser.data == 0) {
+    mp_expect("fixed scatter fixture", false);
+    return;
+  }
+  t_fixture(&ser[0]);
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_SCATTER, &ser[0], 2);
+  spec.x_fixed = true;
+  spec.x_min = 0.5;
+  spec.x_max = 2.0;
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("fixed scatter scene", false);
+    return;
+  }
+  mp_expect_i64("fixed scatter rc", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+  mp_expect_i64("x outside [0.5,2] skipped", t_count_kind(sc, MP_NODE_CIRCLE),
+                (int64)4);
+  spec.y_fixed = true;
+  spec.y_min = 1.5;
+  spec.y_max = 3.0;
+  mp_expect_i64("fixed scatter rc 2", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+  // Left: (1,2) (2,3) of series 0 and (1,2) of series 1; (2,1) is below y.
+  mp_expect_i64("x and y outside skipped", t_count_kind(sc, MP_NODE_CIRCLE),
+                (int64)3);
+  mp_expect_i64("fixed scatter inside the canvas",
+                t_outside(sc, 640.0, 400.0), (int64)0);
+  mp_scene_free(sc);
+  t_drop_fixture(&ser[0]);
+  free(ser.data);
+}
+
+// Bars outside a fixed y domain are skipped and the rest are clipped to the
+// plot. Same pinned frame as check_bar: plot (40,10,540,360); y fixed to
+// [1.5,3] gives 240 px per unit, so map(2) = 250, map(3) = 10, and the zero
+// baseline (730) lies below the plot and is clipped to 370.
+fn check_fixed_bar() {
+  var ser: MpSeries[] = new MpSeries[2];
+  if (ser.data == 0) {
+    mp_expect("fixed bar fixture", false);
+    return;
+  }
+  t_fixture(&ser[0]);
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_BAR, &ser[0], 2);
+  spec.width = 600.0;
+  spec.height = 400.0;
+  spec.margin_auto = false;
+  spec.margins = mp_insets(10.0, 20.0, 30.0, 40.0);
+  spec.legend = MP_LEGEND_NONE;
+  spec.bar_gap = 0.25;
+  spec.y_fixed = true;
+  spec.y_min = 1.5;
+  spec.y_max = 3.0;
+  // A bar's x axis is a band axis: x_fixed is ignored (but still validated).
+  spec.x_fixed = true;
+  spec.x_min = 100.0;
+  spec.x_max = 101.0;
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("fixed bar scene", false);
+    return;
+  }
+  mp_expect_i64("fixed bar rc", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+  mp_expect_i64("bars with y = 1 skipped", t_count_series(sc), (int64)4);
+  var nd: MpNode* = t_nth_series(sc, MP_NODE_RECT, 0);
+  if (nd != 0) { t_rect_near("s0 band 1 clipped", nd, 220.0, 250.0, 67.5,
+                             120.0); }
+  nd = t_nth_series(sc, MP_NODE_RECT, 1);
+  if (nd != 0) { t_rect_near("s0 band 2 clipped", nd, 400.0, 10.0, 67.5,
+                             360.0); }
+  nd = t_nth_series(sc, MP_NODE_RECT, 2);
+  if (nd != 0) { t_rect_near("s1 band 0 clipped", nd, 130.0, 10.0, 67.5,
+                             360.0); }
+  nd = t_nth_series(sc, MP_NODE_RECT, 3);
+  if (nd != 0) { t_rect_near("s1 band 1 clipped", nd, 310.0, 250.0, 67.5,
+                             120.0); }
+  mp_expect_i64("fixed bars inside the canvas", t_outside(sc, 600.0, 400.0),
+                (int64)0);
+  mp_scene_free(sc);
+  t_drop_fixture(&ser[0]);
+  free(ser.data);
+}
+
+fn check_fixed_errors() {
+  var ser: MpSeries[] = new MpSeries[2];
+  if (ser.data == 0) {
+    mp_expect("fixed error fixture", false);
+    return;
+  }
+  t_fixture(&ser[0]);
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, &ser[0], 2);
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("fixed error scene", false);
+    return;
+  }
+  // Bounds are ignored while the flag is off.
+  spec.x_min = NAN();
+  spec.x_max = 0.0 - INF();
+  spec.y_min = 5.0;
+  spec.y_max = 5.0;
+  mp_expect_i64("garbage bounds without the flag", (int64)mp_chart_render(&spec,
+                sc), (int64)MP_OK);
+  mp_expect_i64("garbage bounds render the unfixed frame",
+                mp_scene_count(sc), (int64)28);
+  spec.y_fixed = true;
+  mp_expect_i64("fixed y min == max", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("an invalid fixed domain clears the scene",
+                mp_scene_count(sc), (int64)0);
+  spec.y_min = 6.0;
+  mp_expect_i64("fixed y min > max", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_ERR_ARG);
+  spec.y_min = 0.0;
+  spec.y_max = INF();
+  mp_expect_i64("fixed y max inf", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_ERR_ARG);
+  spec.y_fixed = false;
+  spec.x_fixed = true;
+  mp_expect_i64("fixed x nan", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_ERR_ARG);
+  // Regression: finite bounds whose span overflows (-1e308 .. 1e308) are
+  // refused too — every scale over them would map NaN.
+  spec.x_min = -1.0e308;
+  spec.x_max = 1.0e308;
+  mp_expect_i64("fixed x with a non-finite span", (int64)mp_chart_render(&spec,
+                sc), (int64)MP_ERR_ARG);
+  spec.x_fixed = false;
+  spec.y_fixed = true;
+  spec.y_min = -1.0e308;
+  spec.y_max = 1.0e308;
+  mp_expect_i64("fixed y with a non-finite span", (int64)mp_chart_render(&spec,
+                sc), (int64)MP_ERR_ARG);
+  spec.y_fixed = false;
+  spec.x_fixed = true;
+  spec.x_min = 0.0;
+  spec.x_max = 2.0;
+  mp_expect_i64("valid fixed x", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+  // Empty data with a fixed domain is still background-only, not an error.
+  spec.n_series = 1;
+  var empty: MpSeries[] = new MpSeries[1];
+  if (empty.data != 0) {
+    t_series(&empty[0], "e", 0, 0, 0);
+    spec.series = &empty[0];
+    spec.y_fixed = true;
+    spec.y_min = 0.0;
+    spec.y_max = 1.0;
+    mp_expect_i64("empty fixed rc", (int64)mp_chart_render(&spec, sc),
+                  (int64)MP_OK);
+    mp_expect_i64("empty fixed renders the background", mp_scene_count(sc),
+                  (int64)1);
+    free(empty.data);
+  }
+  mp_scene_free(sc);
+  t_drop_fixture(&ser[0]);
+  free(ser.data);
+}
+
+// MP_FMT_TIME through the chart layer: labels are clocks.
+fn check_time_format() {
+  var b: uint8[64];
+  mp_expect_str("TIME label", mp_chart_fmt_value(65.0, MP_FMT_TIME, &b[0], 64),
+                "01:05");
+  mp_expect_str("TIME label hours", mp_chart_fmt_value(3725.0, MP_FMT_TIME,
+                &b[0], 64), "1:02:05");
+  mp_expect_str("TIME label NaN falls back", mp_chart_fmt_value(NAN(),
+                MP_FMT_TIME, &b[0], 64), "NaN");
+  var ser: MpSeries[] = new MpSeries[2];
+  if (ser.data == 0) {
+    mp_expect("time fixture", false);
+    return;
+  }
+  t_fixture(&ser[0]);
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, &ser[0], 2);
+  spec.legend = MP_LEGEND_NONE;
+  spec.x_format = MP_FMT_TIME;
+  spec.x_fixed = true;
+  spec.x_min = 3540.0;
+  spec.x_max = 3660.0;
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("time scene", false);
+    return;
+  }
+  mp_expect_i64("time render rc", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+  var labels: string[16];
+  var got: int32 = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_CENTER, &labels[0],
+                                  16);
+  // [3540, 3660] takes the clock step 30 s (5 ticks, the target): 59:00 ..
+  // 1:01:00 across the hour.
+  mp_expect_i64("time x label count", (int64)got, (int64)5);
+  if (got == 5) {
+    mp_expect_str("time x label 0", labels[0], "59:00");
+    mp_expect_str("time x label 1", labels[1], "59:30");
+    mp_expect_str("time x label 2", labels[2], "1:00:00");
+    mp_expect_str("time x label 4", labels[4], "1:01:00");
+  }
+  mp_expect_i64("time labels stay inside the canvas",
+                t_outside(sc, 640.0, 400.0), (int64)0);
+  mp_scene_free(sc);
+  t_drop_fixture(&ser[0]);
+  free(ser.data);
+}
+
+// --------------------------------------------------------------- axes and info
+
+// Renders one series (xs, ys, n) of `kind` into `sc` at w x h with no legend;
+// returns the render rc and fills `info`.
+fn t_render1(sc: MpScene*, kind: int32, xs: float64*, ys: float64*, n: int32,
+             w: float64, h: float64, xfmt: int32, info: MpChartInfo*) -> int32 {
+  var ser: MpSeries[] = new MpSeries[1];
+  if (ser.data == 0) { return MP_ERR_ALLOC; }
+  t_series(&ser[0], "s", xs, ys, n);
+  var spec: MpChartSpec = mp_chart_spec(kind, &ser[0], 1);
+  spec.legend = MP_LEGEND_NONE;
+  spec.width = w;
+  spec.height = h;
+  spec.x_format = xfmt;
+  var rc: int32 = mp_chart_render_info(&spec, sc, info);
+  t_series_drop(&ser[0]);
+  free(ser.data);
+  return rc;
+}
+
+// x = [0, 2] with MP_FMT_TIME must not label 00:00 00:00 00:01 00:01 00:02.
+// Time ticks use clock steps, and a sub-second step switches the labels to
+// tenths, so they are distinct.
+fn check_time_ticks() {
+  var b: uint8[64];
+  mp_expect_str("tenths rounds, not truncates",
+                mp_fmt_clock_tenths(0.29999, &b[0], 64), "00:00.3");
+  mp_expect_str("tenths of a tiny negative has no sign",
+                mp_fmt_clock_tenths(-0.04, &b[0], 64), "00:00.0");
+  mp_expect_str("tenths negative", mp_fmt_clock_tenths(-1.25, &b[0], 64),
+                "-00:01.3");
+  mp_expect_str("tenths carries into the minute",
+                mp_fmt_clock_tenths(59.95, &b[0], 64), "01:00.0");
+  mp_expect_str("tenths with hours", mp_fmt_clock_tenths(3725.4, &b[0], 64),
+                "1:02:05.4");
+  mp_expect_str("tenths NaN falls back", mp_fmt_clock_tenths(NAN(), &b[0], 64),
+                "NaN");
+  mp_expect_str("TIME_TENTHS through the chart formatter",
+                mp_chart_fmt_value(1.5, MP_FMT_TIME_TENTHS, &b[0], 64),
+                "00:01.5");
+  mp_expect_near("time step for 2 s", mp_tick_step_time(0.0, 2.0, 5), 0.5,
+                 0.0);
+  mp_expect_near("time step for 120 s", mp_tick_step_time(0.0, 120.0, 5),
+                 30.0, 0.0);
+  mp_expect_near("time step for 10 min", mp_tick_step_time(0.0, 600.0, 5),
+                 120.0, 0.0);
+  // 6 h: 2 h gives 4 ticks (|4-5| = 1) and beats 1 h's 7 ticks.
+  mp_expect_near("time step for 6 h", mp_tick_step_time(0.0, 21600.0, 5),
+                 7200.0, 0.0);
+  // 30 days: whole days by the 1/2/5 rule, 10 d (4 ticks) beats 5 d (7).
+  mp_expect_near("time step for 30 days is whole days",
+                 mp_tick_step_time(0.0, 2592000.0, 5), 864000.0, 0.0);
+
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("time ticks scene", false);
+    return;
+  }
+  defer mp_scene_free(sc);
+  var xs: float64[5] = [0.0, 0.5, 1.0, 1.5, 2.0];
+  var ys: float64[5] = [1.0, 2.0, 3.0, 2.0, 1.0];
+  var info: MpChartInfo = mp_chart_info_empty();
+  mp_expect_i64("2 s time render", (int64)t_render1(sc, MP_CHART_LINE, &xs[0],
+                &ys[0], 5, 640.0, 400.0, MP_FMT_TIME, &info), (int64)MP_OK);
+  var labels: string[16];
+  var got: int32 = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_CENTER, &labels[0],
+                                  16);
+  mp_expect_i64("2 s time label count", (int64)got, (int64)5);
+  if (got == 5) {
+    mp_expect_str("2 s label 0", labels[0], "00:00.0");
+    mp_expect_str("2 s label 1", labels[1], "00:00.5");
+    mp_expect_str("2 s label 2", labels[2], "00:01.0");
+    mp_expect_str("2 s label 3", labels[3], "00:01.5");
+    mp_expect_str("2 s label 4", labels[4], "00:02.0");
+  }
+  mp_expect_i64("info reports the tenths format", (int64)info.x_format,
+                (int64)MP_FMT_TIME_TENTHS);
+
+  var xl: float64[2] = [0.0, 600.0];
+  var yl: float64[2] = [1.0, 2.0];
+  t_render1(sc, MP_CHART_LINE, &xl[0], &yl[0], 2, 640.0, 400.0, MP_FMT_TIME,
+            &info);
+  got = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_CENTER, &labels[0], 16);
+  mp_expect_i64("10 min time label count", (int64)got, (int64)6);
+  if (got == 6) {
+    mp_expect_str("10 min label 0", labels[0], "00:00");
+    mp_expect_str("10 min label 1", labels[1], "02:00");
+    mp_expect_str("10 min label 5", labels[5], "10:00");
+  }
+  mp_expect_i64("info keeps the clock format", (int64)info.x_format,
+                (int64)MP_FMT_TIME);
+}
+
+// Uniform-stride thinning on a value axis: a narrow live-style chart over one
+// minute has five 15 s ticks whose 34.8 px labels do not fit side by side, so
+// every second label is drawn (00:00 00:30 01:00), evenly spaced.
+fn check_label_stride() {
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("stride scene", false);
+    return;
+  }
+  defer mp_scene_free(sc);
+  var xs: float64[2] = [0.0, 60.0];
+  var ys: float64[2] = [1.0, 2.0];
+  var info: MpChartInfo = mp_chart_info_empty();
+  mp_expect_i64("stride render", (int64)t_render1(sc, MP_CHART_LINE, &xs[0],
+                &ys[0], 2, 160.0, 120.0, MP_FMT_TIME, &info), (int64)MP_OK);
+  var labels: string[16];
+  var got: int32 = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_CENTER, &labels[0],
+                                  16);
+  mp_expect_i64("stride x label count", (int64)got, (int64)3);
+  if (got == 3) {
+    mp_expect_str("stride label 0", labels[0], "00:00");
+    mp_expect_str("stride label 1", labels[1], "00:30");
+    mp_expect_str("stride label 2", labels[2], "01:00");
+  }
+  // Every tick keeps its grid line: 5 vertical grid lines.
+  var vgrid: int64 = 0;
+  var i: int64 = 0;
+  while (i < mp_scene_count(sc)) {
+    var nd: MpNode* = mp_scene_node(sc, i);
+    if (nd->kind == MP_NODE_LINE && nd->cls == MP_CLS_GRID) {
+      var p: float64* = mp_scene_node_pts(sc, nd);
+      if (p[0] == p[2]) { vgrid = vgrid + 1; }
+    }
+    i = i + 1;
+  }
+  mp_expect_i64("stride keeps every x grid line", vgrid, (int64)5);
+  // A wide chart needs no thinning: all five labels.
+  t_render1(sc, MP_CHART_LINE, &xs[0], &ys[0], 2, 640.0, 400.0, MP_FMT_TIME,
+            &info);
+  got = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_CENTER, &labels[0], 16);
+  mp_expect_i64("wide chart keeps all five labels", (int64)got, (int64)5);
+}
+
+// Bar category labels: categories[j] labels band j, the rest fall back to
+// the band index, and long labels on a narrow chart thin to a uniform stride.
+fn check_categories() {
+  var ser: MpSeries[] = new MpSeries[1];
+  if (ser.data == 0) {
+    mp_expect("categories fixture", false);
+    return;
+  }
+  defer free(ser.data);
+  var xs: float64[3] = [0.0, 1.0, 2.0];
+  var ys: float64[3] = [5.0, 7.0, 3.0];
+  t_series(&ser[0], "s", &xs[0], &ys[0], 3);
+  defer t_series_drop(&ser[0]);
+  var cats: string[3] = ["north", "south", "east"];
+  var spec: MpChartSpec = mp_chart_spec(MP_CHART_BAR, &ser[0], 1);
+  mp_expect("categories default to none", spec.categories == 0 &&
+            spec.n_categories == 0);
+  spec.legend = MP_LEGEND_NONE;
+  spec.categories = &cats[0];
+  spec.n_categories = 3;
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("categories scene", false);
+    return;
+  }
+  defer mp_scene_free(sc);
+  mp_expect_i64("categories render", (int64)mp_chart_render(&spec, sc),
+                (int64)MP_OK);
+  var labels: string[16];
+  var got: int32 = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_CENTER, &labels[0],
+                                  16);
+  mp_expect_i64("category label count", (int64)got, (int64)3);
+  if (got == 3) {
+    mp_expect_str("category 0", labels[0], "north");
+    mp_expect_str("category 1", labels[1], "south");
+    mp_expect_str("category 2", labels[2], "east");
+  }
+  spec.n_categories = 2;
+  mp_chart_render(&spec, sc);
+  got = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_CENTER, &labels[0], 16);
+  mp_expect_i64("partial categories label count", (int64)got, (int64)3);
+  if (got == 3) {
+    mp_expect_str("partial categories: index for the rest", labels[2], "2");
+  }
+
+  // Twelve bands of long names in 300 px: drawn every third band (stride 3:
+  // bands 0, 3, 6, 9).
+  var ser2: MpSeries[] = new MpSeries[1];
+  if (ser2.data == 0) { return; }
+  defer free(ser2.data);
+  var x12: float64[12];
+  var y12: float64[12];
+  var j: int32 = 0;
+  while (j < 12) {
+    x12[(int64)j] = (float64)j;
+    y12[(int64)j] = (float64)(j + 1);
+    j = j + 1;
+  }
+  t_series(&ser2[0], "s", &x12[0], &y12[0], 12);
+  defer t_series_drop(&ser2[0]);
+  var months: string[12] = ["January", "February", "March", "April", "May",
+                            "June", "July", "August", "September", "October",
+                            "November", "December"];
+  var sp2: MpChartSpec = mp_chart_spec(MP_CHART_BAR, &ser2[0], 1);
+  sp2.legend = MP_LEGEND_NONE;
+  sp2.width = 300.0;
+  sp2.height = 200.0;
+  sp2.categories = &months[0];
+  sp2.n_categories = 12;
+  mp_expect_i64("months render", (int64)mp_chart_render(&sp2, sc),
+                (int64)MP_OK);
+  got = t_collect_text(sc, MP_CLS_TICK, MP_ALIGN_CENTER, &labels[0], 16);
+  mp_expect_i64("months thinned label count", (int64)got, (int64)4);
+  if (got == 4) {
+    mp_expect_str("months label 0", labels[0], "January");
+    mp_expect_str("months label 1", labels[1], "April");
+    mp_expect_str("months label 2", labels[2], "July");
+    mp_expect_str("months label 3", labels[3], "October");
+  }
+  mp_expect_i64("months labels inside the canvas", t_outside(sc, 300.0, 200.0),
+                (int64)0);
+}
+
+// MpChartInfo reports exactly the geometry the scene was built with.
+fn check_chart_info() {
+  var sc: MpScene* = mp_scene_new();
+  if (sc == 0) {
+    mp_expect("info scene", false);
+    return;
+  }
+  defer mp_scene_free(sc);
+  var xs: float64[3] = [2.0, 3.0, 4.0];
+  var ys: float64[3] = [10.0, 50.0, 97.0];
+  var info: MpChartInfo = mp_chart_info_empty();
+  mp_expect("empty info is invalid", !info.valid);
+  mp_expect_i64("info line render", (int64)t_render1(sc, MP_CHART_LINE, &xs[0],
+                &ys[0], 3, 640.0, 400.0, MP_FMT_AUTO, &info), (int64)MP_OK);
+  mp_expect("line info valid", info.valid);
+  mp_expect_i64("line info kind", (int64)info.kind, (int64)MP_CHART_LINE);
+  var plot: MpRect = t_plot_rect(sc);
+  mp_expect_near("info plot x", info.plot.x, plot.x, 0.0);
+  mp_expect_near("info plot w", info.plot.w, plot.w, 0.0);
+  mp_expect_near("info x domain is the data extent", info.x0, 2.0, 0.0);
+  mp_expect_near("info x domain end", info.x1, 4.0, 0.0);
+  mp_expect_near("info y domain starts at zero", info.y0, 0.0, 0.0);
+  mp_expect_near("info y domain is the nice top", info.y1, 100.0, 0.0);
+  mp_expect_near("info y scale maps the top to the plot top",
+                 mp_scale_map(info.y, 100.0), plot.y, 1e-9);
+  mp_expect_near("info x scale maps x1 to the plot right",
+                 mp_scale_map(info.x, 4.0), plot.x + plot.w, 1e-9);
+  var pl: MpNode* = t_nth_kind(sc, MP_NODE_POLY, 0);
+  if (pl != 0) {
+    var p: float64* = mp_scene_node_pts(sc, pl);
+    mp_expect_near("info y scale matches the drawn point",
+                   mp_scale_map(info.y, 50.0), p[3], 1e-9);
+  }
+
+  var bx: float64[4] = [0.0, 1.0, 2.0, 3.0];
+  var by: float64[4] = [3.0, 9.0, 4.0, 7.0];
+  t_render1(sc, MP_CHART_BAR, &bx[0], &by[0], 4, 640.0, 400.0, MP_FMT_AUTO,
+            &info);
+  mp_expect("bar info valid", info.valid);
+  mp_expect_i64("bar info bands", (int64)info.n_bands, (int64)4);
+  mp_expect_near("bar info y nice top", info.y1, 10.0, 0.0);
+  // The tallest bar (9) no longer reaches the plot top.
+  var tall: MpNode* = t_nth_series(sc, MP_NODE_RECT, 1);
+  var bplot: MpRect = t_plot_rect(sc);
+  if (tall != 0) {
+    mp_expect("tallest bar stays below the plot top", tall->y > bplot.y);
+  }
+
+  var nx: float64[1] = [NAN()];
+  t_render1(sc, MP_CHART_LINE, &nx[0], &nx[0], 1, 640.0, 400.0, MP_FMT_AUTO,
+            &info);
+  mp_expect("empty data info is invalid", !info.valid);
+  mp_expect_i64("bad width info rc", (int64)t_render1(sc, MP_CHART_LINE, &xs[0],
+                &ys[0], 3, -1.0, 400.0, MP_FMT_AUTO, &info),
+                (int64)MP_ERR_ARG);
+  mp_expect("error info is invalid", !info.valid);
+  mp_expect_i64("null info is allowed", (int64)t_render1(sc, MP_CHART_LINE,
+                &xs[0], &ys[0], 3, 640.0, 400.0, MP_FMT_AUTO, 0),
+                (int64)MP_OK);
+}
+
+// ------------------------------------------------------------------------ main
 
 fn run_all() {
   check_layout();
@@ -1315,6 +1969,17 @@ fn run_all() {
   check_log_axis();
   check_errors();
   check_stress();
+  check_fixed_defaults();
+  check_fixed_line();
+  check_fixed_ticks();
+  check_fixed_scatter();
+  check_fixed_bar();
+  check_fixed_errors();
+  check_time_format();
+  check_time_ticks();
+  check_label_stride();
+  check_categories();
+  check_chart_info();
 }
 
 export fn main() -> int32 {

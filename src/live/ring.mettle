@@ -1,0 +1,124 @@
+// live/ring — MpRing, a fixed-capacity ring of (x, y) samples.
+//
+// Dependencies: core/{buf,data} (MP_* codes, MpExtent) + std/mem, std/math.
+// Nothing chart-shaped: a ring is the storage behind one live series.
+//
+// Ownership: mp_ring_new returns a ring owned by the caller; mp_ring_free
+// releases both columns and the struct (one free path). Nothing is borrowed.
+//
+// Invariants:
+//   * 0 <= n <= cap and 0 <= head < cap; `head` is the slot of the oldest
+//     sample, so logical index i (0 = oldest, n-1 = newest) lives in slot
+//     (head + i) % cap;
+//   * push is O(1): it appends while n < cap and, once full, overwrites the
+//     oldest sample and advances head;
+//   * samples are stored as given, non-finite ones included (a reader such as
+//     mp_ring_extent or live/decimate skips them), so the ring never decides
+//     what a sample means;
+//   * a read outside [0, n) returns NaN instead of touching memory.
+
+import "std/mem";
+import "std/math";
+import "mistplot/core/buf";
+import "mistplot/core/data";
+
+export struct MpRing { xs: float64*; ys: float64*; cap: int64; head: int64;
+                       n: int64; }
+
+// A ring of `cap` samples; 0 on cap <= 0, cap > MP_MAX_COUNT (cap * 8 would
+// risk wrapping into a short allocation that pushes then overrun) or
+// allocation failure.
+export fn mp_ring_new(cap: int64) -> MpRing* {
+  if (cap <= 0 || cap > MP_MAX_COUNT) { return 0; }
+  var r: MpRing* = (MpRing*)malloc(sizeof(MpRing));
+  if (r == 0) { return 0; }
+  var xs: float64* = (float64*)malloc(cap * 8);
+  if (xs == 0) {
+    free(r);
+    return 0;
+  }
+  var ys: float64* = (float64*)malloc(cap * 8);
+  if (ys == 0) {
+    free(xs);
+    free(r);
+    return 0;
+  }
+  r->xs = xs;
+  r->ys = ys;
+  r->cap = cap;
+  r->head = 0;
+  r->n = 0;
+  return r;
+}
+
+export fn mp_ring_free(r: MpRing*) {
+  if (r == 0) { return; }
+  if (r->xs != 0) { free(r->xs); }
+  if (r->ys != 0) { free(r->ys); }
+  free(r);
+}
+
+export fn mp_ring_push(r: MpRing*, x: float64, y: float64) -> int32 {
+  if (r == 0) { return MP_ERR_ARG; }
+  if (r->n < r->cap) {
+    var slot: int64 = (r->head + r->n) % r->cap;
+    r->xs[slot] = x;
+    r->ys[slot] = y;
+    r->n = r->n + 1;
+    return MP_OK;
+  }
+  r->xs[r->head] = x;
+  r->ys[r->head] = y;
+  r->head = (r->head + 1) % r->cap;
+  return MP_OK;
+}
+
+export fn mp_ring_len(r: MpRing*) -> int64 {
+  if (r == 0) { return 0; }
+  return r->n;
+}
+
+export fn mp_ring_cap(r: MpRing*) -> int64 {
+  if (r == 0) { return 0; }
+  return r->cap;
+}
+
+// Logical index -> storage slot; -1 when out of range.
+fn ring_slot(r: MpRing*, i: int64) -> int64 {
+  if (r == 0) { return -1; }
+  if (i < 0 || i >= r->n) { return -1; }
+  return (r->head + i) % r->cap;
+}
+
+export fn mp_ring_x(r: MpRing*, i: int64) -> float64 {
+  var k: int64 = ring_slot(r, i);
+  if (k < 0) { return NAN(); }
+  return r->xs[k];
+}
+
+export fn mp_ring_y(r: MpRing*, i: int64) -> float64 {
+  var k: int64 = ring_slot(r, i);
+  if (k < 0) { return NAN(); }
+  return r->ys[k];
+}
+
+// Drops every sample; the capacity and the columns stay.
+export fn mp_ring_clear(r: MpRing*) {
+  if (r == 0) { return; }
+  r->head = 0;
+  r->n = 0;
+}
+
+// Bounding box of the finite samples (mp_extent_add skips the rest); invalid
+// when the ring is empty or holds no finite pair. O(n).
+export fn mp_ring_extent(r: MpRing*) -> MpExtent {
+  var e: MpExtent = mp_extent_empty();
+  if (r == 0) { return e; }
+  var i: int64 = 0;
+  while (i < r->n) {
+    var k: int64 = (r->head + i) % r->cap;
+    mp_extent_add(&e, r->xs[k], r->ys[k]);
+    i = i + 1;
+  }
+  return e;
+}

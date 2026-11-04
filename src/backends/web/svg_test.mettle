@@ -1,11 +1,11 @@
-// tests/backends/web/svg — the serialization contract of backends/web/svg.
+// backends/web/svg_test — the serialization contract of backends/web/svg.
 //
-// Pure: scenes are built directly with mp_scene_* (the chart lane is imported
-// nowhere here, by lane rule, and is not needed — the backend's input is the
-// display list). Every fixture asserts a whole document, not a substring,
-// wherever the whole document is knowable; the injection/escaping test asserts
-// both the escaped form's presence and the payload's absence, so a serializer
-// that dropped the text instead of escaping it still fails.
+// Pure: scenes are built directly with mp_scene_* (chart/ is not imported: the
+// backend's input is the display list). Every fixture asserts a whole
+// document, not a substring, wherever the whole document is knowable; the
+// injection/escaping test asserts both the escaped form's presence and the
+// payload's absence, so a serializer that dropped the text instead of
+// escaping it still fails.
 //
 // Expected documents are assembled in an MpBuf (`wp`/`wo`/`wc`) instead of
 // built with `+`, because `mettle test` runs in the compile-time interpreter
@@ -331,7 +331,8 @@ fn check_omissions() {
   // stroke_w == 0 hides a stroke colour that is otherwise present.
   add_rect(sc, 0.0, 0.0, 1.0, 1.0, mp_color(255, 0, 0), mp_color(0, 255, 0),
            0.0, MP_CLS_PLOT);
-  // fill.a == 0 hides the fill; the stroke survives.
+  // fill.a == 0 is written fill="none" (an SVG rect's default fill is black);
+  // the stroke survives.
   add_rect(sc, 1.0, 1.0, 1.0, 1.0, mp_color_a(0, 0, 0, 0),
            mp_color(0, 255, 0), 1.0, MP_CLS_AXIS);
   // opacity == 0 is not 1.0, so it is emitted.
@@ -344,7 +345,7 @@ fn check_omissions() {
   wo(wb, "12", "12");
   wp(wb, "  <rect x=\"0\" y=\"0\" width=\"1\" height=\"1\" fill=\"#ff0000\"");
   wp(wb, " class=\"mp-c-plot\" />\n");
-  wp(wb, "  <rect x=\"1\" y=\"1\" width=\"1\" height=\"1\"");
+  wp(wb, "  <rect x=\"1\" y=\"1\" width=\"1\" height=\"1\" fill=\"none\"");
   wp(wb, " stroke=\"#00ff00\" stroke-width=\"1\" class=\"mp-c-axis\" />\n");
   wp(wb, "  <rect x=\"2\" y=\"2\" width=\"1\" height=\"1\" fill=\"#ff0000\"");
   wp(wb, " opacity=\"0\" class=\"mp-c-plot\" />\n");
@@ -390,7 +391,7 @@ fn check_colors() {
   defer mp_buf_free(b2);
   add_rect(sc2, 0.0, 1.0, 1.0, 1.0, none, mp_color_a(0, 0, 0, 200), 1.0, 4);
   wo(wb2, "5", "5");
-  wp(wb2, "  <rect x=\"0\" y=\"1\" width=\"1\" height=\"1\"");
+  wp(wb2, "  <rect x=\"0\" y=\"1\" width=\"1\" height=\"1\" fill=\"none\"");
   wp(wb2, " stroke=\"rgba(0,0,0,0.784)\" stroke-width=\"1\"");
   wp(wb2, " class=\"mp-c-tick\" />\n");
   wc(wb2);
@@ -493,7 +494,8 @@ fn check_shapes() {
   wp(wb, " stroke-width=\"2\" class=\"mp-c-axis\" />\n");
   wp(wb, "  <circle cx=\"5\" cy=\"6\" r=\"3\" fill=\"#4e79a7\"");
   wp(wb, " class=\"mp-c-series mp-s-0\" />\n");
-  wp(wb, "  <polyline points=\"0,10 5,0 10,10\" stroke=\"#f28e2b\"");
+  // A polyline's default fill is black: a stroke-only series says fill="none".
+  wp(wb, "  <polyline points=\"0,10 5,0 10,10\" fill=\"none\" stroke=\"#f28e2b\"");
   wp(wb, " stroke-width=\"1.5\" class=\"mp-c-series mp-s-1\" />\n");
   wc(wb);
   mp_expect_str("line, circle and polyline", rd(sc, 20.0, 20.0, b),
@@ -520,11 +522,39 @@ fn check_degenerate_shapes() {
   rc = mp_scene_poly(sc, 0, 0, 0, mp_color(1, 2, 3), 1.0, MP_CLS_SERIES);
   mp_expect_i64("empty poly added", (int64)rc, (int64)MP_OK);
   wo(wb, "10", "10");
-  wp(wb, "  <polyline points=\"7.5,8.25\" stroke=\"#010203\"");
+  wp(wb, "  <polyline points=\"7.5,8.25\" fill=\"none\" stroke=\"#010203\"");
   wp(wb, " stroke-width=\"1\" class=\"mp-c-series mp-s-0\" />\n");
   wc(wb);
   mp_expect_str("degenerate polylines", rd(sc, 10.0, 10.0, b),
                 mp_buf_str(wb));
+}
+
+// SVG's initial fill is black, so a shape with a transparent fill must say
+// fill="none"; otherwise every line chart's polyline fills its implied polygon
+// black. A LINE has no interior and keeps omitting fill.
+fn check_transparent_fill() {
+  var sc: MpScene* = new_scene();
+  var wb: MpBuf* = new_buf(512);
+  var b: MpBuf* = new_buf(64);
+  if (sc == 0 || wb == 0 || b == 0) { return; }
+  defer mp_scene_free(sc);
+  defer mp_buf_free(wb);
+  defer mp_buf_free(b);
+  var none: MpColor = mp_color_a(0, 0, 0, 0);
+  var rc: int32 = mp_scene_circle(sc, 5.0, 5.0, 2.0, none, mp_color(1, 2, 3),
+                                  1.0, MP_CLS_SERIES);
+  mp_expect_i64("transparent circle added", (int64)rc, (int64)MP_OK);
+  rc = mp_scene_line(sc, 0.0, 0.0, 9.0, 9.0, mp_color(1, 2, 3), 1.0,
+                     MP_CLS_AXIS);
+  mp_expect_i64("line added", (int64)rc, (int64)MP_OK);
+  wo(wb, "10", "10");
+  wp(wb, "  <circle cx=\"5\" cy=\"5\" r=\"2\" fill=\"none\" stroke=\"#010203\"");
+  wp(wb, " stroke-width=\"1\" class=\"mp-c-series mp-s-0\" />\n");
+  wp(wb, "  <line x1=\"0\" y1=\"0\" x2=\"9\" y2=\"9\" stroke=\"#010203\"");
+  wp(wb, " stroke-width=\"1\" class=\"mp-c-axis\" />\n");
+  wc(wb);
+  mp_expect_str("transparent circle fill is none, line has no fill",
+                rd(sc, 10.0, 10.0, b), mp_buf_str(wb));
 }
 
 // ---------------------------------------------------------------- errors
@@ -650,6 +680,7 @@ fn run_all() {
   check_injection();
   check_shapes();
   check_degenerate_shapes();
+  check_transparent_fill();
   check_argument_errors();
   check_determinism();
   check_structure();

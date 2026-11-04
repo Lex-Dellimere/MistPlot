@@ -1,22 +1,28 @@
 // core/ticks — nice steps and tick values for linear and log axes.
 //
 // Dependencies: std/math only. Tick values are computed into a caller array
-// (no allocation, no formatting: labels are formatted at scene-build time,
-// docs/01-architecture.md D6).
+// (no allocation, no formatting: labels are formatted at scene-build time).
 //
-// Step choice follows the 1/2/5 x 10^k rule. Note the deliberate deviation from
-// docs/03-phase1.md §3, which divides the span by (target-1): with that divisor
-// the guide's own pinned example (0..97, target 5) yields step 50 and 2 ticks,
-// violating docs/02-seams.md §2 ("count within target±2") and
-// docs/01-architecture.md §7 test 2. The seam wins, so `raw = span/target`,
-// which is also what d3 does.
+// Step choice follows the 1/2/5 x 10^k rule with `raw = span/target`, as d3
+// does. Dividing by (target-1) instead would give 0..97 at target 5 a step of
+// 50 and only 2 ticks, outside the "count within target±2" rule.
 //
 // The magnitude comes from `raw`, but the 1/2/5/10 multiple is chosen by how
 // many ticks it actually produces: rounding `raw` up (`norm <= 2 ? 2 : ...`)
 // alone gives 5 ticks for [0,97] with target 8, three short of the request. A
-// count error of at most 2 is the property the seam states and the tests pin.
+// count error of at most 2 is the property the tests pin.
 // Every value is snapped to the step's decimal count so 0.1+0.2 never leaks
 // 0.30000000000000004 into a label.
+//
+// Time axes (values in seconds) choose from clock-shaped steps instead —
+// 0.1/0.2/0.5 s, 1/2/5/10/15/30 s, 1/2/5/10/15/30 min, 1/2/3/6/12 h, then
+// whole days by the 1/2/5 rule — with the same "count closest to target" rule
+// (mp_tick_step_time). mp_ticks_step lays out the ticks of any given step.
+//
+// Nice domains (mp_ticks_nice): an auto axis is extended outward to the
+// nearest tick of its own step, repeated until the step is stable, so the
+// first and last ticks sit exactly on the domain ends (labelled, and the
+// largest mark does not touch the plot edge).
 
 import "std/math";
 
@@ -106,13 +112,15 @@ export fn mp_tick_nice(v: float64, round_up: bool) -> float64 {
   return r;
 }
 
-export fn mp_ticks_linear(d0: float64, d1: float64, target: int32,
-                          out: float64*, cap: int32) -> int32 {
+// Ticks at the multiples of `step` inside [d0, d1] (a tiny tolerance keeps an
+// end that is an exact multiple), snapped to the step's decimals, strictly
+// increasing, at most `cap`. 0 for a non-positive step or an empty domain.
+export fn mp_ticks_step(d0: float64, d1: float64, step: float64,
+                        out: float64*, cap: int32) -> int32 {
   if (out == 0 || cap <= 0) { return 0; }
   var span: float64 = d1 - d0;
   if (!(span > 0.0)) { return 0; }
-  var step: float64 = mp_tick_step(d0, d1, target);
-  if (!(step > 0.0)) { return 0; }
+  if (!(step > 0.0) || is_finite(step) == 0) { return 0; }
   var dec: int32 = ticks_step_decimals(step);
   // The epsilon makes an exact multiple land on itself rather than one step up.
   var first: float64 = ceil(d0 / step - 1e-9) * step;
@@ -135,6 +143,87 @@ export fn mp_ticks_linear(d0: float64, d1: float64, target: int32,
     if (k > (int64)cap * 4 + 4096) { break; }
   }
   return n;
+}
+
+export fn mp_ticks_linear(d0: float64, d1: float64, target: int32,
+                          out: float64*, cap: int32) -> int32 {
+  if (out == 0 || cap <= 0) { return 0; }
+  var span: float64 = d1 - d0;
+  if (!(span > 0.0)) { return 0; }
+  var step: float64 = mp_tick_step(d0, d1, target);
+  return mp_ticks_step(d0, d1, step, out, cap);
+}
+
+// Clock-shaped candidate steps in seconds, ascending.
+const MP_TICKS_TIME_N: int32 = 20;
+const MP_TICKS_TIME: float64[20] = [
+  0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+  900.0, 1800.0, 3600.0, 7200.0, 10800.0, 21600.0, 43200.0
+];
+
+// Step for a time axis (seconds): the clock candidate whose tick count is
+// closest to `target` (the first one on a tie). Spans too long for 12 h steps
+// use whole days chosen by the 1/2/5 rule (never below one day). 0 for an
+// empty or non-finite span.
+export fn mp_tick_step_time(d0: float64, d1: float64,
+                            target: int32) -> float64 {
+  var span: float64 = d1 - d0;
+  if (!(span > 0.0) || is_finite(span) == 0) { return 0.0; }
+  var t: int32 = target;
+  if (t < 1) { t = 1; }
+  if (span / (float64)t > 43200.0 * 2.0) {
+    var days: float64 = mp_tick_step(d0 / 86400.0, d1 / 86400.0, t);
+    if (days < 1.0) { days = 1.0; }
+    return days * 86400.0;
+  }
+  var best: float64 = 0.0;
+  var best_err: float64 = 0.0;
+  var i: int32 = 0;
+  while (i < MP_TICKS_TIME_N) {
+    var st: float64 = MP_TICKS_TIME[i];
+    var err: float64 = floor(span / st) + 1.0 - (float64)t;
+    if (err < 0.0) { err = 0.0 - err; }
+    if (i == 0 || err < best_err) {
+      best = st;
+      best_err = err;
+    }
+    i = i + 1;
+  }
+  return best;
+}
+
+// Extends [*d0, *d1] outward to the nearest multiples of its tick step (time
+// steps when `time`), repeating while the wider domain changes the step (at
+// most four rounds). The ends are snapped to the step's decimals. A domain that
+// is empty, non-finite, or would become non-finite is left as it was.
+export fn mp_ticks_nice(d0: float64*, d1: float64*, target: int32,
+                        time: bool) {
+  if (d0 == 0 || d1 == 0) { return; }
+  var rnd: int32 = 0;
+  while (rnd < 4) {
+    var a: float64 = *d0;
+    var b: float64 = *d1;
+    if (!(b > a) || is_finite(b - a) == 0) { return; }
+    var step: float64 = 0.0;
+    if (time) {
+      step = mp_tick_step_time(a, b, target);
+    } else {
+      step = mp_tick_step(a, b, target);
+    }
+    if (!(step > 0.0)) { return; }
+    var dec: int32 = ticks_step_decimals(step);
+    var na: float64 = ticks_snap(floor(a / step + 1e-9) * step, dec);
+    var nb: float64 = ticks_snap(ceil(b / step - 1e-9) * step, dec);
+    if (na > a) { na = a; }
+    if (nb < b) { nb = b; }
+    if (is_finite(na) == 0 || is_finite(nb) == 0 || is_finite(nb - na) == 0) {
+      return;
+    }
+    if (na == a && nb == b) { return; }
+    *d0 = na;
+    *d1 = nb;
+    rnd = rnd + 1;
+  }
 }
 
 export fn mp_ticks_log(d0: float64, d1: float64, out: float64*,

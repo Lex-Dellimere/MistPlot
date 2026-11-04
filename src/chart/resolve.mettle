@@ -1,19 +1,50 @@
 // chart/resolve — the one chart entry point: a spec in, a scene out.
 //
 // Dependencies: chart/{spec,layout,axis} + core/{buf,color,data,format,geom,
-// scale,text,ticks} + renderer/scene. No backend import, ever
-// (docs/01-architecture.md §4) and no std/io: the library never prints.
+// scale,text,ticks} + renderer/scene. No backend import and no std/io: the
+// library never prints.
 //
 // Ownership: `out` is the caller's scene; mp_chart_render clears it and writes
 // only into it. Two float64 arrays per line series are allocated and freed
 // before returning. The scene owns its text, so the spec's strings may die as
 // soon as the call returns.
 //
-// Pipeline (docs/03-phase1.md §6): validate -> union extents -> tick *values*
-// from the data domain (pass 1) -> measured layout -> final pixel scales over
-// frame.plot (pass 2) -> emit in painter's order: background, plot, grid, axes,
-// series, legend, title. Empty but valid data is not an error: it renders the
-// background and the title and returns MP_OK.
+// Pipeline: validate -> union extents -> tick *values* from the data domain
+// (pass 1) -> measured layout -> final pixel scales over frame.plot (pass 2) ->
+// emit in painter's order: background, plot, grid, axes, series, legend, title.
+// Empty but valid data is not an error: it renders the background and the title
+// and returns MP_OK.
+//
+// Fixed domains: an axis with `*_fixed` set uses exactly [*_min, *_max] in
+// place of the data extent, for the ticks, the layout and the scales; neither
+// the zero baseline nor the degenerate-span fix touches it (a fixed axis with
+// non-finite bounds or max <= min is MP_ERR_ARG). Marks outside a fixed domain
+// follow one backend-neutral rule: line points are clamped to the plot rect on
+// both axes, scatter points outside are skipped, and bars whose value is
+// outside the fixed y domain are skipped (the bars that remain are clipped
+// vertically to the plot rect, because their zero baseline may lie outside it).
+// A bar chart's x axis is a band axis, so `x_fixed` is ignored there. With no
+// fixed axis no mark is clamped or skipped.
+//
+// Nice domains: a linear value axis whose domain is NOT fixed is extended
+// outward to the nearest tick of its own step (core/ticks mp_ticks_nice), so
+// the top and bottom ticks sit on the plot edges and are labelled, and the
+// tallest bar or highest point does not touch the plot top. This applies to
+// the y axis of every chart kind. The x axis of line/scatter charts keeps its
+// data extent (a time series should start and end at the plot edges; a live
+// window is a fixed domain anyway).
+//
+// Time axes: an axis whose label format is MP_FMT_TIME takes its tick step
+// from clock-shaped candidates (mp_tick_step_time: 0.1 s .. 12 h). When that
+// step is below one second the axis labels switch to MP_FMT_TIME_TENTHS, so
+// adjacent labels never repeat (x = [0, 2] reads 00:00.0 00:00.5 ...). The
+// resolved formats are reported in MpChartInfo.
+//
+// Geometry out (mp_chart_render_info): the plot rect, both final scales, the
+// resolved domains, the band count and the effective label formats of the
+// frame just rendered, so a host (hover, hit testing) never re-derives
+// resolve's domain rules. `valid` is false when nothing was laid out (an error
+// or empty data).
 
 import "std/math";
 import "std/mem";
@@ -29,6 +60,41 @@ import "mistplot/renderer/scene";
 import "mistplot/chart/spec";
 import "mistplot/chart/layout";
 import "mistplot/chart/axis";
+
+// Geometry of one rendered frame (see the header). Plain data; the scales are
+// copies, so the struct may outlive the scene it describes.
+export struct MpChartInfo {
+  valid: bool;      // a plot was laid out (rc MP_OK and some finite data)
+  kind: int32;      // MP_CHART_*
+  plot: MpRect;     // plot rect, scene coordinates
+  x: MpScale;       // final x scale (a band scale for bar charts)
+  y: MpScale;       // final y scale
+  x0: float64;      // resolved x domain (bar: 0 .. n_bands)
+  x1: float64;
+  y0: float64;      // resolved y domain (after fixups and nice extension)
+  y1: float64;
+  n_bands: int32;   // bar charts: number of bands, else 0
+  x_format: int32;  // effective label formats (MP_FMT_TIME_TENTHS when
+  y_format: int32;  //   a time axis chose a sub-second step)
+}
+
+// An info that describes nothing (valid = false, zero geometry).
+export fn mp_chart_info_empty() -> MpChartInfo {
+  var o: MpChartInfo;
+  o.valid = false;
+  o.kind = 0;
+  o.plot = mp_rect(0.0, 0.0, 0.0, 0.0);
+  o.x = mp_scale_linear(0.0, 1.0, 0.0, 1.0);
+  o.y = mp_scale_linear(0.0, 1.0, 0.0, 1.0);
+  o.x0 = 0.0;
+  o.x1 = 0.0;
+  o.y0 = 0.0;
+  o.y1 = 0.0;
+  o.n_bands = 0;
+  o.x_format = MP_FMT_AUTO;
+  o.y_format = MP_FMT_AUTO;
+  return o;
+}
 
 fn chart_none() -> MpColor {
   return mp_color_a(0, 0, 0, 0);
@@ -50,17 +116,65 @@ fn chart_scale(xlog: bool, d0: float64, d1: float64, r0: float64,
   return mp_scale_linear(d0, d1, r0, r1);
 }
 
-fn chart_ticks(xlog: bool, d0: float64, d1: float64, out: float64*,
-               cap: int32) -> int32 {
+fn chart_ticks(xlog: bool, time: bool, d0: float64, d1: float64,
+               out: float64*, cap: int32) -> int32 {
   if (xlog) { return mp_ticks_log(d0, d1, out, cap); }
+  if (time) {
+    return mp_ticks_step(d0, d1,
+                         mp_tick_step_time(d0, d1, MP_CHART_TICK_TARGET),
+                         out, cap);
+  }
   return mp_ticks_linear(d0, d1, MP_CHART_TICK_TARGET, out, cap);
 }
 
+// The label format an axis actually uses: a time axis whose (clock) step is
+// below one second shows tenths so neighbouring labels stay distinct.
+fn chart_axis_fmt(fmt: int32, log: bool, d0: float64, d1: float64) -> int32 {
+  if (fmt != MP_FMT_TIME || log) { return fmt; }
+  var st: float64 = mp_tick_step_time(d0, d1, MP_CHART_TICK_TARGET);
+  if (st > 0.0 && st < 1.0) { return MP_FMT_TIME_TENTHS; }
+  return fmt;
+}
+
+fn chart_is_time(fmt: int32) -> bool {
+  return fmt == MP_FMT_TIME || fmt == MP_FMT_TIME_TENTHS;
+}
+
+// A fixed axis is valid only with finite, strictly increasing bounds whose
+// span is itself finite (-1e308..1e308 is not: every scale would map NaN).
+fn chart_fixed_ok(fixed: bool, d0: float64, d1: float64) -> bool {
+  if (!fixed) { return true; }
+  if (is_finite(d0) == 0 || is_finite(d1) == 0) { return false; }
+  if (is_finite(d1 - d0) == 0) { return false; }
+  return d1 > d0;
+}
+
+// True when (x, y) lies inside every fixed domain of the spec (inclusive). An
+// axis that is not fixed never excludes a point; `use_x` is false for bars.
+fn chart_in_fixed(spec: MpChartSpec*, use_x: bool, x: float64,
+                  y: float64) -> bool {
+  if (use_x && spec->x_fixed) {
+    if (x < spec->x_min || x > spec->x_max) { return false; }
+  }
+  if (spec->y_fixed) {
+    if (y < spec->y_min || y > spec->y_max) { return false; }
+  }
+  return true;
+}
+
+fn chart_clamp(v: float64, lo: float64, hi: float64) -> float64 {
+  if (v < lo) { return lo; }
+  if (v > hi) { return hi; }
+  return v;
+}
+
 // One polyline per series. A non-finite x or y is skipped (the point is
-// dropped, the path is not split — Phase 1, docs/03-phase1.md §6). A series
-// with no finite point emits no node.
-fn chart_line(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
-              ys: MpScale) -> int32 {
+// dropped, the path is not split). A series with no finite point emits no node.
+// When either axis is fixed every point is clamped into the plot rect on both
+// axes.
+fn chart_line(s: MpScene*, spec: MpChartSpec*, xs: MpScale, ys: MpScale,
+              plot: MpRect) -> int32 {
+  var clamp: bool = spec->x_fixed || spec->y_fixed;
   var i: int32 = 0;
   while (i < spec->n_series) {
     var ser: MpSeries* = &spec->series[(int64)i];
@@ -81,6 +195,10 @@ fn chart_line(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
         if (is_finite(x) != 0 && is_finite(y) != 0) {
           px[m] = mp_scale_map(xs, x);
           py[m] = mp_scale_map(ys, y);
+          if (clamp) {
+            px[m] = chart_clamp(px[m], plot.x, plot.x + plot.w);
+            py[m] = chart_clamp(py[m], plot.y, plot.y + plot.h);
+          }
           m = m + 1;
         }
         j = j + 1;
@@ -101,9 +219,11 @@ fn chart_line(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
 
 // Bars: series i of k gets sub-band i of every band,
 //   bw = band_width/k, x = band_start + i*bw, w = bw*(1-bar_gap),
-//   y = map(max(y,0)), h = |map(y)-map(0)|  (docs/03-phase1.md §6).
-fn chart_bar(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
-             ys: MpScale) -> int32 {
+//   y = map(max(y,0)), h = |map(y)-map(0)|.
+// With a fixed y domain a bar whose value is outside it is skipped and the
+// rest are clipped to the plot's vertical extent.
+fn chart_bar(s: MpScene*, spec: MpChartSpec*, xs: MpScale, ys: MpScale,
+             plot: MpRect) -> int32 {
   var k: int32 = spec->n_series;
   var gap: float64 = spec->bar_gap;
   if (!(gap > 0.0)) { gap = 0.0; }
@@ -120,9 +240,14 @@ fn chart_bar(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
     while (j < xs.n_bands) {
       if ((int64)j < ser->n) {
         var y: float64 = ser->ys[(int64)j];
-        if (is_finite(y) != 0) {
+        if (is_finite(y) != 0 && chart_in_fixed(spec, false, 0.0, y)) {
           var ytop: float64 = mp_scale_map(ys, fmax(y, 0.0));
           var h: float64 = fabs(mp_scale_map(ys, y) - y0);
+          if (spec->y_fixed) {
+            var ybot: float64 = chart_clamp(ytop + h, plot.y, plot.y + plot.h);
+            ytop = chart_clamp(ytop, plot.y, plot.y + plot.h);
+            h = ybot - ytop;
+          }
           var bx: float64 = mp_scale_band_start(xs, j) + (float64)i * bw;
           var rc: int32 = mp_scene_rect(s, mp_rect(bx, ytop, w, h), col,
                                         chart_none(), 0.0,
@@ -138,6 +263,7 @@ fn chart_bar(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
 }
 
 // Scatter: one circle per point, palette fill at alpha 200 so overlap reads.
+// A point outside a fixed domain is skipped.
 fn chart_scatter(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
                  ys: MpScale) -> int32 {
   var r: float64 = spec->point_radius;
@@ -151,7 +277,8 @@ fn chart_scatter(s: MpScene*, spec: MpChartSpec*, xs: MpScale,
     while (j < ser->n) {
       var x: float64 = ser->xs[j];
       var y: float64 = ser->ys[j];
-      if (is_finite(x) != 0 && is_finite(y) != 0) {
+      if (is_finite(x) != 0 && is_finite(y) != 0 &&
+          chart_in_fixed(spec, true, x, y)) {
         var rc: int32 = mp_scene_circle(s, mp_scale_map(xs, x),
                                         mp_scale_map(ys, y), r, fill,
                                         chart_none(), 0.0,
@@ -173,8 +300,7 @@ fn chart_legend_item_w(spec: MpChartSpec*, i: int32) -> float64 {
 
 // Top edge of the swatch for a legend row whose top is `y`. The clamp and the
 // drawing read this one expression, so a guard can never drift from the shape
-// it guards (wave-5 B3: the clamp used to test `y + SWATCH` while the swatch
-// was drawn 3 px lower, letting the last row leave the canvas).
+// it guards.
 fn chart_legend_swatch_y(y: float64) -> float64 {
   return y + 3.0;
 }
@@ -209,7 +335,7 @@ fn chart_legend(s: MpScene*, spec: MpChartSpec*, f: MpFrame*) -> int32 {
       var y: float64 = f->legend.y + (float64)i * MP_CHART_LEGEND_ROW;
       // Both guards test the box actually drawn: the swatch sits at
       // chart_legend_swatch_y(y), the left inset is the 4 px chart_legend_item
-      // shifts by. Entries that would leave the canvas are dropped (Phase 1).
+      // shifts by. Entries that would leave the canvas are dropped.
       if (chart_legend_swatch_y(y) + MP_CHART_LEGEND_SWATCH > spec->height) {
         return MP_OK;
       }
@@ -223,7 +349,7 @@ fn chart_legend(s: MpScene*, spec: MpChartSpec*, f: MpFrame*) -> int32 {
     return MP_OK;
   }
   // Bottom legend: one centred row; entries that would leave the canvas are
-  // dropped (Phase 1 has no wrapping — docs/02-seams.md §8 keeps it Phase 2).
+  // dropped (there is no wrapping).
   var total: float64 = 0.0;
   var i2: int32 = 0;
   while (i2 < spec->n_series) {
@@ -265,9 +391,22 @@ fn chart_title(s: MpScene*, spec: MpChartSpec*, f: MpFrame*) -> int32 {
 }
 
 export fn mp_chart_render(spec: MpChartSpec*, out: MpScene*) -> int32 {
+  var info: MpChartInfo = mp_chart_info_empty();
+  return mp_chart_render_info(spec, out, &info);
+}
+
+// mp_chart_render that also reports the frame's geometry into `info` (which
+// may be 0). On any error, and for empty data, info->valid is false.
+export fn mp_chart_render_info(spec_in: MpChartSpec*, out: MpScene*,
+                               info: MpChartInfo*) -> int32 {
+  if (info != 0) { *info = mp_chart_info_empty(); }
   if (out == 0) { return MP_ERR_ARG; }
   mp_scene_clear(out);
-  if (spec == 0) { return MP_ERR_ARG; }
+  if (spec_in == 0) { return MP_ERR_ARG; }
+  // A frame-local copy: the effective label formats are written into it, the
+  // caller's spec is never modified (every string stays borrowed).
+  var eff: MpChartSpec = *spec_in;
+  var spec: MpChartSpec* = &eff;
   if (!mp_chart_kind_valid(spec->kind)) { return MP_ERR_ARG; }
   if (spec->n_series < 1 || spec->n_series > MP_CHART_MAX_SERIES) {
     return MP_ERR_ARG;
@@ -277,6 +416,12 @@ export fn mp_chart_render(spec: MpChartSpec*, out: MpScene*) -> int32 {
     return MP_ERR_ARG;
   }
   if (!(spec->width > 0.0) || !(spec->height > 0.0)) { return MP_ERR_ARG; }
+  if (!chart_fixed_ok(spec->x_fixed, spec->x_min, spec->x_max)) {
+    return MP_ERR_ARG;
+  }
+  if (!chart_fixed_ok(spec->y_fixed, spec->y_min, spec->y_max)) {
+    return MP_ERR_ARG;
+  }
 
   // 1. union of the series extents; nothing copied, the spec is borrowed.
   // `bands` is the longest series: bars split every band across the series and
@@ -317,11 +462,24 @@ export fn mp_chart_render(spec: MpChartSpec*, out: MpScene*) -> int32 {
   //   * bars force a zero baseline, and a zero baseline is not a log domain, so
   //     a bar chart is always linear;
   //   * a degenerate span is opened up by one unit so the scale keeps a usable
-  //     pixel range instead of mapping everything to the midpoint.
+  //     pixel range instead of mapping everything to the midpoint;
+  //   * a fixed axis replaces the data domain outright and skips both fixes
+  //     (its bounds were validated above, so its span is never degenerate).
   var bar: bool = (spec->kind == MP_CHART_BAR);
+  var fx: bool = spec->x_fixed && !bar;
+  var fy: bool = spec->y_fixed;
+  if (fx) {
+    ext.min_x = spec->x_min;
+    ext.max_x = spec->x_max;
+  }
+  if (fy) {
+    ext.min_y = spec->y_min;
+    ext.max_y = spec->y_max;
+  }
   var ylog: bool = chart_wants_log(spec->y_kind, ext.min_y, ext.max_y);
   if (bar) { ylog = false; }
   var zero: bool = bar || (spec->y_start_at_zero && !ylog);
+  if (fy) { zero = false; }
   if (zero && ext.min_y > 0.0) { ext.min_y = 0.0; }
   if (zero && ext.max_y < 0.0) { ext.max_y = 0.0; }
   if (ext.max_y == ext.min_y) {
@@ -336,6 +494,11 @@ export fn mp_chart_render(spec: MpChartSpec*, out: MpScene*) -> int32 {
     ext.min_x = ext.min_x - 1.0;
     ext.max_x = ext.max_x + 1.0;
   }
+  // Nice y: an auto linear y axis grows to the nearest ticks of its own step.
+  if (!fy && !ylog) {
+    mp_ticks_nice(&ext.min_y, &ext.max_y, MP_CHART_TICK_TARGET,
+                  chart_is_time(spec->y_format));
+  }
 
   // 4. pass 1: tick *values* from the data domain only. No pixel range is
   // involved, so no label is ever measured with a plot-dependent value.
@@ -345,8 +508,7 @@ export fn mp_chart_render(spec: MpChartSpec*, out: MpScene*) -> int32 {
   var xlog: bool = false;
   if (bar) {
     // Every band is a category; only the first MP_CHART_TICK_MAX of them get a
-    // tick label (the labels are the band index: a spec carries no category
-    // strings yet, docs/02-seams.md §8).
+    // tick label (axis turns the band indices into labels).
     nx = bands;
     if (nx > MP_CHART_TICK_MAX) { nx = MP_CHART_TICK_MAX; }
     var j: int32 = 0;
@@ -356,10 +518,14 @@ export fn mp_chart_render(spec: MpChartSpec*, out: MpScene*) -> int32 {
     }
   } else {
     xlog = chart_wants_log(spec->x_kind, ext.min_x, ext.max_x);
-    nx = chart_ticks(xlog, ext.min_x, ext.max_x, &xv[0], MP_CHART_TICK_MAX);
+    eff.x_format = chart_axis_fmt(spec->x_format, xlog, ext.min_x,
+                                  ext.max_x);
+    nx = chart_ticks(xlog, chart_is_time(spec->x_format), ext.min_x,
+                     ext.max_x, &xv[0], MP_CHART_TICK_MAX);
   }
-  var ny: int32 = chart_ticks(ylog, ext.min_y, ext.max_y, &yv[0],
-                              MP_CHART_TICK_MAX);
+  eff.y_format = chart_axis_fmt(spec->y_format, ylog, ext.min_y, ext.max_y);
+  var ny: int32 = chart_ticks(ylog, chart_is_time(spec->y_format), ext.min_y,
+                              ext.max_y, &yv[0], MP_CHART_TICK_MAX);
 
   var xs_prov: MpScale;
   if (bar) {
@@ -395,14 +561,34 @@ export fn mp_chart_render(spec: MpChartSpec*, out: MpScene*) -> int32 {
   rc = mp_axis_draw(out, spec, &frame, xs, ys, &xv[0], nx, &yv[0], ny);
   if (rc != MP_OK) { return rc; }
   if (spec->kind == MP_CHART_LINE) {
-    rc = chart_line(out, spec, xs, ys);
+    rc = chart_line(out, spec, xs, ys, plot);
   } else if (spec->kind == MP_CHART_BAR) {
-    rc = chart_bar(out, spec, xs, ys);
+    rc = chart_bar(out, spec, xs, ys, plot);
   } else {
     rc = chart_scatter(out, spec, xs, ys);
   }
   if (rc != MP_OK) { return rc; }
   rc = chart_legend(out, spec, &frame);
   if (rc != MP_OK) { return rc; }
-  return chart_title(out, spec, &frame);
+  rc = chart_title(out, spec, &frame);
+  if (rc != MP_OK) { return rc; }
+  if (info != 0) {
+    info->valid = true;
+    info->kind = spec->kind;
+    info->plot = plot;
+    info->x = xs;
+    info->y = ys;
+    info->x0 = ext.min_x;
+    info->x1 = ext.max_x;
+    if (bar) {
+      info->x0 = 0.0;
+      info->x1 = (float64)bands;
+      info->n_bands = bands;
+    }
+    info->y0 = ext.min_y;
+    info->y1 = ext.max_y;
+    info->x_format = eff.x_format;
+    info->y_format = eff.y_format;
+  }
+  return MP_OK;
 }

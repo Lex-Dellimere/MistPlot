@@ -1,40 +1,42 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 400" width="640" height="400" role="img">
   <rect x="0" y="0" width="640" height="400" fill="#ffffff" class="mp-c-bg" />
-  <rect x="44.8" y="49.04" width="524.4" height="302.4" fill="#ffffff" stroke="#e5e7eb" stroke-width="1" class="mp-c-plot" />
-  <line x1="44.8" y1="351.44" x2="569.2" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="44.8" y1="286.408" x2="569.2" y2="286.408" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="44.8" y1="221.375" x2="569.2" y2="221.375" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="44.8" y1="156.343" x2="569.2" y2="156.343" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="44.8" y1="91.311" x2="569.2" y2="91.311" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="44.8" y1="49.04" x2="44.8" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="132.2" y1="49.04" x2="132.2" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="219.6" y1="49.04" x2="219.6" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="307" y1="49.04" x2="307" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="394.4" y1="49.04" x2="394.4" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="481.8" y1="49.04" x2="481.8" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="569.2" y1="49.04" x2="569.2" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
-  <line x1="44.8" y1="49.04" x2="44.8" y2="351.44" stroke="#9ca3af" stroke-width="1" class="mp-c-axis" />
-  <line x1="44.8" y1="351.44" x2="569.2" y2="351.44" stroke="#9ca3af" stroke-width="1" class="mp-c-axis" />
-  <text x="38.8" y="353.84" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">0</text>
-  <text x="38.8" y="288.808" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">20</text>
-  <text x="38.8" y="223.775" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">40</text>
-  <text x="38.8" y="158.743" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">60</text>
-  <text x="38.8" y="93.711" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">80</text>
-  <text x="44.8" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">0</text>
-  <text x="132.2" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">2</text>
-  <text x="219.6" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">4</text>
-  <text x="307" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">6</text>
-  <text x="394.4" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">8</text>
-  <text x="481.8" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">10</text>
+  <rect x="30.88" y="67.44" width="538.32" height="284" fill="#ffffff" stroke="#e5e7eb" stroke-width="1" class="mp-c-plot" />
+  <line x1="30.88" y1="351.44" x2="569.2" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="30.88" y1="294.64" x2="569.2" y2="294.64" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="30.88" y1="237.84" x2="569.2" y2="237.84" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="30.88" y1="181.04" x2="569.2" y2="181.04" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="30.88" y1="124.24" x2="569.2" y2="124.24" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="30.88" y1="67.44" x2="569.2" y2="67.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="30.88" y1="67.44" x2="30.88" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="120.6" y1="67.44" x2="120.6" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="210.32" y1="67.44" x2="210.32" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="300.04" y1="67.44" x2="300.04" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="389.76" y1="67.44" x2="389.76" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="479.48" y1="67.44" x2="479.48" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="569.2" y1="67.44" x2="569.2" y2="351.44" stroke="#e5e7eb" stroke-width="1" class="mp-c-grid" />
+  <line x1="30.88" y1="67.44" x2="30.88" y2="351.44" stroke="#9ca3af" stroke-width="1" class="mp-c-axis" />
+  <line x1="30.88" y1="351.44" x2="569.2" y2="351.44" stroke="#9ca3af" stroke-width="1" class="mp-c-axis" />
+  <text x="24.88" y="353.84" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">0</text>
+  <text x="24.88" y="297.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">20</text>
+  <text x="24.88" y="240.24" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">40</text>
+  <text x="24.88" y="183.44" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">60</text>
+  <text x="24.88" y="126.64" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">80</text>
+  <text x="24.88" y="69.84" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="end" class="mp-c-tick">100</text>
+  <text x="30.88" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">0</text>
+  <text x="120.6" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">2</text>
+  <text x="210.32" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">4</text>
+  <text x="300.04" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">6</text>
+  <text x="389.76" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">8</text>
+  <text x="479.48" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">10</text>
   <text x="569.2" y="365.04" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-tick">12</text>
-  <text x="307" y="379.44" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-label">seconds</text>
-  <text x="0" y="202.64" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="start" class="mp-c-label">req/s</text>
-  <polyline points="44.8,305.917 88.5,279.905 132.2,289.659 175.9,250.64 219.6,208.369 263.3,224.627 307,182.356 350.7,146.588 394.4,162.846 438.1,120.575 481.8,78.305 525.5,97.814 569.2,49.04" stroke="#4e79a7" stroke-width="2" class="mp-c-series mp-s-0" />
-  <polyline points="44.8,322.175 88.5,312.421 132.2,296.163 175.9,302.666 219.6,273.401 263.3,250.64 307,260.395 350.7,231.13 394.4,205.117 438.1,218.124 481.8,182.356 525.5,153.092 569.2,166.098" stroke="#f28e2b" stroke-width="2" class="mp-c-series mp-s-1" />
-  <rect x="579.2" y="52.04" width="12" height="12" fill="#4e79a7" class="mp-c-legend" />
-  <text x="595.2" y="60.44" fill="#1f2933" font-family="system-ui, sans-serif" font-size="12" text-anchor="start" class="mp-c-legend">api</text>
-  <rect x="579.2" y="70.04" width="12" height="12" fill="#f28e2b" class="mp-c-legend" />
-  <text x="595.2" y="78.44" fill="#1f2933" font-family="system-ui, sans-serif" font-size="12" text-anchor="start" class="mp-c-legend">cache</text>
+  <text x="300.04" y="379.44" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-label">seconds</text>
+  <text x="0" y="53.44" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="start" class="mp-c-label">req/s</text>
+  <polyline points="30.88,311.68 75.74,288.96 120.6,297.48 165.46,263.4 210.32,226.48 255.18,240.68 300.04,203.76 344.9,172.52 389.76,186.72 434.62,149.8 479.48,112.88 524.34,129.92 569.2,87.32" fill="none" stroke="#4e79a7" stroke-width="2" class="mp-c-series mp-s-0" />
+  <polyline points="30.88,325.88 75.74,317.36 120.6,303.16 165.46,308.84 210.32,283.28 255.18,263.4 300.04,271.92 344.9,246.36 389.76,223.64 434.62,235 479.48,203.76 524.34,178.2 569.2,189.56" fill="none" stroke="#f28e2b" stroke-width="2" class="mp-c-series mp-s-1" />
+  <rect x="579.2" y="70.44" width="12" height="12" fill="#4e79a7" class="mp-c-legend" />
+  <text x="595.2" y="78.84" fill="#1f2933" font-family="system-ui, sans-serif" font-size="12" text-anchor="start" class="mp-c-legend">api</text>
+  <rect x="579.2" y="88.44" width="12" height="12" fill="#f28e2b" class="mp-c-legend" />
+  <text x="595.2" y="96.84" fill="#1f2933" font-family="system-ui, sans-serif" font-size="12" text-anchor="start" class="mp-c-legend">cache</text>
   <text x="320" y="12.8" fill="#1f2933" font-family="system-ui, sans-serif" font-size="16" text-anchor="middle" class="mp-c-title">Throughput &amp; latency &lt;budget&gt;</text>
   <text x="320" y="32.64" fill="#6b7280" font-family="system-ui, sans-serif" font-size="12" text-anchor="middle" class="mp-c-title">13 samples, 2 series</text>
 </svg>

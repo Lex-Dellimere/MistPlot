@@ -2,9 +2,9 @@
 // emitted string (scene text, SVG, ASCII, export payloads).
 //
 // Dependencies: core/color (mp_buf_put_color) and core/format
-// (mp_buf_put_i64 / _f64); std/mem, std/conv. Nothing imports buf except the
-// modules above it in docs/01-architecture.md §4, so the error constants live
-// here and are the lowest thing in the graph.
+// (mp_buf_put_i64 / _f64); std/mem, std/conv. Only the modules layered above
+// it import buf, so the error constants live here and are the lowest thing in
+// the graph.
 //
 // Ownership: mp_buf_new returns a buffer owned by the caller; mp_buf_free
 // releases the bytes and the struct. Every put_* either appends fully or
@@ -24,9 +24,19 @@ export const MP_ERR_ALLOC: int32 = 2;
 export const MP_ERR_STATE: int32 = 3;
 export const MP_ERR_IO: int32 = 4;
 
+// Largest element count any MistPlot column (ring, series, scene node or point
+// array) is ever allocated with: 2^28. Every `count * size` computed from a
+// caller's number is checked against it first, so the multiplication cannot
+// wrap int64 into a small allocation that later writes overrun. MpBuf, which
+// holds bytes, is limited to MP_MAX_COUNT * 8 bytes (2 GiB) for the same
+// reason.
+export const MP_MAX_COUNT: int64 = 268435456;
+
 export struct MpBuf { data: uint8*; len: int64; cap: int64; }
 
+// 0 on allocation failure or a cap above MP_MAX_COUNT * 8 bytes.
 export fn mp_buf_new(cap: int64) -> MpBuf* {
+  if (cap > MP_MAX_COUNT * 8) { return 0; }
   var b: MpBuf* = (MpBuf*)malloc(sizeof(MpBuf));
   if (b == 0) { return 0; }
   var c: int64 = cap;
@@ -67,6 +77,7 @@ export fn mp_buf_ok(b: MpBuf*) -> bool {
 export fn mp_buf_reserve(b: MpBuf*, extra: int64) -> int32 {
   if (b == 0) { return MP_ERR_ARG; }
   if (extra < 0) { return MP_ERR_ARG; }
+  if (extra > MP_MAX_COUNT * 8 - b->len - 1) { return MP_ERR_ALLOC; }
   var need: int64 = b->len + extra + 1;
   if (need <= b->cap) { return MP_OK; }
   var ncap: int64 = b->cap;
@@ -127,7 +138,7 @@ export fn mp_buf_put_f64(b: MpBuf*, v: float64, decimals: int32) -> int32 {
   return mp_buf_put(b, s.chars, (int64)s.length);
 }
 
-// XML/HTML escaping for the web backend: & < > " ' -> entities (§1).
+// XML/HTML escaping for the web backend: & < > " ' -> entities.
 export fn mp_buf_put_esc(b: MpBuf*, s: string) -> int32 {
   if (b == 0) { return MP_ERR_ARG; }
   var i: int64 = 0;

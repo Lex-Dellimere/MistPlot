@@ -1,22 +1,27 @@
 // chart/layout — the frame rectangles of one chart, with margins derived from
-// measured text (docs/02-seams.md §4, docs/03-phase1.md §5).
+// measured text.
 //
 // Dependencies: core/{geom,text,scale,data} + chart/spec. No scene, no backend,
 // no allocation: layout only measures strings it is handed.
 //
 // Auto margins, with th = mp_text_height(12) = 14.4:
-//   top    = 1.6*th (title) + 1.25*th (subtitle) + 8
-//   left   = max(widest y tick label, y_label) + 10
+//   top    = 1.6*th (title) + 1.25*th (subtitle) + 8 + (y title ? th + 4 : 0)
+//   left   = widest y tick label + 10
 //   right  = legend_w + 12 when the legend is on the right, else 8
 //   bottom = th + 10 + (x title ? 1.4*th + 4 : 0) +
 //            (bottom legend ? 18 + 4 : 0)
 // plus one text guard of its own: the first (and last) x tick label is centred
 // on the plot edge, so each side needs half its measured width, and left/right
 // grow to half the outermost label + 2 when that is wider.
-// The seam spells bottom as "text height + 10" and the guide adds the axis
-// title band; both are honoured by making the axis-title band additive, so the
-// x tick labels *and* the x title fit inside the frame and nothing has to be
-// drawn outside the canvas.
+// The axis-title band is additive to the tick-label band, so the x tick labels
+// *and* the x title fit inside the frame and nothing has to be drawn outside
+// the canvas.
+//
+// The y title is horizontal (MythicUI has no rotated text, and one rule for
+// every backend keeps them identical), so it gets its own band above the plot,
+// left-aligned at the canvas edge, clear of the top y tick label (which is
+// centred on plot.y and reaches th/2 above it). Sharing the left band with the
+// tick labels would put it on top of the middle tick label.
 //
 // legend_w = widest series name + 24 (swatch 12 + gap 4 + right pad 8).
 //
@@ -39,10 +44,14 @@ export struct MpFrame { plot: MpRect; title: MpRect; legend: MpRect;
 // layout policy is private to this module.
 export const MP_LAYOUT_TICK_GAP: float64 = 6.0;  // tick label -> plot edge
 export const MP_LAYOUT_TICK_PAD: float64 = 4.0;  // plot edge -> tick label top
+// Minimum gap between two drawn tick labels on one axis; axis thins the
+// labels to a uniform stride until neighbours keep at least this distance.
+export const MP_LAYOUT_LABEL_GAP: float64 = 4.0;
 
-const MP_LAYOUT_GAP: float64 = 10.0;       // seam: left / bottom pad
+const MP_LAYOUT_GAP: float64 = 10.0;       // left / bottom pad
 const MP_LAYOUT_RIGHT: float64 = 8.0;      // no right legend
 const MP_LAYOUT_TOP: float64 = 8.0;        // above the plot, below the title
+const MP_LAYOUT_YTITLE_GAP: float64 = 4.0; // y title band -> top tick label
 const MP_LAYOUT_MARGIN_MIN: float64 = 2.0; // canvas minus the clamp
 
 export fn mp_layout_text_h() -> float64 {
@@ -66,6 +75,29 @@ fn layout_label_at(v: float64*, i: int32, n: int32, fmt: int32) -> float64 {
   if (v == 0 || i < 0 || i >= n) { return 0.0; }
   var b: uint8[64];
   var s: string = mp_chart_fmt_value(v[(int64)i], fmt, &b[0], 64);
+  return mp_text_width(s, MP_CHART_TEXT_SIZE);
+}
+
+// Label of band `j` on a bar chart's band axis: the spec's category string
+// when it has one for j (a borrowed view of the caller's bytes), else the band
+// index through core/format into `out`. Shared with axis so layout measures
+// exactly the text the axis draws.
+export fn mp_layout_band_label(spec: MpChartSpec*, j: int32, out: uint8*,
+                               cap: int64) -> string {
+  if (spec != 0 && spec->categories != 0 && j >= 0 &&
+      j < spec->n_categories) {
+    var c: string = spec->categories[(int64)j];
+    return c;
+  }
+  return mp_chart_fmt_value((float64)j, MP_FMT_INT, out, cap);
+}
+
+// Measured width of the band-axis label at tick index i (0 out of range).
+fn layout_band_at(spec: MpChartSpec*, v: float64*, i: int32,
+                  n: int32) -> float64 {
+  if (v == 0 || i < 0 || i >= n) { return 0.0; }
+  var b: uint8[64];
+  var s: string = mp_layout_band_label(spec, (int32)v[(int64)i], &b[0], 64);
   return mp_text_width(s, MP_CHART_TEXT_SIZE);
 }
 
@@ -157,12 +189,10 @@ export fn mp_layout_compute(spec: MpChartSpec*, xv: float64*, nx: int32,
   var sub_h: float64 = mp_layout_subtitle_h(spec);
 
   var top: float64 = title_h + sub_h + MP_LAYOUT_TOP;
-  var left: float64 = layout_label_w(yv, ny, yfmt);
   if ((int64)spec->y_label.length > 0) {
-    var wl: float64 = mp_text_width(spec->y_label, MP_CHART_TEXT_SIZE);
-    if (wl > left) { left = wl; }
+    top = top + th + MP_LAYOUT_YTITLE_GAP;
   }
-  left = left + MP_LAYOUT_GAP;
+  var left: float64 = layout_label_w(yv, ny, yfmt) + MP_LAYOUT_GAP;
 
   var legend_w: float64 = mp_layout_legend_w(spec);
   var right: float64 = MP_LAYOUT_RIGHT;
@@ -178,9 +208,15 @@ export fn mp_layout_compute(spec: MpChartSpec*, xv: float64*, nx: int32,
   } else {
     // The first x tick label is centred on plot.x and the last on the plot's
     // right edge, so each needs half its measured width inside the canvas.
-    var g: float64 = layout_label_at(xv, 0, nx, xfmt) * 0.5 + 2.0;
+    var w0: float64 = layout_label_at(xv, 0, nx, xfmt);
+    var w1: float64 = layout_label_at(xv, nx - 1, nx, xfmt);
+    if (xs.kind == MP_SCALE_BAND) {
+      w0 = layout_band_at(spec, xv, 0, nx);
+      w1 = layout_band_at(spec, xv, nx - 1, nx);
+    }
+    var g: float64 = w0 * 0.5 + 2.0;
     if (g > left) { left = g; }
-    g = layout_label_at(xv, nx - 1, nx, xfmt) * 0.5 + 2.0;
+    g = w1 * 0.5 + 2.0;
     if (g > right) { right = g; }
   }
 
@@ -232,11 +268,11 @@ export fn mp_layout_compute(spec: MpChartSpec*, xv: float64*, nx: int32,
   var ylw: float64 = 0.0;
   var ylh: float64 = 0.0;
   if ((int64)spec->y_label.length > 0) {
-    var band: float64 = left - MP_LAYOUT_GAP;
-    if (band < 0.0) { band = 0.0; }
     ylx = 0.0;
-    ylw = band;
-    yly = plot.y + (plot.h - th) * 0.5;
+    ylw = mp_text_width(spec->y_label, MP_CHART_TEXT_SIZE);
+    if (ylw > w) { ylw = w; }
+    yly = plot.y - th * 0.5 - MP_LAYOUT_YTITLE_GAP * 0.5 - th;
+    if (yly < title_h + sub_h) { yly = title_h + sub_h; }
     ylh = th;
   }
   out->y_label = mp_rect(ylx, yly, ylw, ylh);

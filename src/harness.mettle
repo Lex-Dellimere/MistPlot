@@ -3,7 +3,7 @@
 //
 // A test file exports `main` (so the compiled gate can run it) and declares
 // `@test fn` wrappers that call the same `check_*` functions (so `mettle test`
-// runs it in the interpreter). See tests/t_scale.mettle for the shape.
+// runs it in the interpreter).
 
 import "std/io";
 

@@ -1,9 +1,9 @@
 // backends/terminal/ascii_test — the cell contract of the terminal backend.
 //
-// Pure: scenes are built directly with mp_scene_* (chart/ is imported nowhere
-// here, by lane rule, and is not needed — the backend's input is the display
-// list). Every fixture asserts the whole document, not a substring, so a
-// backend that dropped a row, an SGR or a reset still fails.
+// Pure: scenes are built directly with mp_scene_* (chart/ is not imported: the
+// backend's input is the display list). Every fixture asserts the whole
+// document, not a substring, so a backend that dropped a row, an SGR or a
+// reset still fails.
 //
 // Expected documents are assembled in an MpBuf (`wp`/`wr`/`wfg`/`wbg`) rather
 // than with `+`, because `mettle test` runs in the compile-time interpreter and

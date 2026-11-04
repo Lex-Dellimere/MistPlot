@@ -1,7 +1,7 @@
 // core/geom — rectangles, insets and the clamp helpers layout needs.
 //
 // Dependencies: nothing (pure value math, no allocation, no std import).
-// Rects are top-left origin, +y down, CSS pixel units (docs/03-phase1.md §1).
+// Rects are top-left origin, +y down, CSS pixel units.
 // Shrinking by more than the extent yields negative w/h on purpose: clamping is
 // the layout layer's job, not the geometry primitive's.
 

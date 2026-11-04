@@ -1,5 +1,5 @@
 // chart/axis — grid lines, axis lines, tick labels and axis titles for one
-// frame (docs/02-seams.md §4).
+// frame.
 //
 // Dependencies: chart/{spec,layout} + core/{scale,color,geom,text} +
 // renderer/scene. Nothing chart-kind specific lives here: an axis only knows
@@ -11,9 +11,15 @@
 // One placement rule for every TEXT node (mp_axis_emit_text): the anchor is
 // shifted by the smallest amount that puts the *measured* box inside the
 // canvas, and a label wider than the whole canvas is dropped. So the axis never
-// emits a node outside the canvas rect. This is *not* collision skipping (§4
-// defers that to Phase 2: a label that overlaps another is still emitted, in
-// the place its tick asks for).
+// emits a node outside the canvas rect.
+//
+// Label thinning (every axis: band categories, value x, value y): the label
+// boxes are computed exactly as mp_axis_emit_text will place them, then the
+// axis draws labels 0, k, 2k, ... for the smallest stride k >= 1 at which no
+// two consecutive drawn boxes come closer than MP_LAYOUT_LABEL_GAP (along the
+// axis: widths on x, text height on y). Labels therefore stay evenly spaced
+// and the first one is always drawn; grid lines are still drawn for every
+// tick. A pure function of the measured text, so deterministic.
 
 import "mistplot/core/color";
 import "mistplot/core/geom";
@@ -49,8 +55,8 @@ fn axis_box_left(x: float64, w: float64, align: int32) -> float64 {
 //   * shift the anchor by the smallest amount that puts the measured box (in
 //     its alignment) inside the canvas — the label keeps its tick;
 //   * a label wider than the whole canvas cannot be placed inside it at all,
-//     so it is dropped rather than drawn over the edge (Phase 2 wraps or
-//     ellipsizes; the seam only forbids emitting outside the canvas).
+//     so it is dropped rather than drawn over the edge (there is no wrapping
+//     or ellipsis).
 export fn mp_axis_emit_text(s: MpScene*, x: float64, y: float64,
                             label: string, size: float64, color: MpColor,
                             align: int32, cls: int32, cw: float64,
@@ -68,6 +74,46 @@ export fn mp_axis_emit_text(s: MpScene*, x: float64, y: float64,
   if (ay + h > ch) { ay = ch - h; }
   if (ay < 0.0) { ay = 0.0; }
   return mp_scene_text(s, x + dx, ay, label, size, color, align, cls);
+}
+
+// Smallest stride k >= 1 such that the boxes [lo[i], hi[i]] of labels 0, k,
+// 2k, ... keep at least MP_LAYOUT_LABEL_GAP between consecutive ones (boxes
+// may be in either order along the axis). Labels with ok[i] false (dropped by
+// the placement rule) do not take part. n == 0 gives 1.
+fn axis_stride(lo: float64*, hi: float64*, ok: bool*, n: int32) -> int32 {
+  var k: int32 = 1;
+  while (k < n) {
+    var fits: bool = true;
+    var have: bool = false;
+    var plo: float64 = 0.0;
+    var phi: float64 = 0.0;
+    var i: int32 = 0;
+    while (i < n && fits) {
+      if (ok[(int64)i]) {
+        var a: float64 = lo[(int64)i];
+        var b: float64 = hi[(int64)i];
+        if (have) {
+          var apart: bool = a >= phi + MP_LAYOUT_LABEL_GAP ||
+                            plo >= b + MP_LAYOUT_LABEL_GAP;
+          if (!apart) { fits = false; }
+        }
+        have = true;
+        plo = a;
+        phi = b;
+      }
+      i = i + k;
+    }
+    if (fits) { return k; }
+    k = k + 1;
+  }
+  return k;
+}
+
+// The label text of tick i on an axis (band category or formatted value).
+fn axis_label(spec: MpChartSpec*, band: bool, v: float64, fmt: int32,
+              out: uint8*, cap: int64) -> string {
+  if (band) { return mp_layout_band_label(spec, (int32)v, out, cap); }
+  return mp_chart_fmt_value(v, fmt, out, cap);
 }
 
 export fn mp_axis_draw(s: MpScene*, spec: MpChartSpec*, f: MpFrame*,
@@ -111,30 +157,72 @@ export fn mp_axis_draw(s: MpScene*, spec: MpChartSpec*, f: MpFrame*,
                      plot.y + plot.h, spec->theme.axis, 1.0, MP_CLS_AXIS);
   if (rc != MP_OK) { return rc; }
 
-  // 3. tick labels: y right-aligned against the axis, x centred under its tick.
+  // 3. tick labels: y right-aligned against the axis, x centred under its
+  // tick, both thinned to a uniform stride (see the header).
   var th: float64 = mp_layout_text_h();
   var b: uint8[64];
   var yfmt: int32 = axis_fmt(ys.kind, spec->y_format);
   var xfmt: int32 = axis_fmt(xs.kind, spec->x_format);
+  var yband: bool = ys.kind == MP_SCALE_BAND;
+  var band: bool = xs.kind == MP_SCALE_BAND;
+  var lo: float64[MP_CHART_TICK_MAX];
+  var hi: float64[MP_CHART_TICK_MAX];
+  var ok: bool[MP_CHART_TICK_MAX];
+  var nyy: int32 = ny;
+  if (nyy > MP_CHART_TICK_MAX) { nyy = MP_CHART_TICK_MAX; }
+  var nxx: int32 = nx;
+  if (nxx > MP_CHART_TICK_MAX) { nxx = MP_CHART_TICK_MAX; }
+
+  // y: vertical boxes [top, top + th], top clamped into the canvas.
   i = 0;
-  while (i < ny) {
+  while (i < nyy) {
     var py: float64 = mp_axis_pos(ys, yv[(int64)i]);
-    var lab: string = mp_chart_fmt_value(yv[(int64)i], yfmt, &b[0], 64);
-    rc = mp_axis_emit_text(s, plot.x - MP_LAYOUT_TICK_GAP, py - th * 0.5,
-                           lab, MP_CHART_TEXT_SIZE, spec->theme.muted,
-                           MP_ALIGN_END, MP_CLS_TICK, cw, ch);
-    if (rc != MP_OK) { return rc; }
+    var lab: string = axis_label(spec, yband, yv[(int64)i], yfmt, &b[0], 64);
+    var top: float64 = py - th * 0.5;
+    if (top + th > ch) { top = ch - th; }
+    if (top < 0.0) { top = 0.0; }
+    lo[(int64)i] = top;
+    hi[(int64)i] = top + th;
+    ok[(int64)i] = mp_text_width(lab, MP_CHART_TEXT_SIZE) <= cw;
     i = i + 1;
   }
+  var ky: int32 = axis_stride(&lo[0], &hi[0], &ok[0], nyy);
   i = 0;
-  while (i < nx) {
+  while (i < nyy) {
+    var py2: float64 = mp_axis_pos(ys, yv[(int64)i]);
+    var lab1: string = axis_label(spec, yband, yv[(int64)i], yfmt, &b[0],
+                                  64);
+    rc = mp_axis_emit_text(s, plot.x - MP_LAYOUT_TICK_GAP, py2 - th * 0.5,
+                           lab1, MP_CHART_TEXT_SIZE, spec->theme.muted,
+                           MP_ALIGN_END, MP_CLS_TICK, cw, ch);
+    if (rc != MP_OK) { return rc; }
+    i = i + ky;
+  }
+
+  // x: horizontal boxes, centred on the tick and shifted into the canvas.
+  i = 0;
+  while (i < nxx) {
     var px: float64 = mp_axis_pos(xs, xv[(int64)i]);
-    var lab2: string = mp_chart_fmt_value(xv[(int64)i], xfmt, &b[0], 64);
-    rc = mp_axis_emit_text(s, px, plot.y + plot.h + MP_LAYOUT_TICK_PAD,
-                           lab2, MP_CHART_TEXT_SIZE, spec->theme.muted,
+    var lab2: string = axis_label(spec, band, xv[(int64)i], xfmt, &b[0], 64);
+    var w: float64 = mp_text_width(lab2, MP_CHART_TEXT_SIZE);
+    var l: float64 = px - w * 0.5;
+    if (l + w > cw) { l = cw - w; }
+    if (l < 0.0) { l = 0.0; }
+    lo[(int64)i] = l;
+    hi[(int64)i] = l + w;
+    ok[(int64)i] = w <= cw;
+    i = i + 1;
+  }
+  var kx: int32 = axis_stride(&lo[0], &hi[0], &ok[0], nxx);
+  i = 0;
+  while (i < nxx) {
+    var px2: float64 = mp_axis_pos(xs, xv[(int64)i]);
+    var lab3: string = axis_label(spec, band, xv[(int64)i], xfmt, &b[0], 64);
+    rc = mp_axis_emit_text(s, px2, plot.y + plot.h + MP_LAYOUT_TICK_PAD,
+                           lab3, MP_CHART_TEXT_SIZE, spec->theme.muted,
                            MP_ALIGN_CENTER, MP_CLS_TICK, cw, ch);
     if (rc != MP_OK) { return rc; }
-    i = i + 1;
+    i = i + kx;
   }
 
   // 4. axis titles, each in its own frame band.

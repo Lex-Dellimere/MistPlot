@@ -3,12 +3,11 @@
 // Dependencies: core/format (channel integers go through the one
 // number formatter), std/conv for the returned string view. This module must
 // NOT import core/buf: buf imports color for mp_buf_put_color, so an
-// arrow back would be a cycle (docs/02-seams.md §1).
+// arrow back would be a cycle.
 //
-// Serialization policy (§0): `#rrggbb` when a == 255, else `rgba(r,g,b,a)` with
-// the raw 0..255 alpha, exactly as the seam spells it. Backends that need CSS
-// alpha (docs/03-phase1.md §7 wants `a/255`) format it themselves; that is the
-// documented seam/guide conflict, resolved in favor of the seam.
+// Serialization policy: `#rrggbb` when a == 255, else `rgba(r,g,b,a)` with the
+// raw 0..255 alpha. Backends that need a CSS alpha (`a/255`) format it
+// themselves.
 //
 // Nothing here allocates; mp_color_css writes into the caller's buffer and
 // returns a borrowed view of it.

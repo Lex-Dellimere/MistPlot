@@ -2,14 +2,15 @@
 //
 // Dependencies: core/buf for the MP_* error codes; std/mem, std/conv.
 // Data borrows nothing: the series *copies* its name at construction so a
-// temporary label cannot dangle (docs/02-seams.md §2).
+// temporary label cannot dangle.
 //
-// Contract: mp_extent_add ignores non-finite pairs (docs/02-seams.md §2 +
-// docs/03-phase1.md:128: a NaN/inf sample is skipped, not stored), so one bad
-// sample cannot turn a domain into NaN and collapse every mark onto the range
-// midpoint. A series of only non-finite pairs therefore has no valid extent.
+// Contract: mp_extent_add ignores non-finite pairs (a NaN/inf sample is
+// skipped, not stored), so one bad sample cannot turn a domain into NaN and
+// collapse every mark onto the range midpoint. A series of only non-finite
+// pairs therefore has no valid extent.
 //
-// Ownership: mp_series_new returns a series owned by the caller; mp_series_free
+// Ownership: mp_series_new / mp_series_from_columns return a series owned by
+// the caller (from_columns copies both columns); mp_series_free
 // releases xs, ys, the name copy and the struct. mp_series_free_all releases
 // the contents of a caller-owned array of MpSeries *values* and does not free
 // the array itself. push/set never leave a partially grown series behind.
@@ -29,7 +30,10 @@ export struct MpExtent { min_x: float64; max_x: float64; min_y: float64;
 
 const MP_SERIES_DEFAULT_CAP: int64 = 16;
 
+// A series with room for `cap` points (<= 0 = the default); 0 on allocation
+// failure or cap > MP_MAX_COUNT (cap * 8 must not wrap).
 export fn mp_series_new(name: string, cap: int64) -> MpSeries* {
+  if (cap > MP_MAX_COUNT) { return 0; }
   var c: int64 = cap;
   if (c <= 0) { c = MP_SERIES_DEFAULT_CAP; }
   var s: MpSeries* = (MpSeries*)malloc(sizeof(MpSeries));
@@ -70,6 +74,27 @@ export fn mp_series_new(name: string, cap: int64) -> MpSeries* {
   return s;
 }
 
+// Bulk load (query results, CSV columns): a new series holding a *copy* of the
+// first `n` pairs of the two caller columns, which stay the caller's. n == 0
+// is an empty series with the default capacity. Returns 0 on n < 0, a missing
+// column with n > 0, n > MP_MAX_COUNT, or an allocation failure; free with
+// mp_series_free.
+export fn mp_series_from_columns(name: string, xs: float64*, ys: float64*,
+                                 n: int64) -> MpSeries* {
+  if (n < 0 || n > MP_MAX_COUNT) { return 0; }
+  if (n > 0 && (xs == 0 || ys == 0)) { return 0; }
+  var s: MpSeries* = mp_series_new(name, n);
+  if (s == 0) { return 0; }
+  var i: int64 = 0;
+  while (i < n) {
+    s->xs[i] = xs[i];
+    s->ys[i] = ys[i];
+    i = i + 1;
+  }
+  s->n = n;
+  return s;
+}
+
 export fn mp_series_free(s: MpSeries*) {
   if (s == 0) { return; }
   if (s->xs != 0) { free(s->xs); }
@@ -94,11 +119,16 @@ export fn mp_series_free_all(list: MpSeries*, n: int32) {
 // grown when the second column fails, so both columns are allocated with
 // malloc first and the old ones are released only after both succeeded: a
 // failed push leaves n, cap and both column contents exactly as they were.
+// Growth past MP_MAX_COUNT points is MP_ERR_ALLOC (the doubling and the byte
+// count could otherwise wrap).
 fn mp_series_grow(s: MpSeries*, need: int64) -> int32 {
+  if (need < 0) { return MP_ERR_ARG; }
+  if (need > MP_MAX_COUNT - s->n) { return MP_ERR_ALLOC; }
   if (s->n + need <= s->cap) { return MP_OK; }
   var ncap: int64 = s->cap;
   if (ncap < MP_SERIES_DEFAULT_CAP) { ncap = MP_SERIES_DEFAULT_CAP; }
   while (ncap < s->n + need) { ncap = ncap * 2; }
+  if (ncap > MP_MAX_COUNT) { ncap = MP_MAX_COUNT; }
   var nx: float64* = (float64*)malloc(ncap * 8);
   if (nx == 0) { return MP_ERR_ALLOC; }
   var ny: float64* = (float64*)malloc(ncap * 8);
@@ -151,9 +181,7 @@ export fn mp_extent_empty() -> MpExtent {
 
 export fn mp_extent_add(e: MpExtent*, x: float64, y: float64) {
   if (e == 0) { return; }
-  // §2 + docs/03-phase1.md:128: a non-finite sample is not a data point. It is
-  // dropped here, not in the chart layer, so one bad sample cannot turn the
-  // domain into NaN and collapse every mark onto the range midpoint.
+  // Non-finite samples are dropped here, not in the chart layer (see header).
   if (x != x || y != y) { return; }
   if (x > 1e308 || x < 0.0 - 1e308) { return; }
   if (y > 1e308 || y < 0.0 - 1e308) { return; }

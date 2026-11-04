@@ -4,18 +4,16 @@
 // here: a backend is one function per target with the signature family
 //   mp_svg_render / mp_ascii_render / mp_png_encode
 //   (s: MpScene*, o: MpRenderOpts*, out: MpBuf*) -> int32
-// documented in docs/02-seams.md §3. Each clears `out`, writes only into `out`,
-// allocates nothing but out's growth, and reads no global state except the
-// theme and the text-measure seam.
+// Each clears `out`, writes only into `out`, allocates nothing but out's
+// growth, and reads no global state except the theme and the text measurer.
 
 import "mistplot/core/color";
 
 export struct MpRenderOpts { width: float64; height: float64; theme: MpTheme;
                              pad: float64; aria: bool; }
 
-// Defaults chosen where the seam left the field open: pad = 8 logical pixels of
-// outer breathing room, aria = true (server-rendered charts should describe
-// themselves by default).
+// Defaults: pad = 8 logical pixels of outer breathing room, aria = true
+// (server-rendered charts should describe themselves by default).
 export fn mp_render_opts(width: float64, height: float64,
                          theme: MpTheme) -> MpRenderOpts {
   var o: MpRenderOpts;

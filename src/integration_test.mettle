@@ -1,7 +1,7 @@
-// integration_test — the cross-lane proof: one MpChartSpec goes through
-// chart/resolve -> renderer/scene -> backends/web/{svg,page} and
-// backends/terminal/ascii in a single file, so a break between two lanes fails
-// here even when every lane's own test is green.
+// integration_test — one MpChartSpec goes through chart/resolve ->
+// renderer/scene -> backends/web/{svg,page} and backends/terminal/ascii in a
+// single file, so a break between two layers fails here even when each
+// layer's own test is green.
 //
 // What is asserted
 //   1. the line fixture (2 series x 13 points, title with `&` and `<`) renders
@@ -17,7 +17,7 @@
 //   4. mp_chart_figure wraps that document: one <figure, one <svg>, the escaped
 //      title in a <figcaption>, and no <script> even when the title is
 //      "<script>alert(1)</script>";
-//   5. the terminal backend draws a scene the chart lane built into exactly
+//   5. the terminal backend draws a scene chart/resolve built into exactly
 //      `rows` lines of `cols` visible cells, with palette colour 0
 //      (rgb 78,121,167 = #4e79a7, the SVG's series-0 stroke) in an exact
 //      number of complete `ESC[48;2;78;121;167m` sequences;
@@ -25,21 +25,20 @@
 //
 // Interpreter budget: `mettle test` runs the file in a compile-time interpreter
 // with a fixed 20,000,000-step budget, so this file is deliberately lean —
-// ~30 document scans, one 80x80 terminal render. The full-size bar example
-// (200x80, title + legend) is checked natively by tools/smoke.sh, where a step
-// count costs nothing. Adding assertions here can push the file over the
-// budget, which reads as "did not finish within 20000000 steps".
+// ~30 document scans, one 80x80 terminal render. Adding assertions here can
+// push the file over the budget, which reads as "did not finish within
+// 20000000 steps".
 //
-// Pinned node counts are the composition contract between the chart lane, the
-// scene lane and the backends. A legitimate layout change updates them together
-// with tests/golden/line.svg (see reports/integration.md).
+// Pinned node counts are the composition contract between chart/resolve,
+// renderer/scene and the backends. A legitimate layout change updates them
+// together with tests/golden/line.svg.
 //
 // Pure: no fopen, no externs, and no runtime string concatenation (that puts
 // mettle_string_free in the call graph and makes `mettle test` skip the file).
-// File output lives in cmd/; tools/smoke.sh proves debug == release on disk.
+// File output lives in cmd/.
 //
-// The line and scatter fixtures mirror the shipped examples (cmd/line_svg,
-// cmd/export_svg) number for number, so this test and the smoke run agree.
+// The line fixture mirrors cmd/line_svg number for number, so this test and
+// the golden agree.
 
 import "std/conv";
 import "std/math";
@@ -62,12 +61,14 @@ const IT_H: float64 = 400.0;
 const IT_COLS: int64 = 80;
 const IT_ROWS: int64 = 80;
 
-const IT_LINE_NODES: int64 = 38;
-const IT_SCATTER_NODES: int64 = 33;
-// Measured on the fixed 80x80 bar document (reports/integration.md §5.1): the
-// terminal restarts the series-0 background SGR this many times. Pinned like a
-// node count: a layout change moves it and the golden together.
-const IT_ASCII_S0_SGR: int64 = 97;
+// Nice y ranges (chart/resolve) add the top tick to both fixtures: one grid
+// line and one label more than the raw data extent gives.
+const IT_LINE_NODES: int64 = 40;
+const IT_SCATTER_NODES: int64 = 35;
+// Measured on the fixed 80x80 bar document: the terminal restarts the series-0
+// background SGR this many times. Pinned like a node count: a layout change
+// moves it and the golden together.
+const IT_ASCII_S0_SGR: int64 = 94;
 
 fn it_title() -> string { return "Throughput & latency <budget>"; }
 
@@ -75,7 +76,7 @@ fn it_title_escaped() -> string {
   return "Throughput &amp; latency &lt;budget&gt;";
 }
 
-// The one root element backends/web/svg emits (svg.mettle:344-364), in its own
+// The one root element backends/web/svg emits (mp_svg_render), in its own
 // order, at the fixture's 640x400. Pinned whole instead of as substrings: a
 // `viewBox=...` probe and a `width=... height=...` probe can each match on a
 // *different* element, this cannot.
@@ -212,7 +213,7 @@ fn it_line_spec(ser: MpSeries*) -> MpChartSpec {
   return spec;
 }
 
-// The terminal canvas *is* the cell grid (backends/terminal/ascii §canvas), so
+// The terminal canvas *is* the cell grid (see backends/terminal/ascii), so
 // a chart rendered for the terminal is laid out at the terminal's own size.
 fn it_bar_spec(ser: MpSeries*) -> MpChartSpec {
   var spec: MpChartSpec = mp_chart_spec(MP_CHART_BAR, ser, 2);
@@ -271,7 +272,7 @@ fn it_has_text(sc: MpScene*, cls: int32, want: string) -> bool {
 }
 
 // Align-aware box of one node inside the canvas (same definition of "inside" as
-// the chart lane's own test, so a disagreement is a bug, not a tolerance).
+// chart/chart_test, so a disagreement is a bug, not a tolerance).
 fn it_node_inside(nd: MpNode*, cw: float64, ch: float64) -> bool {
   var eps: float64 = 1e-6;
   var x0: float64 = nd->x;
@@ -368,10 +369,8 @@ fn it_same_scene(a: MpScene*, b: MpScene*) -> bool {
 fn it_svg_check(doc: string) {
   // Exact, not a substring: the document is fixed, so the whole opening tag is
   // the assertion. That pins viewBox, width and height *on the same element*
-  // and to the spec's own numbers, which the two `str_contains` probes it
-  // replaces could not: the width/height probe also matched the 640x400
-  // background <rect>, and neither probe said which element carried which
-  // attribute (measured: reports/integration.md §6.8).
+  // and to the spec's own numbers; a width/height substring probe would also
+  // match the 640x400 background <rect>.
   mp_expect("svg: root element is exactly the expected tag",
             it_starts(doc, it_svg_open()));
   mp_expect("svg: exactly one viewBox in the document",
@@ -379,7 +378,8 @@ fn it_svg_check(doc: string) {
   // The ASCII check below claims the terminal's series-0 colour is the SVG's;
   // pin the SVG side of that claim exactly instead of trusting the comment.
   mp_expect("svg: series 0 is exactly #4e79a7 at stroke-width 2",
-            it_count(doc, "stroke=\"#4e79a7\" stroke-width=\"2\" class=\"mp-c-series mp-s-0\"") == 1);
+            it_count(doc,
+                     "stroke=\"#4e79a7\" stroke-width=\"2\" class=\"mp-c-series mp-s-0\"") == 1);
   mp_expect("svg: exactly one root", it_count(doc, "<svg") == 1);
   mp_expect("svg: one closing root", it_count(doc, "</svg>") == 1);
   mp_expect("svg: document ends with </svg>", it_ends(doc, "</svg>\n"));
@@ -459,9 +459,9 @@ fn it_ascii_shape(doc: string, cols: int64, rows: int64) -> bool {
   return done_rows == rows;
 }
 
-// The terminal is ASCII-only (Phase 3 policy in backends/terminal/ascii): every
-// byte is ESC, a newline or 0x20..0x7E. Counts visible glyphs on the way, which
-// proves the backend drew the scene instead of emitting a blank grid.
+// The terminal is ASCII-only (see backends/terminal/ascii): every byte is ESC,
+// a newline or 0x20..0x7E. Counts visible glyphs on the way, which proves the
+// backend drew the scene instead of emitting a blank grid.
 fn it_ascii_printable(doc: string) -> bool {
   var n: int64 = (int64)doc.length;
   var i: int64 = 0;

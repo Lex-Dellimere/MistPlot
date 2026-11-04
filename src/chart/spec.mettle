@@ -1,5 +1,5 @@
 // chart/spec — the chart specification, its kinds/legend/format constants and
-// the one constructor with the Phase-1 defaults (docs/02-seams.md §4).
+// the one constructor with the defaults.
 //
 // Dependencies: core/{color,geom,data,scale,format} + std/math. No scene and no
 // backend: a spec is pure data, so it can be built without a renderer.
@@ -28,6 +28,12 @@ export const MP_LEGEND_BOTTOM: int32 = 2;
 export const MP_FMT_AUTO: int32 = 0;
 export const MP_FMT_SI: int32 = 1;
 export const MP_FMT_INT: int32 = 2;
+// Seconds as a clock: mm:ss below one hour, h:mm:ss at or above (mp_fmt_clock).
+export const MP_FMT_TIME: int32 = 3;
+// Seconds as a clock with tenths: mm:ss.t / h:mm:ss.t (mp_fmt_clock_tenths).
+// A time axis switches to it by itself when its tick step is below one
+// second (so labels stay distinct); a caller may also ask for it directly.
+export const MP_FMT_TIME_TENTHS: int32 = 4;
 
 // Layout and drawing constants. They live here (not in layout.mettle) because
 // both layout and resolve/axis need them and the spec owns the chart's
@@ -35,8 +41,8 @@ export const MP_FMT_INT: int32 = 2;
 export const MP_CHART_MAX_SERIES: int32 = 32;
 export const MP_CHART_TICK_TARGET: int32 = 5;
 export const MP_CHART_TICK_MAX: int32 = 64;
-// Phase-1 ceiling on the number of bar bands (categories) in one chart, so the
-// band index stays a sane int32 and a chart cannot ask for a billion rects.
+// Ceiling on the number of bar bands (categories) in one chart, so the band
+// index stays a sane int32 and a chart cannot ask for a billion rects.
 export const MP_CHART_MAX_BANDS: int32 = 1000000;
 export const MP_CHART_TEXT_SIZE: float64 = 12.0;
 export const MP_CHART_TITLE_SIZE: float64 = 16.0;
@@ -71,12 +77,27 @@ export struct MpChartSpec {
   bar_gap: float64;
   x_format: int32;
   y_format: int32;
+  // Fixed axis domains (live charts). When `*_fixed` is true the axis domain is
+  // exactly [min, max] instead of the data extent; resolve rejects a fixed axis
+  // whose bounds are non-finite or not strictly increasing.
+  x_fixed: bool;
+  x_min: float64;
+  x_max: float64;
+  y_fixed: bool;
+  y_min: float64;
+  y_max: float64;
+  // Bar charts: label of band j is categories[j] for j < n_categories, else
+  // the band index. Borrowed like every other spec string. Ignored by line
+  // and scatter charts. Default 0 / 0 (index labels).
+  categories: string*;
+  n_categories: int32;
 }
 
-// Defaults (docs/02-seams.md §4): 640x400, auto margins, right legend, grid on,
-// y starts at zero, light theme, 3 px points, bar_gap 0.2, linear axes, auto
-// label formats. `margins` is zeroed because `margin_auto` is true; a caller
-// that sets `margin_auto = false` supplies all four insets itself.
+// Defaults: 640x400, auto margins, right legend, grid on, y starts at zero,
+// light theme, 3 px points, bar_gap 0.2, linear axes, auto label formats, no
+// fixed domains, no category labels. `margins` is zeroed because `margin_auto`
+// is true; a caller that sets `margin_auto = false` supplies all four insets
+// itself.
 export fn mp_chart_spec(kind: int32, series: MpSeries*,
                         n_series: int32) -> MpChartSpec {
   var s: MpChartSpec;
@@ -101,13 +122,23 @@ export fn mp_chart_spec(kind: int32, series: MpSeries*,
   s.bar_gap = 0.2;
   s.x_format = MP_FMT_AUTO;
   s.y_format = MP_FMT_AUTO;
+  s.x_fixed = false;
+  s.x_min = 0.0;
+  s.x_max = 0.0;
+  s.y_fixed = false;
+  s.y_min = 0.0;
+  s.y_max = 0.0;
+  s.categories = 0;
+  s.n_categories = 0;
   return s;
 }
 
 // One axis label through core/format — the only number -> text path in the
-// chart layer (§0). MP_FMT_INT rounds half away from zero, but a non-finite or
+// chart layer. MP_FMT_INT rounds half away from zero, but a non-finite or
 // out-of-int64 value is never truncated: it falls back to the auto formatter
 // (which prints NaN/inf) instead of casting undefined behaviour into a label.
+// MP_FMT_TIME / MP_FMT_TIME_TENTHS read the value as seconds (mp_fmt_clock /
+// mp_fmt_clock_tenths have the same fallback).
 export fn mp_chart_fmt_value(v: float64, fmt: int32, out: uint8*,
                              cap: int64) -> string {
   if (fmt == MP_FMT_INT) {
@@ -117,6 +148,8 @@ export fn mp_chart_fmt_value(v: float64, fmt: int32, out: uint8*,
     return mp_fmt_auto(v, out, cap);
   }
   if (fmt == MP_FMT_SI) { return mp_fmt_si(v, out, cap); }
+  if (fmt == MP_FMT_TIME) { return mp_fmt_clock(v, out, cap); }
+  if (fmt == MP_FMT_TIME_TENTHS) { return mp_fmt_clock_tenths(v, out, cap); }
   return mp_fmt_auto(v, out, cap);
 }
 

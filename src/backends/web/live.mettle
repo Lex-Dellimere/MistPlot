@@ -1,0 +1,152 @@
+// backends/web/live — live charts on the web: the SVG of an MpLive's current
+// frame, and the browser snippet that polls for it.
+//
+// Dependencies: live/stream + renderer/{scene,backend} + core/buf +
+// backends/web/svg. This file and page.mettle are the only web modules that
+// may import above the renderer.
+//
+// Ownership: both entry points clear `out` and write only into it; nothing is
+// allocated here. mp_live_svg updates the MpLive (which owns its scenes) and
+// serializes the cached scene; the MpLive itself stays the caller's.
+//
+// Server renders, browser swaps: mp_live_embed writes
+//   <div class="mp-live" data-src="URL" data-interval="N"></div>
+//   <script>...</script>
+// and the script reads both values back from its *own* preceding element
+// (document.currentScript.previousElementSibling), so several embeds on one
+// page never share state and the page needs no ids. mp_live_embed_with puts an
+// initial SVG inside the div so the first paint is not blank. That SVG is
+// inserted RAW (not escaped): it must be MistPlot output (mp_live_svg /
+// mp_svg_render), never caller-supplied markup. The script text is one
+// constant: the URL is never interpolated into JavaScript, only written once
+// as an HTML-escaped attribute value (& < > " ' become entities, so a URL can
+// neither close the attribute nor open a tag). Polling sends If-None-Match
+// with the last ETag it saw, swaps the div's innerHTML on 200, does nothing
+// on 304, and doubles its delay on an error, going back to the interval after
+// the next success. Rules the script keeps:
+//   * the ETag is remembered only after the body arrived and was swapped in,
+//     so a failed body read never leaves the client claiming a frame it does
+//     not show (it would then get 304s for it forever);
+//   * the error delay is min(2 * delay, 32 * interval, 60000 ms) but never
+//     below the interval: setTimeout treats a delay above 2^31-1 ms as 0,
+//     so an unbounded backoff over a long interval would become a tight loop;
+//   * polling stops once the div is no longer in the document (isConnected),
+//     so a page that replaced the embed does not keep a timer per old copy.
+// interval_ms is limited to 1..MP_LIVE_MAX_INTERVAL_MS (one hour) by the
+// server side; the script clamps it the same way.
+//
+// This is the only MistPlot output that contains <script>; svg.mettle and
+// page.mettle stay script-free. Output is deterministic: a pure function of
+// the URL and the interval.
+
+import "mistplot/core/buf";
+import "mistplot/renderer/scene";
+import "mistplot/renderer/backend";
+import "mistplot/backends/web/svg";
+import "mistplot/live/stream";
+
+// Largest accepted poll interval (one hour). Larger values are MP_ERR_ARG:
+// they are almost certainly a unit mistake (seconds vs ms), and the browser's
+// timer cannot represent much more than 24 days anyway.
+export const MP_LIVE_MAX_INTERVAL_MS: int32 = 3600000;
+
+// The polling script, one entry per line (each written followed by "\n").
+// It is a constant and must never contain a value from the caller. In a
+// Mettle literal `{{` is one literal `{` (a lone `{` would interpolate) and `}`
+// is literal as it stands.
+const MP_WLIVE_LINES: int32 = 32;
+const MP_WLIVE_SCRIPT: string[32] = [
+  "<script>",
+  "(function () {{",
+  "  var el = document.currentScript.previousElementSibling;",
+  "  var src = el.getAttribute(\"data-src\");",
+  "  var base = parseInt(el.getAttribute(\"data-interval\"), 10) || 1000;",
+  "  base = Math.max(1, Math.min(base, 3600000));",
+  "  var wait = base;",
+  "  var tag = null;",
+  "  function tick() {{",
+  "    if (!el.isConnected) {{ return; }",
+  "    var h = {{};",
+  "    if (tag !== null) {{ h[\"If-None-Match\"] = tag; }",
+  "    fetch(src, {{ headers: h, cache: \"no-store\" }).then(function (r) {{",
+  "      if (r.status === 304) {{ return null; }",
+  "      if (!r.ok) {{ throw new Error(\"HTTP \" + r.status); }",
+  "      var et = r.headers.get(\"ETag\");",
+  "      return r.text().then(function (t) {{ return {{ t: t, et: et }; });",
+  "    }).then(function (res) {{",
+  "      if (res !== null) {{",
+  "        el.innerHTML = res.t;",
+  "        tag = res.et;",
+  "      }",
+  "      wait = base;",
+  "    }).catch(function () {{",
+  "      wait = Math.max(base, Math.min(wait * 2, base * 32, 60000));",
+  "    }).then(function () {{",
+  "      if (el.isConnected) {{ setTimeout(tick, wait); }",
+  "    });",
+  "  }",
+  "  tick();",
+  "})();",
+  "</script>"
+];
+
+fn wlive_script(out: MpBuf*) -> int32 {
+  var i: int32 = 0;
+  while (i < MP_WLIVE_LINES) {
+    var rc: int32 = mp_buf_puts(out, MP_WLIVE_SCRIPT[i]);
+    if (rc != MP_OK) { return rc; }
+    rc = mp_buf_putc(out, 10);
+    if (rc != MP_OK) { return rc; }
+    i = i + 1;
+  }
+  return MP_OK;
+}
+
+// Updates the live chart if it changed, then writes its current frame as one
+// SVG document. A failed rebuild returns that error (mp_live_error) and writes
+// nothing, even though an older frame is still cached.
+export fn mp_live_svg(lv: MpLive*, o: MpRenderOpts*, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if (lv == 0 || o == 0) { return MP_ERR_ARG; }
+  mp_live_update(lv);
+  var rc: int32 = mp_live_error(lv);
+  if (rc != MP_OK) { return rc; }
+  return mp_svg_render(mp_live_scene(lv), o, out);
+}
+
+// The browser embed for a live endpoint at `url`, polled every `interval_ms`
+// milliseconds, with an empty div until the first poll answers. An empty url
+// or interval_ms outside 1..MP_LIVE_MAX_INTERVAL_MS is MP_ERR_ARG.
+export fn mp_live_embed(url: string, interval_ms: int32, out: MpBuf*) -> int32 {
+  return mp_live_embed_with(url, interval_ms, "", out);
+}
+
+// mp_live_embed with `initial_svg` written inside the div, so the chart
+// paints before the first poll. The bytes are inserted RAW: pass only
+// MistPlot output (e.g. mp_live_svg's buffer), never untrusted markup. ""
+// gives exactly mp_live_embed's output.
+export fn mp_live_embed_with(url: string, interval_ms: int32,
+                             initial_svg: string, out: MpBuf*) -> int32 {
+  if (out == 0) { return MP_ERR_ARG; }
+  mp_buf_clear(out);
+  if ((int64)url.length == 0 || interval_ms <= 0 ||
+      interval_ms > MP_LIVE_MAX_INTERVAL_MS) {
+    return MP_ERR_ARG;
+  }
+  var rc: int32 = mp_buf_puts(out, "<div class=\"mp-live\" data-src=\"");
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_esc(out, url);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(out, "\" data-interval=\"");
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_put_i64(out, (int64)interval_ms);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(out, "\">");
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(out, initial_svg);
+  if (rc != MP_OK) { return rc; }
+  rc = mp_buf_puts(out, "</div>\n");
+  if (rc != MP_OK) { return rc; }
+  return wlive_script(out);
+}

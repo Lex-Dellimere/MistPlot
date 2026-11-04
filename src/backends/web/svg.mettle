@@ -1,22 +1,21 @@
 // backends/web/svg — turns a scene IR into one deterministic SVG document.
 //
-// Dependencies (docs/02-seams.md §5): renderer/scene, renderer/backend and
-// core/{buf,color,format} only — no float classification from std/math is
-// needed because a NaN is its own witness (`v != v`) and the only other
-// rejection is an absolute-magnitude clamp. Nothing chart-shaped is imported:
-// the backend walks the display list and does no arithmetic beyond the text
-// baseline shift.
+// Dependencies: renderer/scene, renderer/backend and core/{buf,color,format}
+// only — no float classification from std/math is needed because a NaN is its
+// own witness (`v != v`) and the only other rejection is an absolute-magnitude
+// clamp. Nothing chart-shaped is imported: the backend walks the display list
+// and does no arithmetic beyond the text baseline shift.
 //
 // Ownership: mp_svg_render clears `out` and writes only into it; the only
 // allocation is `out`'s growth. A growth failure returns MP_ERR_ALLOC with a
-// partial document left in `out` (documented by §5, not a bug).
+// partial document left in `out`.
 //
 // Determinism: the bytes are a pure function of the scene and the two viewport
 // numbers — no ids, no timestamps, no random values, no allocation addresses,
 // no `system()`-derived anything. Two renders of one scene are byte-identical,
 // which is what the golden file and the debug/release diff depend on.
 //
-// Serialization policy (docs/03-phase1.md §7):
+// Serialization policy:
 //   * exactly one root at depth 0, every node on its own line at depth 1
 //     (two spaces of indent), trailing newline, no XML declaration;
 //   * attribute order is fixed and global: geometry (x y width height, or
@@ -27,10 +26,15 @@
 //     stripped, `-0` -> `0`, NaN/±inf -> `0`, and |v| >= 1e15 -> `0` so the
 //     formatter's scientific fallback can never leak `e+` into the markup;
 //   * colors: `#rrggbb` when a == 255, otherwise `rgba(r,g,b,a/255)` with the
-//     alpha written at exactly three decimals (the form §7 fixes for this
-//     backend; core/color keeps the literal 0..255 spelling for its callers);
-//   * `stroke` is omitted when `stroke_w <= 0`, `fill` when `fill.a == 0`,
-//     `opacity` when it is exactly 1.0;
+//     alpha written at exactly three decimals (core/color keeps the literal
+//     0..255 spelling for its callers);
+//   * `stroke` is omitted when `stroke_w <= 0` and `opacity` when it is
+//     exactly 1.0. A fill with alpha 0 is written as `fill="none"` on the
+//     shapes SVG fills by default — rect, circle and polyline, whose initial
+//     fill is BLACK (an open polyline fills its implied polygon, which would
+//     turn every line chart into a black blob in browsers). A `line` has no
+//     interior, and a text node with alpha 0 is never emitted by the chart
+//     layer, so both still omit it;
 //   * text is escaped (& < > " '), carries font-family="system-ui, sans-serif",
 //     font-size and text-anchor, and its y is node.y + size*0.8 because
 //     renderer/scene stores the TOP of the text box, not the baseline;
@@ -40,8 +44,8 @@
 //     so nothing is silently renamed;
 //   * o->theme and o->pad are not consumed: colors are already baked into the
 //     nodes by chart/resolve, and padding is a layout concept. o->aria is not
-//     consumed either, because Phase 1 forbids ids (no aria-labelledby is
-//     possible); the root always carries role="img".
+//     consumed either, because the output carries no ids (no aria-labelledby
+//     is possible); the root always carries role="img".
 
 import "mistplot/core/buf";
 import "mistplot/core/color";
@@ -53,8 +57,8 @@ import "mistplot/renderer/scene";
 // scientific text, so it is serialized as 0 instead (`e+` is banned here).
 const MP_SVG_MAX_ABS: float64 = 1e15;
 
-// The scene's TEXT y is the top of the box; Phase 1 puts the baseline at 0.8
-// of the em box (§5 leaves the choice to the backend and asks for it here).
+// The scene's TEXT y is the top of the box; the baseline sits at 0.8 of the
+// em box.
 const MP_SVG_BASELINE: float64 = 0.8;
 
 // Strips trailing zeros in the fraction, then a trailing dot. mp_fmt_fixed
@@ -75,7 +79,7 @@ fn svg_trim(out: uint8*, n: int64) -> int64 {
 }
 
 // A number is only serialized when it is finite and inside the fixed-notation
-// window; everything else becomes `0` (determinism over honesty, §5).
+// window; everything else becomes `0` (determinism over honesty).
 fn svg_num_finite(v: float64) -> bool {
   if (v != v) { return false; }
   if (v >= MP_SVG_MAX_ABS) { return false; }
@@ -147,8 +151,8 @@ fn svg_put_color(b: MpBuf*, c: MpColor) -> int32 {
 // One `class` attribute. The eight base classes are named; cls >= SERIES is
 // the palette encoding; anything else (never emitted by chart/resolve) keeps
 // its number so nothing is silently renamed. Written as one switch instead of
-// a name-returning helper: a borrowed string from a helper put a string free
-// into the call graph and made `mettle test` skip the whole file.
+// a name-returning helper: a borrowed string from a helper puts a string free
+// into the call graph and makes `mettle test` skip the whole file.
 fn svg_put_class(b: MpBuf*, cls: int32) -> int32 {
   var rc: int32 = svg_attr_open(b, "class");
   if (rc != MP_OK) { return rc; }
@@ -184,9 +188,14 @@ fn svg_anchor(align: int32) -> string {
   }
 }
 
-// fill, stroke, stroke-width, opacity — in that fixed order.
-fn svg_put_paint(b: MpBuf*, nd: MpNode*) -> int32 {
+// fill, stroke, stroke-width, opacity — in that fixed order. `none_fill`:
+// write fill="none" for a transparent fill (shapes SVG fills by default).
+fn svg_put_paint(b: MpBuf*, nd: MpNode*, none_fill: bool) -> int32 {
   var rc: int32 = MP_OK;
+  if (nd->fill.a == 0 && none_fill) {
+    rc = svg_str_attr(b, "fill", "none");
+    if (rc != MP_OK) { return rc; }
+  }
   if (nd->fill.a != 0) {
     rc = svg_attr_open(b, "fill");
     if (rc != MP_OK) { return rc; }
@@ -223,7 +232,7 @@ fn svg_emit_rect(b: MpBuf*, nd: MpNode*) -> int32 {
   if (rc != MP_OK) { return rc; }
   rc = svg_num_attr(b, "height", nd->h);
   if (rc != MP_OK) { return rc; }
-  rc = svg_put_paint(b, nd);
+  rc = svg_put_paint(b, nd, true);
   if (rc != MP_OK) { return rc; }
   rc = svg_put_class(b, nd->cls);
   if (rc != MP_OK) { return rc; }
@@ -243,7 +252,7 @@ fn svg_emit_line(s: MpScene*, b: MpBuf*, nd: MpNode*) -> int32 {
   if (rc != MP_OK) { return rc; }
   rc = svg_num_attr(b, "y2", p[3]);
   if (rc != MP_OK) { return rc; }
-  rc = svg_put_paint(b, nd);
+  rc = svg_put_paint(b, nd, false);
   if (rc != MP_OK) { return rc; }
   rc = svg_put_class(b, nd->cls);
   if (rc != MP_OK) { return rc; }
@@ -259,7 +268,7 @@ fn svg_emit_circle(b: MpBuf*, nd: MpNode*) -> int32 {
   if (rc != MP_OK) { return rc; }
   rc = svg_num_attr(b, "r", nd->r);
   if (rc != MP_OK) { return rc; }
-  rc = svg_put_paint(b, nd);
+  rc = svg_put_paint(b, nd, true);
   if (rc != MP_OK) { return rc; }
   rc = svg_put_class(b, nd->cls);
   if (rc != MP_OK) { return rc; }
@@ -293,7 +302,7 @@ fn svg_emit_poly(s: MpScene*, b: MpBuf*, nd: MpNode*) -> int32 {
   if (rc != MP_OK) { return rc; }
   rc = svg_put_points(b, p, (int64)nd->pts_len);
   if (rc != MP_OK) { return rc; }
-  rc = svg_put_paint(b, nd);
+  rc = svg_put_paint(b, nd, true);
   if (rc != MP_OK) { return rc; }
   rc = svg_put_class(b, nd->cls);
   if (rc != MP_OK) { return rc; }
@@ -307,7 +316,7 @@ fn svg_emit_text(s: MpScene*, b: MpBuf*, nd: MpNode*) -> int32 {
   if (rc != MP_OK) { return rc; }
   rc = svg_num_attr(b, "y", nd->y + nd->size * MP_SVG_BASELINE);
   if (rc != MP_OK) { return rc; }
-  rc = svg_put_paint(b, nd);
+  rc = svg_put_paint(b, nd, false);
   if (rc != MP_OK) { return rc; }
   rc = svg_str_attr(b, "font-family", "system-ui, sans-serif");
   if (rc != MP_OK) { return rc; }

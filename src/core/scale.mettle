@@ -1,10 +1,9 @@
 // core/scale — linear / log / band scales as plain value structs.
 //
 // Dependencies: std/math only (nothing chart-shaped; scales never see a scene).
-// A `kind` discriminant instead of three types keeps copies cheap
-// (docs/01-architecture.md D5).
+// A `kind` discriminant instead of three types keeps copies cheap.
 //
-// Contract (docs/02-seams.md §2):
+// Contract:
 //   linear/log: map(d0) == r0, map(d1) == r1; a degenerate domain d0 == d1 maps
 //   everything to the range midpoint and sets valid = false.
 //   log: requires d0 > 0 && d1 > 0, otherwise valid = false and map returns r0;
@@ -84,9 +83,9 @@ export fn mp_scale_map(s: MpScale, v: float64) -> float64 {
   }
   if (s.kind == MP_SCALE_LOG) {
     if (!s.valid) {
-      // §2: a non-positive or non-finite domain has no logarithm, so map
-      // returns r0. A degenerate (d0 == d1 > 0) domain takes the linear/log
-      // rule: the range midpoint.
+      // A non-positive or non-finite domain has no logarithm, so map returns
+      // r0. A degenerate (d0 == d1 > 0) domain takes the linear/log rule: the
+      // range midpoint.
       if (s.d0 > 0.0 && s.d0 == s.d1) { return (s.r0 + s.r1) * 0.5; }
       return s.r0;
     }

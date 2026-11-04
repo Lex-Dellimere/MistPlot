@@ -1,22 +1,20 @@
 // backends/terminal/ascii — the terminal backend: one character cell per
 // (col,row) of a cols x rows grid, emitted as ANSI SGR text or as plain text.
 //
-// Dependencies (docs/02-seams.md §3, docs/04-integration.md §4):
-// renderer/scene, renderer/backend, core/{buf,color} and std/math (floor).
-// Nothing chart-shaped is imported: the backend walks the display list and does
-// no arithmetic beyond the coordinate mapping and the text baseline shift.
+// Dependencies: renderer/scene, renderer/backend, core/{buf,color} and std/math
+// (floor). Nothing chart-shaped is imported: the backend walks the display list
+// and does no arithmetic beyond the coordinate mapping and the text baseline
+// shift.
 //
 // Ownership: mp_ascii_render clears `out` and writes only into it. The cell
 // grid is a stack array of MP_ASCII_MAX_CELLS (200*80) cells, so the only
-// allocation is `out`'s growth — the seam's "no allocation but out" rule holds
-// and there is nothing to free.
+// allocation is `out`'s growth and there is nothing to free.
 //
 // Determinism: the bytes are a pure function of the scene, the two viewport
 // numbers, the theme and the sign of o->pad. No ids, no time, no addresses, no
 // locale — two renders of one scene are byte-identical.
 //
-// Interpretation (the seam leaves these to the backend; all are documented in
-// reports/export.md):
+// Interpretation:
 //   * canvas: cols = (int32)o->width, rows = (int32)o->height, truncated; a
 //     non-finite, non-positive or > 200x80 size is MP_ERR_ARG (after clear);
 //   * mapping: col = floor(x / o->width * cols), row = floor(y / o->height *
@@ -35,11 +33,11 @@
 //     `+`, which is where junctions and crossings come from. No anti-aliasing;
 //   * CIRCLE: midpoint outline of `o`; `@` when the radius is < 1.5 cells. The
 //     radius is measured in columns (r / width * cols) because a cell is not
-//     square and Phase 3 does not correct the aspect ratio;
+//     square and the aspect ratio is not corrected;
 //   * TEXT: one cell per byte, clipped per cell to the canvas. The glyph row is
 //     the row containing the baseline y + size*0.8 (the same baseline choice
 //     backends/web/svg documents); the column is the anchor, shifted left by
-//     len/2 for CENTER and by len for END. Phase 3 is ASCII-only: bytes
+//     len/2 for CENTER and by len for END. Text is ASCII-only: bytes
 //     0x20..0x7E are drawn as themselves and every other byte (control or
 //     >= 0x80, i.e. every UTF-8 continuation byte) becomes `?`;
 //   * ANSI: `ESC[38;2;r;g;bm` foreground, `ESC[48;2;r;g;bm` background, and

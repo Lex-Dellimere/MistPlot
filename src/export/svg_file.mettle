@@ -1,9 +1,9 @@
-// export/svg_file — the one file-writing seam: render a scene to SVG and put
-// the bytes on disk.
+// export/svg_file — the one place that writes a file: render a scene to SVG and
+// put the bytes on disk.
 //
-// Dependencies (docs/02-seams.md §6): core/buf, renderer/{backend,scene},
-// backends/web/svg and std/io (fopen/fwrite/fclose). No `system()`, no shell,
-// no temporary file, no rename: the bytes go straight to `path`.
+// Dependencies: core/buf, renderer/{backend,scene}, backends/web/svg and std/io
+// (fopen/fwrite/fclose). No `system()`, no shell, no temporary file, no rename:
+// the bytes go straight to `path`.
 //
 // Ownership: the temporary MpBuf is created and freed here; the scene, the
 // render options and `path` are borrowed. The file handle is closed on every
@@ -12,8 +12,8 @@
 // Errors: MP_ERR_ARG for a null scene/opts/path, MP_ERR_ALLOC when the buffer
 // cannot be created, whatever mp_svg_render returns, and MP_ERR_IO when the
 // open, the write or the close fails. A failed open leaves no file behind; a
-// failed write leaves a truncated file (there is no atomic-rename dance in
-// Phase 1) and still closes the handle.
+// failed write leaves a truncated file (there is no atomic rename) and still
+// closes the handle.
 
 import "std/io";
 import "mistplot/core/buf";

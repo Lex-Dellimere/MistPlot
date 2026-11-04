@@ -2,15 +2,14 @@
 // list of primitives.
 //
 // Dependencies: core/{buf,color,geom,text} plus std/mem and std/conv
-// (for the borrowed string views). Nothing chart-shaped may ever be added here
-// (docs/01-architecture.md D1); backends walk arrays and do no arithmetic
-// (D2).
+// (for the borrowed string views). Nothing chart-shaped may ever be added
+// here; backends walk arrays and do no arithmetic.
 //
 // Ownership: mp_scene_new returns a scene owned by the caller; mp_scene_free
 // releases the node array, the point array, the text buffer and the struct.
 // The scene OWNS its text: mp_scene_text copies the bytes into scene->text and
 // nodes store (offset, length) — a rendered scene outlives the spec that built
-// it (D4). mp_scene_node / _node_text / _node_pts return borrowed views.
+// it. mp_scene_node / _node_text / _node_pts return borrowed views.
 //
 // Invariants:
 //   * nodes are in painter's order (background first);
@@ -127,7 +126,12 @@ export fn mp_scene_count(s: MpScene*) -> int64 {
   return s->n;
 }
 
+// The node count is capped at MP_MAX_COUNT so `ncap * sizeof(MpNode)` cannot
+// wrap. (The point array needs no extra cap: MP_SCENE_MAX_OFF bounds it to
+// 2^31 floats, far from wrapping.)
 fn scene_reserve_nodes(s: MpScene*, extra: int64) -> int32 {
+  if (extra < 0) { return MP_ERR_ARG; }
+  if (extra > MP_MAX_COUNT - s->n) { return MP_ERR_STATE; }
   if (s->n + extra <= s->cap) { return MP_OK; }
   var ncap: int64 = s->cap;
   if (ncap < MP_SCENE_MIN_NODES) { ncap = MP_SCENE_MIN_NODES; }

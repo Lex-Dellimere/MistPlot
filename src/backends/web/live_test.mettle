@@ -1,0 +1,321 @@
+// backends/web/live_test — mp_live_svg and mp_live_embed.
+//
+// Pure: the MpLive is fed in-process; no sockets, files or clocks. The embed
+// snippet is asserted as one whole document (built in an MpBuf, because a
+// runtime `+` would make `mettle test` skip the file). mp_live_svg is pinned
+// by equivalence instead of a hand-computed layout: the live frame must be
+// byte-identical to mp_chart_svg of a static spec holding the same samples
+// with the window written as a fixed x domain, so the live path cannot drift
+// from the static one. Escaping is asserted both ways (escaped form present,
+// raw payload absent), and the URL must occur exactly once in the snippet, in
+// the attribute, never in the script.
+
+import "std/math";
+import "std/conv";
+import "mistplot/harness";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/data";
+import "mistplot/renderer/scene";
+import "mistplot/renderer/backend";
+import "mistplot/chart/spec";
+import "mistplot/backends/web/svg";
+import "mistplot/backends/web/page";
+import "mistplot/backends/web/live";
+import "mistplot/live/stream";
+
+// Option equality ICEs at codegen in this compiler build, so an absence is
+// spelled with a match (same helper as svg_test).
+fn absent(hay: string, needle: string) -> bool {
+  var at: Option<int64> = str_find(hay, needle);
+  var found: bool = false;
+  match (at) {
+    case Some(_pos): { found = true; }
+    case None: { found = false; }
+  }
+  return !found;
+}
+
+fn wp(b: MpBuf*, s: string) {
+  if (mp_buf_puts(b, s) != MP_OK) {
+    mp_expect("expected document append", false);
+  }
+}
+
+// The constant script every embed ends with. Pinned whole, which covers the
+// interval clamp, the isConnected guards, the ETag stored only after the swap
+// and the bounded backoff.
+fn w_script(b: MpBuf*) {
+  wp(b, "<script>\n");
+  wp(b, "(function () {{\n");
+  wp(b, "  var el = document.currentScript.previousElementSibling;\n");
+  wp(b, "  var src = el.getAttribute(\"data-src\");\n");
+  wp(b, "  var base = parseInt(el.getAttribute(\"data-interval\"), 10)");
+  wp(b, " || 1000;\n");
+  wp(b, "  base = Math.max(1, Math.min(base, 3600000));\n");
+  wp(b, "  var wait = base;\n");
+  wp(b, "  var tag = null;\n");
+  wp(b, "  function tick() {{\n");
+  wp(b, "    if (!el.isConnected) {{ return; }\n");
+  wp(b, "    var h = {{};\n");
+  wp(b, "    if (tag !== null) {{ h[\"If-None-Match\"] = tag; }\n");
+  wp(b, "    fetch(src, {{ headers: h, cache: \"no-store\" })");
+  wp(b, ".then(function (r) {{\n");
+  wp(b, "      if (r.status === 304) {{ return null; }\n");
+  wp(b, "      if (!r.ok) {{ throw new Error(\"HTTP \" + r.status); }\n");
+  wp(b, "      var et = r.headers.get(\"ETag\");\n");
+  wp(b, "      return r.text().then(function (t) {{");
+  wp(b, " return {{ t: t, et: et }; });\n");
+  wp(b, "    }).then(function (res) {{\n");
+  wp(b, "      if (res !== null) {{\n");
+  wp(b, "        el.innerHTML = res.t;\n");
+  wp(b, "        tag = res.et;\n");
+  wp(b, "      }\n");
+  wp(b, "      wait = base;\n");
+  wp(b, "    }).catch(function () {{\n");
+  wp(b, "      wait = Math.max(base, Math.min(wait * 2, base * 32, 60000));\n");
+  wp(b, "    }).then(function () {{\n");
+  wp(b, "      if (el.isConnected) {{ setTimeout(tick, wait); }\n");
+  wp(b, "    });\n");
+  wp(b, "  }\n");
+  wp(b, "  tick();\n");
+  wp(b, "})();\n");
+  wp(b, "</script>\n");
+}
+
+// ---------------------------------------------------------------- embed
+
+fn check_embed() {
+  var b: MpBuf* = mp_buf_new(64);
+  var wb: MpBuf* = mp_buf_new(2048);
+  if (b == 0 || wb == 0) {
+    mp_expect("embed buffers", false);
+    mp_buf_free(b);
+    mp_buf_free(wb);
+    return;
+  }
+  defer mp_buf_free(b);
+  defer mp_buf_free(wb);
+  mp_buf_puts(b, "STALE");
+  mp_expect_i64("embed rc", (int64)mp_live_embed("/charts/cpu.svg", 1000, b),
+                (int64)MP_OK);
+  wp(wb, "<div class=\"mp-live\" data-src=\"/charts/cpu.svg\"");
+  wp(wb, " data-interval=\"1000\"></div>\n");
+  w_script(wb);
+  var doc: string = mp_buf_str(b);
+  mp_expect_str("embed snippet", doc, mp_buf_str(wb));
+  mp_expect("embed drops stale bytes", absent(doc, "STALE"));
+  mp_expect_i64("one live div", str_count(doc, "<div"), (int64)1);
+  mp_expect_i64("one script", str_count(doc, "<script"), (int64)1);
+  mp_expect_i64("url appears once (the attribute)",
+                str_count(doc, "/charts/cpu.svg"), (int64)1);
+  mp_expect("no id attribute", absent(doc, "id=\""));
+
+  // Determinism: the same arguments give the same bytes in a fresh buffer.
+  var b2: MpBuf* = mp_buf_new(8192);
+  if (b2 != 0) {
+    mp_live_embed("/charts/cpu.svg", 1000, b2);
+    mp_expect("embed is deterministic", mp_buf_str(b2) == mp_buf_str(wb));
+    mp_buf_free(b2);
+  }
+}
+
+fn check_embed_escaping() {
+  var b: MpBuf* = mp_buf_new(64);
+  var wb: MpBuf* = mp_buf_new(2048);
+  if (b == 0 || wb == 0) {
+    mp_expect("escape buffers", false);
+    mp_buf_free(b);
+    mp_buf_free(wb);
+    return;
+  }
+  defer mp_buf_free(b);
+  defer mp_buf_free(wb);
+  mp_expect_i64("hostile url rc",
+                (int64)mp_live_embed("/zq?a=1&b=\"x\"><script>alert('p')</script>",
+                                     250, b),
+                (int64)MP_OK);
+  wp(wb, "<div class=\"mp-live\" data-src=\"/zq?a=1&amp;b=&quot;x&quot;");
+  wp(wb, "&gt;&lt;script&gt;alert(&#39;p&#39;)&lt;/script&gt;\"");
+  wp(wb, " data-interval=\"250\"></div>\n");
+  w_script(wb);
+  var doc: string = mp_buf_str(b);
+  mp_expect_str("hostile url is escaped", doc, mp_buf_str(wb));
+  mp_expect_i64("only the snippet's own script tag", str_count(doc, "<script"),
+                (int64)1);
+  mp_expect("no raw attribute break-out", absent(doc, "\"x\""));
+  mp_expect("no raw alert payload", absent(doc, "alert('p')"));
+  mp_expect_i64("the url marker occurs once", str_count(doc, "/zq"),
+                (int64)1);
+  mp_expect_i64("exactly one div end", (int64)str_count(doc, "</div>\n"),
+                (int64)1);
+}
+
+fn check_embed_errors() {
+  var b: MpBuf* = mp_buf_new(64);
+  if (b == 0) {
+    mp_expect("error buffer", false);
+    return;
+  }
+  defer mp_buf_free(b);
+  mp_expect_i64("null out", (int64)mp_live_embed("/x", 1000, 0),
+                (int64)MP_ERR_ARG);
+  mp_buf_puts(b, "STALE");
+  mp_expect_i64("empty url", (int64)mp_live_embed("", 1000, b),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("empty url clears out", mp_buf_len(b), (int64)0);
+  mp_expect_i64("zero interval", (int64)mp_live_embed("/x", 0, b),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("negative interval", (int64)mp_live_embed("/x", -5, b),
+                (int64)MP_ERR_ARG);
+  // An interval above one hour is refused, so the browser's backoff can never
+  // approach setTimeout's 2^31-1 ms limit (beyond it the timer fires at once:
+  // a tight request loop).
+  mp_expect_i64("interval above one hour", (int64)mp_live_embed("/x",
+                MP_LIVE_MAX_INTERVAL_MS + 1, b), (int64)MP_ERR_ARG);
+  mp_expect_i64("interval of one day", (int64)mp_live_embed("/x", 86400000,
+                b), (int64)MP_ERR_ARG);
+  mp_expect_i64("interval of exactly one hour", (int64)mp_live_embed("/x",
+                MP_LIVE_MAX_INTERVAL_MS, b), (int64)MP_OK);
+  mp_expect_i64("embed_with null out",
+                (int64)mp_live_embed_with("/x", 1000, "<svg></svg>", 0),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("embed_with interval above one hour",
+                (int64)mp_live_embed_with("/x", 3600001, "<svg></svg>", b),
+                (int64)MP_ERR_ARG);
+}
+
+// mp_live_embed_with: the initial frame sits raw inside the div (first paint
+// is not blank); "" is exactly mp_live_embed.
+fn check_embed_with() {
+  var b: MpBuf* = mp_buf_new(64);
+  var wb: MpBuf* = mp_buf_new(2048);
+  var e: MpBuf* = mp_buf_new(2048);
+  if (b == 0 || wb == 0 || e == 0) {
+    mp_expect("embed_with buffers", false);
+    mp_buf_free(b);
+    mp_buf_free(wb);
+    mp_buf_free(e);
+    return;
+  }
+  defer mp_buf_free(b);
+  defer mp_buf_free(wb);
+  defer mp_buf_free(e);
+  mp_expect_i64("embed_with rc", (int64)mp_live_embed_with("/c.svg", 500,
+                "<svg role=\"img\"><rect /></svg>\n", b), (int64)MP_OK);
+  wp(wb, "<div class=\"mp-live\" data-src=\"/c.svg\" data-interval=\"500\">");
+  wp(wb, "<svg role=\"img\"><rect /></svg>\n</div>\n");
+  w_script(wb);
+  mp_expect_str("embed_with snippet", mp_buf_str(b), mp_buf_str(wb));
+  mp_expect_i64("embed_with empty rc", (int64)mp_live_embed_with("/c.svg", 500,
+                "", b), (int64)MP_OK);
+  mp_live_embed("/c.svg", 500, e);
+  mp_expect("embed_with \"\" equals mp_live_embed",
+            mp_buf_str(b) == mp_buf_str(e));
+}
+
+// ---------------------------------------------------------------- svg
+
+fn lw_y(i: int32) -> float64 {
+  return (float64)((i * 7) % 11);
+}
+
+fn check_live_svg() {
+  var lv: MpLive* = mp_live_new(MP_CHART_LINE, 1, 64);
+  var b: MpBuf* = mp_buf_new(64);
+  var want: MpBuf* = mp_buf_new(64);
+  if (lv == 0 || b == 0 || want == 0) {
+    mp_expect("live svg fixtures", false);
+    mp_live_free(lv);
+    mp_buf_free(b);
+    mp_buf_free(want);
+    return;
+  }
+  defer mp_live_free(lv);
+  defer mp_buf_free(b);
+  defer mp_buf_free(want);
+  var sp: MpChartSpec* = mp_live_spec(lv);
+  sp->width = 160.0;
+  sp->height = 90.0;
+  sp->legend = MP_LEGEND_NONE;
+  sp->title = "cpu";
+  mp_live_touch(lv);
+  mp_live_series_name(lv, 0, "cpu");
+  var i: int32 = 0;
+  while (i < 30) {
+    mp_live_push(lv, 0, (float64)i, lw_y(i));
+    i = i + 1;
+  }
+  mp_live_window(lv, 12.0);
+  var o: MpRenderOpts = mp_render_opts(160.0, 90.0, mp_theme_light());
+  mp_expect_i64("live svg rc", (int64)mp_live_svg(lv, &o, b), (int64)MP_OK);
+
+  // The same frame as a static chart: x fixed to the window [17, 29], with
+  // samples 16..29 — the live window also draws the last sample before its
+  // start (16), which the fixed-domain line rule clamps onto the left edge.
+  var xs: float64[14];
+  var ys: float64[14];
+  i = 0;
+  while (i < 14) {
+    xs[(int64)i] = (float64)(16 + i);
+    ys[(int64)i] = lw_y(16 + i);
+    i = i + 1;
+  }
+  var ser: MpSeries* = mp_series_from_columns("cpu", &xs[0], &ys[0], 14);
+  mp_expect("static series", ser != 0);
+  if (ser == 0) { return; }
+  defer mp_series_free(ser);
+  var st: MpChartSpec = mp_chart_spec(MP_CHART_LINE, ser, 1);
+  st.width = 160.0;
+  st.height = 90.0;
+  st.legend = MP_LEGEND_NONE;
+  st.title = "cpu";
+  st.x_fixed = true;
+  st.x_min = 17.0;
+  st.x_max = 29.0;
+  mp_expect_i64("static svg rc", (int64)mp_chart_svg(&st, &o, want),
+                (int64)MP_OK);
+  var doc: string = mp_buf_str(b);
+  mp_expect_str("live frame equals the static chart of its window", doc,
+                mp_buf_str(want));
+  mp_expect("live svg is one document", str_starts_with(doc, "<svg ") != 0);
+  mp_expect("live svg has no script", absent(doc, "<script"));
+  mp_expect("live svg drew the title", !absent(doc, ">cpu</text>"));
+
+  // Unchanged: no rebuild, same bytes.
+  var seq: int64 = mp_live_seq(lv);
+  mp_expect_i64("second svg rc", (int64)mp_live_svg(lv, &o, b), (int64)MP_OK);
+  mp_expect("unchanged chart re-serializes identically",
+            mp_buf_str(b) == mp_buf_str(want));
+  mp_expect_i64("serializing does not move seq", mp_live_seq(lv), seq);
+  mp_expect("nothing left to rebuild", !mp_live_update(lv));
+
+  // A failing rebuild returns its code and writes nothing.
+  sp->height = 0.0;
+  mp_live_touch(lv);
+  mp_expect_i64("bad spec svg rc", (int64)mp_live_svg(lv, &o, b),
+                (int64)MP_ERR_ARG);
+  mp_expect_i64("bad spec leaves out empty", mp_buf_len(b), (int64)0);
+  mp_expect_i64("null live", (int64)mp_live_svg(0, &o, b), (int64)MP_ERR_ARG);
+  mp_expect_i64("null opts", (int64)mp_live_svg(lv, 0, b), (int64)MP_ERR_ARG);
+  mp_expect_i64("null out", (int64)mp_live_svg(lv, &o, 0), (int64)MP_ERR_ARG);
+}
+
+fn run_all() {
+  check_embed();
+  check_embed_escaping();
+  check_embed_errors();
+  check_embed_with();
+  check_live_svg();
+}
+
+export fn main() -> int32 {
+  run_all();
+  return mp_summary();
+}
+
+@test fn t_web_live() -> int32 {
+  run_all();
+  if (mp_fails != 0) { return 1; }
+  return 0;
+}

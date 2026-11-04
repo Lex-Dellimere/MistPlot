@@ -1,10 +1,9 @@
-// tests/t_scene — core/buf + core/color + core/geom + core/text + core/data +
-// renderer/scene + renderer/backend.
+// renderer/scene_test — core/buf + core/color + core/geom + core/text +
+// core/data + renderer/scene + renderer/backend.
 //
 // Pure: allocation only through malloc/new (which the compile-time interpreter
-// supports), no files, no externs. The scene-ownership check is architecture
-// §7 test 4: build text from a heap buffer, free the buffer, then read the
-// bytes back out of the scene.
+// supports), no files, no externs. The scene-ownership check builds text from
+// a heap buffer, frees the buffer, then reads the bytes back out of the scene.
 
 import "std/conv";
 import "std/mem";
@@ -17,8 +16,8 @@ import "mistplot/core/data";
 import "mistplot/renderer/scene";
 import "mistplot/renderer/backend";
 
-// Injected measurer: twice the byte length, so a test can tell the seam apart
-// from the default 0.58 heuristic.
+// Injected measurer: twice the byte length, so a test can tell it apart from
+// the default 0.58 heuristic.
 fn scene_double_measure(ctx: rawptr, s: string, size: float64) -> float64 {
   return (float64)s.length * size * 2.0;
 }
@@ -227,6 +226,25 @@ fn check_text() {
             !mp_text_measure_active());
   mp_expect_near("zero size measures zero", mp_text_width("abc", 0.0),
                  0.0, 1e-9);
+
+  // Save / restore: a host installs its own measurer for one render and then
+  // puts the previous one (with its context) back instead of the default.
+  mp_text_set_measure(&scene_ctx_measure, (rawptr)&factor);
+  var prev_fn: fn(rawptr, string, float64) -> float64 = mp_text_measure_fn();
+  var prev_ctx: rawptr = mp_text_measure_ctx();
+  mp_expect("saved ctx is the installed one", prev_ctx == (rawptr)&factor);
+  mp_text_set_measure(&scene_double_measure, 0);
+  mp_expect_near("nested measurer active", mp_text_width("ab", 10.0), 40.0,
+                 1e-9);
+  mp_text_set_measure(prev_fn, prev_ctx);
+  mp_expect_near("previous measurer restored with its context",
+                 mp_text_width("ab", 10.0), 60.0, 1e-9);
+  mp_text_reset_measure();
+  mp_expect("reset restores the default", !mp_text_measure_active());
+  mp_expect("default has no saved fn", mp_text_measure_fn() == 0);
+  mp_expect("default has no saved ctx", mp_text_measure_ctx() == 0);
+  mp_expect_near("default width after reset", mp_text_width("abcd", 10.0),
+                 23.2, 1e-9);
 }
 
 fn check_data() {
@@ -540,7 +558,7 @@ fn check_scene() {
   mp_expect_str("opts theme carried", o.theme.name, "light");
 }
 
-// Growth is the failure mode the seam calls out ("every add returns
+// Growth is the failure mode the scene contract calls out ("every add returns
 // MP_ERR_ALLOC and leaves the scene consistent"). The allocator will not fail
 // on demand here, so this asserts the other half: every realloc of the node,
 // point and text arrays is transparent — counts are exact, offsets stay put,
@@ -654,7 +672,32 @@ fn check_scene_growth() {
                 (int64)MP_OK);
 }
 
+// A count * size computed from a caller's number must not wrap int64 into a
+// short allocation.
+fn check_size_guards() {
+  var huge: int64 = (int64)2305843009213693952;   // 2^61: * 8 wraps to 0
+  mp_expect("series cap above MP_MAX_COUNT is refused",
+            mp_series_new("x", MP_MAX_COUNT + 1) == 0);
+  mp_expect("series cap 2^61 is refused", mp_series_new("x", huge) == 0);
+  var xs: float64[1];
+  var ys: float64[1];
+  xs[0] = 0.0;
+  ys[0] = 0.0;
+  mp_expect("from_columns n 2^61 is refused",
+            mp_series_from_columns("x", &xs[0], &ys[0], huge) == 0);
+  mp_expect("buf cap 2^61 is refused", mp_buf_new(huge) == 0);
+  var b: MpBuf* = mp_buf_new(16);
+  mp_expect("guard buf allocated", b != 0);
+  if (b != 0) {
+    mp_expect_i64("buf reserve 2^61 is refused", (int64)mp_buf_reserve(b, huge),
+                  (int64)MP_ERR_ALLOC);
+    mp_expect_i64("refused reserve keeps the buffer", b->len, (int64)0);
+    mp_buf_free(b);
+  }
+}
+
 export fn main() -> int32 {
+  check_size_guards();
   check_buf();
   check_color();
   check_geom();
@@ -666,6 +709,7 @@ export fn main() -> int32 {
 }
 
 @test fn t_scene() -> int32 {
+  check_size_guards();
   check_buf();
   check_color();
   check_geom();
