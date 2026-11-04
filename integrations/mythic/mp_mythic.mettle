@@ -492,14 +492,16 @@ fn mm_hover(ui: MythicUi*, p: MythicPainter*, c: MpChart*, r: MythicRect) {
 
   var hb: uint8[64];
   var vb: uint8[64];
+  var nb: uint8[256];
   var w: float64 = mm_text_w(p->fonts, p->scale, mp_chart_readout_x(c, hx, &hb[0], 64), MM_TIP_SIZE,
                              MP_NF_TABULAR);
   var rows: int32 = 1;
   i = 0;
   while (i < n) {
     if (has[(int64)i]) {
+      var name: string = mp_series_name(c, i, &nb[0], 256);
       var rw: float64 = MM_TIP_SW + 6.0 +
-        mm_text_w(p->fonts, p->scale, c->series[(int64)i].name, MM_TIP_SIZE, 0) + 12.0 +
+        mm_text_w(p->fonts, p->scale, name, MM_TIP_SIZE, 0) + 12.0 +
         mm_text_w(p->fonts, p->scale, mp_chart_readout_y(c, vy[(int64)i], &vb[0], 64), MM_TIP_SIZE,
                   MP_NF_TABULAR);
       if (rw > w) { w = rw; }
@@ -531,7 +533,7 @@ fn mm_hover(ui: MythicUi*, p: MythicPainter*, c: MpChart*, r: MythicRect) {
       var top: float64 = ty + (float64)row * MM_TIP_ROW;
       var sw: MythicRect = mm_rect(tx, top + (MM_TIP_ROW - MM_TIP_SW) * 0.5, MM_TIP_SW, MM_TIP_SW);
       mythic_paint_fill(p, sw, mythic_radius(2.0), mm_argb(mp_series_color(c, i)));
-      mm_text_at(p, c->series[(int64)i].name, MM_TIP_SIZE, 0, MP_ALIGN_START,
+      mm_text_at(p, mp_series_name(c, i, &nb[0], 256), MM_TIP_SIZE, 0, MP_ALIGN_START,
                  tx + MM_TIP_SW + 6.0, top + lift, th->colors.text_primary);
       mm_text_at(p, mp_chart_readout_y(c, vy[(int64)i], &vb[0], 64), MM_TIP_SIZE, MP_NF_TABULAR,
                  MP_ALIGN_END, ox + bx + bw - MM_TIP_PAD, top + lift, th->colors.text_primary);
@@ -556,13 +558,6 @@ fn mm_chart_paint_cb(ui: MythicUi*, p: MythicPainter*, r: MythicRect, ud: rawptr
     mm_hover(ui, p, c, r);
   }
   mp_chart_unlock(c);
-}
-
-fn mm_live(c: MpChart*) -> bool {
-  mp_chart_lock(c);
-  var live: bool = c->keep > 0 || c->span > 0.0;
-  mp_chart_unlock(c);
-  return live;
 }
 
 /// Reserves a box and paints chart c in it at the box's final size and the window's
@@ -590,7 +585,7 @@ export fn mp_mythic_chart(ui: MythicUi*, c: MpChart*, width: MythicSize, height:
   var th: MpTheme = mp_mythic_theme(ui);
   mp_chart_set_host_theme(c, th);
   mythic_node_paint(ui, &mm_chart_paint_cb, (rawptr)c);
-  if (mm_live(c)) { mythic_request_frame_in(ui, MP_MYTHIC_FRAME_MS); }
+  if (mp_chart_is_live(c)) { mythic_request_frame_in(ui, MP_MYTHIC_FRAME_MS); }
 }
 
 // ---------------------------------------------------------------- PNG export

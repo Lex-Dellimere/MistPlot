@@ -3,9 +3,11 @@
 // with mp_alloc_live() back at its starting value.
 
 import "std/conv";
+import "std/math";
 import "mistplot/test/harness";
 import "mistplot/core/error";
 import "mistplot/core/mem";
+import "mistplot/data/col";
 import "mistplot/core/buf";
 import "mistplot/core/color";
 import "mistplot/core/geom";
@@ -267,6 +269,108 @@ fn check_lock_hooks() {
   mp_expect_i64("leak-free", mp_alloc_live(), base);
 }
 
+fn check_getters() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_expect_i64("keep default", mp_chart_keep_count(c), 0);
+  mp_expect_near("window default", mp_chart_window_span(c), 0.0, 0.0);
+  mp_expect("static is not live", !mp_chart_is_live(c));
+  mp_chart_keep(c, 50);
+  mp_expect_i64("keep", mp_chart_keep_count(c), 50);
+  mp_expect("keep makes it live", mp_chart_is_live(c));
+  mp_chart_keep(c, 0);
+  mp_expect("static again", !mp_chart_is_live(c));
+  mp_chart_window(c, 2.5);
+  mp_expect_near("window", mp_chart_window_span(c), 2.5, 0.0);
+  mp_expect("window makes it live", mp_chart_is_live(c));
+  mp_expect_i64("null keep", mp_chart_keep_count(0), 0);
+  mp_expect_near("null window", mp_chart_window_span(0), 0.0, 0.0);
+  mp_expect("null live", !mp_chart_is_live(0));
+
+  var s: int32 = mp_chart_series(c, "alpha é");
+  var t: int32 = mp_chart_series(c, "");
+  var buf: uint8[16];
+  mp_expect_str("name", mp_series_name(c, s, &buf[0], 16), "alpha é");
+  mp_expect_str("empty name", mp_series_name(c, t, &buf[0], 16), "");
+  mp_expect_str("name cut", mp_series_name(c, s, &buf[0], 3), "alp");
+  mp_expect_str("name cut at a code point", mp_series_name(c, s, &buf[0], 7), "alpha ");
+  mp_expect_str("name bad index", mp_series_name(c, 9, &buf[0], 16), "");
+  mp_expect_str("name negative index", mp_series_name(c, -1, &buf[0], 16), "");
+  mp_expect_str("name null buffer", mp_series_name(c, s, 0, 16), "");
+  mp_expect_str("name zero cap", mp_series_name(c, s, &buf[0], 0), "");
+  mp_expect_str("name null chart", mp_series_name(0, s, &buf[0], 16), "");
+
+  mp_expect("last_x empty", mp_chart_last_x(c, s) != mp_chart_last_x(c, s));
+  mp_expect("last_x bad index", mp_chart_last_x(c, 5) != mp_chart_last_x(c, 5));
+  mp_expect("last_x null", mp_chart_last_x(0, 0) != mp_chart_last_x(0, 0));
+  mp_chart_clear(c);
+  mp_chart_push(c, s, 1.0, 10.0);
+  mp_chart_push(c, s, 2.0, 20.0);
+  mp_chart_push(c, s, 3.0, 30.0);
+  mp_chart_push(c, s, NAN(), 40.0);
+  mp_expect_near("last_x skips non-finite", mp_chart_last_x(c, s), 3.0, 0.0);
+  mp_expect("other series still empty", mp_chart_last_x(c, t) != mp_chart_last_x(c, t));
+  mp_chart_clear(c);
+  mp_expect("last_x after clear", mp_chart_last_x(c, s) != mp_chart_last_x(c, s));
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
+fn check_set_at_x() {
+  var base: int64 = mp_alloc_live();
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  var s: int32 = mp_chart_series(c, "a");
+  var i: int32 = 0;
+  while (i < 5) {
+    mp_chart_push(c, s, (float64)i, (float64)(i * 10));
+    i = i + 1;
+  }
+  var seq: int64 = mp_chart_seq(c);
+  mp_expect_i64("overwrite", (int64)mp_chart_set_at_x(c, s, 3.0, 99.0), (int64)MP_OK);
+  mp_expect("seq bumped", mp_chart_seq(c) > seq);
+  mp_expect_near("y replaced", mp_col_y(&c->series[0].col, 3), 99.0, 0.0);
+  mp_expect_near("x kept", mp_col_x(&c->series[0].col, 3), 3.0, 0.0);
+  mp_expect_i64("len unchanged", mp_chart_len(c, s), 5);
+  mp_expect_near("last_x unchanged", mp_chart_last_x(c, s), 4.0, 0.0);
+  mp_expect_i64("last sample", (int64)mp_chart_set_at_x(c, s, 4.0, 1.0), (int64)MP_OK);
+  mp_expect_near("first sample ok", mp_col_y(&c->series[0].col, 4), 1.0, 0.0);
+  mp_expect_i64("first", (int64)mp_chart_set_at_x(c, s, 0.0, 7.0), (int64)MP_OK);
+
+  seq = mp_chart_seq(c);
+  mp_expect_i64("miss between", (int64)mp_chart_set_at_x(c, s, 2.5, 1.0), (int64)MP_ERR_STATE);
+  mp_expect_i64("miss above", (int64)mp_chart_set_at_x(c, s, 9.0, 1.0), (int64)MP_ERR_STATE);
+  mp_expect_i64("miss below", (int64)mp_chart_set_at_x(c, s, -1.0, 1.0), (int64)MP_ERR_STATE);
+  mp_expect_i64("seq unchanged by a miss", mp_chart_seq(c), seq);
+  mp_expect_i64("a miss is not a setup error", (int64)mp_chart_error(c), (int64)MP_OK);
+
+  mp_expect_i64("bad series", (int64)mp_chart_set_at_x(c, 4, 1.0, 1.0), (int64)MP_ERR_ARG);
+  mp_expect_i64("bad series recorded", (int64)mp_chart_error(c), (int64)MP_ERR_ARG);
+  mp_expect_i64("null chart", (int64)mp_chart_set_at_x(0, 0, 1.0, 1.0), (int64)MP_ERR_ARG);
+  mp_chart_error_clear(c);
+
+  var u: int32 = mp_chart_series(c, "unsorted");
+  mp_chart_push(c, u, 2.0, 1.0);
+  mp_chart_push(c, u, 1.0, 2.0);
+  mp_expect_i64("unsorted", (int64)mp_chart_set_at_x(c, u, 1.0, 5.0), (int64)MP_ERR_STATE);
+  mp_expect_near("unsorted untouched", mp_col_y(&c->series[1].col, 1), 2.0, 0.0);
+  mp_expect_i64("empty series", (int64)mp_chart_set_at_x(c, mp_chart_series(c, "e"), 1.0, 5.0),
+                (int64)MP_ERR_STATE);
+
+  // A ring that dropped its oldest samples still finds the ones it holds.
+  var r: int32 = mp_chart_series(c, "ring");
+  mp_chart_keep(c, 3);
+  i = 0;
+  while (i < 6) {
+    mp_chart_push(c, r, (float64)i, (float64)i);
+    i = i + 1;
+  }
+  mp_expect_i64("ring hit", (int64)mp_chart_set_at_x(c, r, 4.0, 44.0), (int64)MP_OK);
+  mp_expect_near("ring y", mp_col_y(&c->series[3].col, 1), 44.0, 0.0);
+  mp_expect_i64("ring dropped", (int64)mp_chart_set_at_x(c, r, 1.0, 0.0), (int64)MP_ERR_STATE);
+  mp_chart_free(c);
+  mp_expect_i64("leak-free", mp_alloc_live(), base);
+}
+
 fn run_all() {
   check_lifecycle();
   check_series_limits();
@@ -276,6 +380,8 @@ fn run_all() {
   check_host_theme();
   check_string_copies();
   check_lock_hooks();
+  check_getters();
+  check_set_at_x();
 }
 
 export fn main() -> int32 {

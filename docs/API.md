@@ -1954,7 +1954,7 @@ Hover text for a y value of the last frame: fixed decimals one digit finer than 
 
 `import "mistplot/chart/samples";`
 
-Sample input of a chart: pushes, bar-style values by category, clearing, ring size (mp_chart_keep) and the sliding window (mp_chart_window). Each call takes the chart's lock hooks, records its first failure as the sticky error and moves seq only when the data or the setting changed. Uses chart/chart, data/col and core.
+Sample input of a chart: pushes, bar-style values by category, in-place overwrite by x, clearing, ring size (mp_chart_keep) and the sliding window (mp_chart_window), with getters for the newest x, the ring size, the window and whether the chart is live. Each call takes the chart's lock hooks, records its first failure as the sticky error and moves seq only when the data or the setting changed. Uses chart/chart, data/col and core.
 
 ### `mp_chart_push`
 
@@ -2153,11 +2153,112 @@ Shows only the newest span of x: [latest x - span, latest x], where latest x is 
 
 **Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
 
+### `mp_chart_keep_count`
+
+```mettle
+fn mp_chart_keep_count(c: MpChart*) -> int64
+```
+
+The ring size set by mp_chart_keep.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `c` | `MpChart*` | The chart. Valid: non-zero; 0 gives 0. |
+
+**Returns:** Samples kept per series; 0 = unbounded.
+
+**Memory:** Reads only.
+
+**Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+### `mp_chart_window_span`
+
+```mettle
+fn mp_chart_window_span(c: MpChart*) -> float64
+```
+
+The window span set by mp_chart_window.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `c` | `MpChart*` | The chart. Valid: non-zero; 0 gives 0. |
+
+**Returns:** The span in data units; 0 = everything is shown.
+
+**Memory:** Reads only.
+
+**Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+### `mp_chart_is_live`
+
+```mettle
+fn mp_chart_is_live(c: MpChart*) -> bool
+```
+
+Whether the chart is live: it has a ring (mp_chart_keep) or a window (mp_chart_window). Hosts use it to decide whether to keep redrawing.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `c` | `MpChart*` | The chart. Valid: non-zero; 0 gives false. |
+
+**Returns:** true when the ring size or the window span is above 0.
+
+**Memory:** Reads only.
+
+**Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+### `mp_chart_last_x`
+
+```mettle
+fn mp_chart_last_x(c: MpChart*, s: int32) -> float64
+```
+
+The x of the newest sample of series s that has a finite x. For a series whose x values are nondecreasing it is also the largest x.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `c` | `MpChart*` | The chart. Valid: non-zero; 0 gives NaN. |
+| `s` | `int32` | Series index. Valid: 0 .. mp_chart_series_count(c)-1; others give NaN. |
+
+**Returns:** The x in data units, or NaN when the series is empty, holds no finite x or the arguments are bad.
+
+**Memory:** Reads only.
+
+**Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+### `mp_chart_set_at_x`
+
+```mettle
+fn mp_chart_set_at_x(c: MpChart*, s: int32, x: float64, y: float64) -> int32
+```
+
+Overwrites the sample of series s whose x equals x, keeping its x: the in-place update of a row that already sits in a time-ordered series. Does nothing when the series is not sorted by x or holds no sample at x; the caller then reloads instead.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `c` | `MpChart*` | The chart. Valid: non-zero. |
+| `s` | `int32` | Series index. Valid: 0 .. mp_chart_series_count(c)-1. |
+| `x` | `float64` | The x to find. Units: data units. Valid: finite; compared for exact equality. |
+| `y` | `float64` | The new value. Units: data units. Valid: any. |
+
+**Returns:** MP_OK when a sample was overwritten, or an error code.
+
+**Errors:**
+
+- `MP_ERR_ARG` c is 0 or s is out of range (recorded as the sticky error); nothing changes.
+- `MP_ERR_STATE` the series x values are not sorted, or no sample has this x; nothing changes and the sticky error is left alone (a miss is an answer, not a setup fault).
+
+**Memory:** Nothing is retained.
+
+**Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+**Cost:** O(log n) on a sorted series.
+
 ## `src/chart/series.mettle`
 
 `import "mistplot/chart/series";`
 
-Per-series style setters: name, colour, width, dash, marker, smoothing and fill. Same rules as the chart setters: one field each, strings copied, the first failure recorded as the sticky error, seq moved only by a real change. Uses chart/chart and core.
+Per-series style setters: name, colour, width, dash, marker, smoothing and fill, and the name getter. Same rules as the chart setters: one field each, strings copied, the first failure recorded as the sticky error, seq moved only by a real change. Uses chart/chart and core.
 
 ### `mp_series_set_name`
 
@@ -2184,6 +2285,29 @@ Renames series s (its legend label).
 **Memory:** name is copied.
 
 **Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+### `mp_series_name`
+
+```mettle
+fn mp_series_name(c: MpChart*, s: int32, out: uint8*, cap: int64) -> string
+```
+
+Copies the name of series s into out, so a host can read it without touching the chart. A name longer than cap is cut at a code point boundary.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `c` | `MpChart*` | The chart. Valid: non-zero; 0 gives "". |
+| `s` | `int32` | Series index. Valid: 0 .. mp_chart_series_count(c)-1; others give "". |
+| `out` | `uint8*` | Destination bytes. Valid: non-zero, cap bytes writable; 0 gives "". |
+| `cap` | `int64` | Size of out. Units: bytes. Valid: > 0; MP_MAX_TEXT always fits the name. |
+
+**Returns:** A view of the copied bytes in out ("" for a series without a name), or "" for a bad chart, index or buffer. Not NUL-terminated.
+
+**Memory:** Writes into out and returns a view of it: valid while out is, never free it. The chart keeps its own copy of the name.
+
+**Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+**Cost:** O(name length).
 
 ### `mp_series_set_color`
 
@@ -5471,8 +5595,6 @@ One table binding of a watch; read it through mp_meo_table_stats.
 | `x_rowid` | `bool` | x is the INTEGER PRIMARY KEY (the rowid) |
 | `x_unique` | `bool` | x is the rowid, PRIMARY KEY or UNIQUE |
 | `covered_seq` | `uint64` | commit_seq the last built-in reload contained |
-| `has_x` | `bool[32]` | per series: last_x is set |
-| `last_x` | `float64[32]` | per series: largest x in the chart |
 | `st` | `MpMeoTableStats` | counters |
 
 **Memory:** Owned by its watch. table, x_name, y_name and g_name are owned copies (mapped tables only); c, ctx and db are borrowed.

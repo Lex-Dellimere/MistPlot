@@ -110,8 +110,6 @@ export struct MpMeoSlot {
   x_rowid: bool;                                   /// x is the INTEGER PRIMARY KEY (the rowid)
   x_unique: bool;                                  /// x is the rowid, PRIMARY KEY or UNIQUE
   covered_seq: uint64;                             /// commit_seq the last built-in reload contained
-  has_x: bool[32];                                 /// per series: last_x is set
-  last_x: float64[32];                             /// per series: largest x in the chart
   st: MpMeoTableStats;                             /// counters
 }
 
@@ -182,12 +180,6 @@ fn mpm_slot_clear(s: MpMeoSlot*) {
   s->x_rowid = false;
   s->x_unique = false;
   s->covered_seq = 0;
-  var i: int32 = 0;
-  while (i < 32) {
-    s->has_x[i] = false;
-    s->last_x[i] = 0.0;
-    i = i + 1;
-  }
 }
 
 /// Creates a watch over feed that sees only what the feed publishes from now on (its
@@ -572,7 +564,7 @@ fn mpm_fast(s: MpMeoSlot*, ev: MeoChange*) -> bool {
   var rc: int32 = mpm_decode(s, ev, &g, &x, &y);
   if (rc < 0) { return false; }
   var c: MpChart* = s->c;
-  if (rc == 0 && (g < 0 || g >= (int64)c->n_series || g >= 32)) { rc = 1; }
+  if (rc == 0 && (g < 0 || g >= (int64)mp_chart_series_count(c) || g >= 32)) { rc = 1; }
   if (rc == 1) {
     // An updated row may have been drawn before; only a reload can tell.
     if (!ins) { return false; }
@@ -581,33 +573,22 @@ fn mpm_fast(s: MpMeoSlot*, ev: MeoChange*) -> bool {
   }
   var si: int32 = (int32)g;
   if (ins) {
-    if (s->has_x[si] && x < s->last_x[si]) { return false; }
+    if (x < mp_chart_last_x(c, si)) { return false; }   // false for an empty series (NaN)
     if (mp_chart_push(c, si, x, y) != MP_OK) { return false; }
-    s->has_x[si] = true;
-    s->last_x[si] = x;
     s->st.fast_count = s->st.fast_count + 1;
     return true;
   }
   // REPLACE: with a unique x, a sample at x in this series can only be this row.
   if (!s->x_unique) { return false; }
-  var col: MpCol* = &c->series[(int64)si].col;
-  var i: int64 = mp_col_lower_bound(col, x);
-  if (i >= mp_col_len(col) || mp_col_x(col, i) != x) { return false; }
-  if (mp_col_set(col, i, x, y) != MP_OK) { return false; }
-  mp_chart_touch(c);
+  if (mp_chart_set_at_x(c, si, x, y) != MP_OK) { return false; }
   s->st.fast_count = s->st.fast_count + 1;
   return true;
 }
 
 fn mpm_scan_put(s: MpMeoSlot*, g: int64, x: float64, y: float64) -> int32 {
   var c: MpChart* = s->c;
-  if (g < 0 || g >= (int64)c->n_series || g >= 32) { return 0; }
-  var si: int32 = (int32)g;
-  if (mp_chart_push(c, si, x, y) != MP_OK) { return 1; }
-  if (!s->has_x[si] || x > s->last_x[si]) {
-    s->has_x[si] = true;
-    s->last_x[si] = x;
-  }
+  if (g < 0 || g >= (int64)mp_chart_series_count(c) || g >= 32) { return 0; }
+  if (mp_chart_push(c, (int32)g, x, y) != MP_OK) { return 1; }
   return 0;
 }
 
@@ -632,11 +613,6 @@ fn mpm_xy_reload(s: MpMeoSlot*) -> int32 {
   }
   var seq: uint64 = meo_pager_commit_seq(db->pager);
   mp_chart_clear(s->c);
-  var i: int32 = 0;
-  while (i < 32) {
-    s->has_x[i] = false;
-    i = i + 1;
-  }
   if (s->gc >= 0) {
     rc = meo_q_scan_xyg(db, s->table, s->x_name, s->y_name, s->g_name, -MPM_HUGE,
       MPM_HUGE, &mpm_scan_xyg, (rawptr)s);

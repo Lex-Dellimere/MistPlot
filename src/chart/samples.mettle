@@ -1,7 +1,9 @@
-//! Sample input of a chart: pushes, bar-style values by category, clearing, ring size
-//! (mp_chart_keep) and the sliding window (mp_chart_window). Each call takes the chart's
-//! lock hooks, records its first failure as the sticky error and moves seq only when the
-//! data or the setting changed. Uses chart/chart, data/col and core.
+//! Sample input of a chart: pushes, bar-style values by category, in-place overwrite by x,
+//! clearing, ring size (mp_chart_keep) and the sliding window (mp_chart_window), with
+//! getters for the newest x, the ring size, the window and whether the chart is live. Each
+//! call takes the chart's lock hooks, records its first failure as the sticky error and
+//! moves seq only when the data or the setting changed. Uses chart/chart, data/col and
+//! core.
 
 import "std/math";
 import "mistplot/core/error";
@@ -287,6 +289,105 @@ export fn mp_chart_window(c: MpChart*, span: float64) -> int32 {
     mp_chart_touch(c);
   }
   mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// The ring size set by mp_chart_keep.
+///
+/// @param c The chart. Valid: non-zero; 0 gives 0.
+/// @return Samples kept per series; 0 = unbounded.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_keep_count(c: MpChart*) -> int64 {
+  if (c == 0) { return 0; }
+  mp_chart_enter(c);
+  var n: int64 = c->keep;
+  mp_chart_leave(c);
+  return n;
+}
+
+/// The window span set by mp_chart_window.
+///
+/// @param c The chart. Valid: non-zero; 0 gives 0.
+/// @return The span in data units; 0 = everything is shown.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_window_span(c: MpChart*) -> float64 {
+  if (c == 0) { return 0.0; }
+  mp_chart_enter(c);
+  var span: float64 = c->span;
+  mp_chart_leave(c);
+  return span;
+}
+
+/// Whether the chart is live: it has a ring (mp_chart_keep) or a window (mp_chart_window).
+/// Hosts use it to decide whether to keep redrawing.
+///
+/// @param c The chart. Valid: non-zero; 0 gives false.
+/// @return true when the ring size or the window span is above 0.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_is_live(c: MpChart*) -> bool {
+  if (c == 0) { return false; }
+  mp_chart_enter(c);
+  var live: bool = c->keep > 0 || c->span > 0.0;
+  mp_chart_leave(c);
+  return live;
+}
+
+/// The x of the newest sample of series s that has a finite x. For a series whose x values
+/// are nondecreasing it is also the largest x.
+///
+/// @param c The chart. Valid: non-zero; 0 gives NaN.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1; others give NaN.
+/// @return The x in data units, or NaN when the series is empty, holds no finite x or the
+///   arguments are bad.
+/// @mem Reads only.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_last_x(c: MpChart*, s: int32) -> float64 {
+  if (c == 0) { return NAN(); }
+  mp_chart_enter(c);
+  var x: float64 = NAN();
+  if (s >= 0 && s < c->n_series && c->series[(int64)s].col.has_last) {
+    x = c->series[(int64)s].col.last_x;
+  }
+  mp_chart_leave(c);
+  return x;
+}
+
+/// Overwrites the sample of series s whose x equals x, keeping its x: the in-place update
+/// of a row that already sits in a time-ordered series. Does nothing when the series is
+/// not sorted by x or holds no sample at x; the caller then reloads instead.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param s Series index. Valid: 0 .. mp_chart_series_count(c)-1.
+/// @param x The x to find. Units: data units. Valid: finite; compared for exact equality.
+/// @param y The new value. Units: data units. Valid: any.
+/// @return MP_OK when a sample was overwritten, or an error code.
+/// @error MP_ERR_ARG c is 0 or s is out of range (recorded as the sticky error); nothing
+///   changes.
+/// @error MP_ERR_STATE the series x values are not sorted, or no sample has this x; nothing
+///   changes and the sticky error is left alone (a miss is an answer, not a setup fault).
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(log n) on a sorted series.
+export fn mp_chart_set_at_x(c: MpChart*, s: int32, x: float64, y: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_ERR_ARG;
+  if (s >= 0 && s < c->n_series) {
+    rc = MP_ERR_STATE;
+    var col: MpCol* = &c->series[(int64)s].col;
+    if (mp_col_sorted(col)) {
+      var i: int64 = mp_col_lower_bound(col, x);
+      if (i < mp_col_len(col) && mp_col_x(col, i) == x) {
+        rc = mp_col_set(col, i, x, y);
+        if (rc == MP_OK) { mp_chart_touch(c); }
+      }
+    }
+  }
+  if (rc != MP_ERR_STATE) { mp_chart_fail(c, rc); }
   mp_chart_leave(c);
   return rc;
 }

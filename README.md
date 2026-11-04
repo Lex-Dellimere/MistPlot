@@ -1,20 +1,22 @@
 # MistPlot
 
-Charts for [Mettle](https://github.com/suidvandiewereld/Mettle): line, bar and
-scatter, static or live. One layout engine builds a display list (a scene of
-rects, lines, polylines, circles and text), and small backends turn it into
-SVG, an HTML `<figure>`, terminal text, or MythicUI paint calls. Output is
-deterministic: the same chart renders the same bytes.
+Charts for [Mettle](https://github.com/suidvandiewereld/Mettle): line, area, bar
+and scatter, static or live. One `MpChart` object holds the data and the style.
+A frame pipeline turns it into a scene (rects, lines, paths, markers and text),
+and small renderers turn the scene into SVG, an HTML `<figure>`, terminal text
+or MythicUI paint calls. Output is deterministic: the same chart renders the
+same bytes.
 
 ```
-src/core/        buffers, colors, data series, scales, ticks, number format
-src/renderer/    the scene (display list) and render options
-src/chart/       spec -> layout -> scene
-src/live/        ring buffers, min/max decimation, MpLive
-src/backends/    web (SVG, figure, live embed) and terminal
-src/export/      write an SVG file
+src/core/        buffers, colors, scales, ticks, number format, render targets
+src/data/        sample columns, min/max summaries, decimation, smoothing
+src/scene/       the scene (display list), paths, pixel snapping
+src/chart/       the chart object, setters, frame pipeline, picking
+src/render/      SVG, HTML, terminal, files
+src/sync/        mp_chart_share (locking for other threads)
 integrations/    raize (RaizeWeb), mythic (MythicUI), meodb (MeoDB)
 cmd/golden/      prints the tests/golden/ fixtures (tools/golden.sh --update rewrites them)
+docs/API.md      every export: inputs, outputs, errors, ownership (tools/apidoc.sh)
 ```
 
 ## Build
@@ -26,11 +28,12 @@ v0.17.0 release.
 ./check.sh
 ```
 
-`check.sh` runs every test in the interpreter, builds and runs each test in
-debug and release, compares `cmd/golden` with every file in `tests/golden/`, and
-runs the RaizeWeb, MythicUI and MeoDB integration builds. It prints `PASS`.
-`MEODB_DIR` picks the MeoDB checkout (default `../meodb`); an
-integration whose library isn't on disk is skipped.
+`check.sh` checks the doc comments and `docs/API.md`, runs every test in the
+interpreter, builds and runs each test in debug and release, compares
+`cmd/golden` with every file in `tests/golden/`, and runs the RaizeWeb, MythicUI
+and MeoDB integration builds. It prints `PASS`. `MEODB_DIR` picks the MeoDB
+checkout (default `../meodb`); an integration whose library isn't on disk is
+skipped.
 
 To use MistPlot from an app, add it to the app's `mbuild.mettle`:
 
@@ -38,132 +41,177 @@ To use MistPlot from an app, add it to the app's `mbuild.mettle`:
 mb_dep_path("mistplot", "../mistplot");
 ```
 
-and import modules as `import "mistplot/chart/spec";`. The integrations live
-outside `src/`, so an app imports one by path (for example
-`import "../mistplot/integrations/raize/mp_raize";`) and maps its host
-library itself.
+and `import "mistplot/mistplot";`. The integrations live outside `src/`, so an
+app imports one by path (for example `import "../mistplot/integrations/raize/mp_raize";`)
+and maps its host library itself.
 
-## Static charts
+## Ownership
 
-```mettle
-var s: MpSeries* = mp_series_new("latency", 0);
-mp_series_push(s, 0.0, 12.0);
-mp_series_push(s, 1.0, 15.0);
+1. A chart copies everything you give it. `mp_chart_free` releases all of it.
+2. An `MpBuf` you pass in belongs to you; each call clears it and fills it.
+3. Pointers returned from a chart (`mp_chart_scene`, `mp_chart_svg_view`) are
+   borrowed: valid only while you hold `mp_chart_lock`, until the next render.
+4. An integration registration borrows the chart. Unregister it before you free the chart.
+5. Returned strings are views of a buffer you passed, or static text.
 
-var spec: MpChartSpec = mp_chart_spec(MP_CHART_LINE, s, 1);
-spec.title = "Latency";
-spec.y_label = "ms";
-var o: MpRenderOpts = mp_render_opts(spec.width, spec.height, spec.theme);
+Every call returns `MP_OK` or an `MP_ERR_*` code; the chart also keeps the first
+error (`mp_chart_error`). Size, scale and text measurement are not chart state:
+you pass them per render, so one chart can draw as an SVG, a terminal and a
+HiDPI window. Call `mp_chart_share(c)` before other threads touch a chart.
 
-var out: MpBuf* = mp_buf_new(4096);
-mp_chart_svg(&spec, &o, out);        // or mp_chart_figure for HTML
-```
+## Static chart in RaizeWeb
 
-The spec borrows its series and strings, so keep them alive while it is used.
-`mp_chart_render` gives you the scene itself, for `mp_ascii_render`,
-`mp_export_svg` or your own backend. For a terminal, size the spec with
-`mp_ascii_chart_width(cols)` / `mp_ascii_chart_height(rows)` and draw it with
-`mp_ascii_render_grid`, so each line of chart text takes one row. Bars take category names through
-`spec.categories` / `spec.n_categories`; `x_fixed` / `y_fixed` pin an axis
-range; `MP_FMT_TIME` labels seconds as `mm:ss`.
-
-## Live charts
+`integrations/raize/mp_raize.mettle`. Your app maps RaizeWeb's `raize_core`,
+`raize_realtime`, `raize_app` and `raize_template`.
 
 ```mettle
-var lv: MpLive* = mp_live_new(MP_CHART_LINE, 1, 4096);  // kind, series, samples kept
-mp_live_series_name(lv, 0, "cpu");
-mp_live_window(lv, 60.0);                 // show the last 60 x units
-mp_live_spec(lv)->x_format = MP_FMT_TIME;
-mp_live_touch(lv);                        // after editing the spec
+import "raize_core/context/context";
+import "raize_app/app";
+import "mistplot/mistplot";
+import "../mistplot/integrations/raize/mp_raize";
 
-mp_live_push(lv, 0, t, value);            // O(1)
-if (mp_live_update(lv)) {                 // re-renders only when something changed
-  var sc: MpScene* = mp_live_scene(lv);
+var g_sales: MpChart* = 0;            // keep module-scope charts behind a pointer
+
+fn h_sales(ctx: RzContext*) -> int32 { return mp_raize_svg(ctx, g_sales, 640.0, 360.0); }
+
+fn sales_app(app: RzApp*) {
+  g_sales = mp_chart_new(MP_BAR);
+  mp_chart_set_title(g_sales, "Requests by region");
+  mp_chart_set_y_format(g_sales, MP_FMT_SI);
+  var s: int32 = mp_chart_series(g_sales, "requests");
+  mp_chart_set_value(g_sales, s, "north", 420.0);
+  mp_chart_set_value(g_sales, s, "south", 310.0);
+  mp_chart_set_value(g_sales, s, "east", 515.0);
+  if (mp_chart_error(g_sales) == MP_OK) { rz_get(app, "/sales.svg", &h_sales); }
 }
 ```
 
-A frame costs O(plot width) however many samples there are: each pixel column
-keeps its first, min, max and last sample, so peaks survive. `mp_live_seq`
-counts changes and is what the web and MythicUI integrations use to skip work.
-`MpLive` is not thread-safe; share it under your own lock.
+Every helper returns the HTTP status it built, as RaizeWeb's router requires.
+`mp_raize_svg` sends an `ETag` of `<generation>-<seq>`, so an unchanged
+chart costs a 304 and no render. `mp_raize_html` and `mp_raize_embed` give an
+HTML fragment; `mp_raize_tpl_figure` and `mp_raize_tpl_embed` fill a template
+variable, so a page can hold `{{{chart}}}`.
 
-## RaizeWeb
-
-`integrations/raize/mp_raize.mettle`. Your app maps RaizeWeb's `raize_core` and `raize_realtime`.
-
-```mettle
-fn h_chart(ctx: RzContext*) -> int32 { return mp_raize_svg(ctx, g_spec, g_opts); }
-fn h_live(ctx: RzContext*) -> int32 { return mp_raize_live_serve(ctx, g_rl); }
-```
-
-- Every helper returns the HTTP status it built, as RaizeWeb's router
-  requires.
-- To put a chart in a template, use a raw placeholder (`{{{chart}}}`) and
-  `mp_raize_tpl_figure`. The buffer it fills must outlive
-  `rz_template_render_into`.
-- The page embeds the current frame plus a small script (`mp_raize_tpl_live`)
-  that polls with `If-None-Match`. An unchanged chart costs a 304 and no render.
-- With channels, the page is told about new frames instead:
-  `mp_raize_live_channel` registers the chart on a topic, `mp_raize_live_notify`
-  (after a batch of pushes) broadcasts the new ETag, and the page
-  (`mp_raize_tpl_live_ws`) fetches the frame through the same ETag route. The
-  socket carries only the tag because RaizeWeb's outgoing WebSocket data has no
-  backpressure. While the socket is down, the page polls.
-- `MpRaizeLive` wraps an `MpLive` with a lock and an SVG cache.
-  `mp_raize_live_push` and `mp_raize_live_serve` lock for you. Anything else
-  that touches the `MpLive` goes between `mp_raize_live_lock` and
-  `mp_raize_live_unlock`, followed by `mp_live_touch`.
+For a live page, `mp_raize_channel(app, c, topic, socket_path)` registers the
+chart on a channel topic (and shares it). After a batch of pushes,
+`mp_raize_notify(c)` sends the new tag to joined pages, which fetch the frame
+through the same ETag route. While the socket is down the page polls.
 
 Example: `integrations/raize/examples/dashboard.mettle` (port 8088,
 `--run-for N` to stop on its own).
 
-## MythicUI
+## Live chart in MythicUI
 
 `integrations/mythic/mp_mythic.mettle`. Your app maps MythicUI as `mythic`.
 
 ```mettle
+import "mythic/mythic";
+import "mistplot/mistplot";
+import "../mistplot/integrations/mythic/mp_mythic";
+
+struct App { cpu: MpChart*; }
+
 fn frame(ui: MythicUi*, ud: rawptr) {
   var app: App* = (App*)ud;
-  if (ui->pass == 0) {                    // MythicUI may run a frame 3 times
-    mp_live_push(app->lv, 0, now_seconds(ui), read_sensor());
+  if (ui->pass == 0) {                  // MythicUI may run a frame 3 times
+    var t: float64 = (float64)mythic_time_us(ui) / 1000000.0;
+    mp_chart_push(app->cpu, 0, t, read_cpu());
   }
-  mp_mythic_live(ui, app->live_chart, app->lv, mythic_grow(), mythic_fixed(300));
-  mp_mythic_chart(ui, app->bar_chart, &app->bars, mythic_grow(), mythic_fixed(300));
+  mp_mythic_chart(ui, app->cpu, mythic_grow(), mythic_fixed(320));
 }
+
+// setup
+app->cpu = mp_chart_new(MP_AREA);
+mp_chart_set_title(app->cpu, "CPU");
+mp_chart_set_x_format(app->cpu, MP_FMT_TIME);
+mp_chart_set_y_range(app->cpu, 0.0, 100.0);
+mp_chart_keep(app->cpu, 100000);      // a ring of 100000 samples
+mp_chart_window(app->cpu, 60.0);      // show the last 60 x units
+mp_chart_series(app->cpu, "cpu %");
 ```
 
-Each chart keeps its state in an `MpMythicChart` (`mp_mythic_chart_new`/`_free`).
-Charts follow the MythicUI theme, measure text with MythicUI's fonts, and show
-a hover readout on live charts. Change state only on pass 0; declare the
-widgets on every pass. A producer thread pushes under a lock the UI also takes.
+`mp_mythic_chart` follows the MythicUI theme (unless you called
+`mp_chart_set_theme`), measures text with MythicUI's fonts, draws at the
+window's device scale, shows a hover readout and asks for the next frame while
+the chart is live. Push on pass 0 only; call it on every pass.
+`mp_mythic_save_png(c, w, h, scale, path)` writes a HiDPI PNG.
+
+A frame costs O(plot width) however many samples a sorted series holds: each
+pixel column keeps its first, min, max and last sample, so peaks survive.
 
 Example: `integrations/mythic/examples/live_dashboard.mettle`.
 
-## MeoDB
-
-`integrations/meodb/mp_meo.mettle`, on MeoDB's committed-change feed. Your
-app maps MeoDB as `meodb`.
+## Live chart in the terminal
 
 ```mettle
-var w: MpMeoWatch* = mp_meo_watch_new(feed);
-mp_meo_watch_table(w, READINGS, lv, &reload_readings, (rawptr)app);
+import "std/io";
+import "std/math";
+import "std/thread";
+import "std/bench";
+import "mistplot/mistplot";
 
-mp_meo_poll(w);                           // each frame, or in a loop
-
-fn reload_readings(ctx: rawptr, table_id: uint32, lv: MpLive*) -> int32 {
-  mp_live_clear(lv);
-  // re-scan the table and mp_live_push each row
-  return MP_OK;
+fn main() -> int32 {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_set_title(c, "sin(t)");
+  mp_chart_set_x_format(c, MP_FMT_TIME);
+  mp_chart_keep(c, 10000);
+  mp_chart_window(c, 30.0);
+  var s: int32 = mp_chart_series(c, "signal");
+  var out: MpBuf* = mp_buf_new(65536);
+  var t0: int64 = bench_time_us();
+  var i: int32 = 0;
+  while (i < 600) {
+    var t: float64 = (float64)(bench_time_us() - t0) / 1000000.0;
+    mp_chart_push(c, s, t, sin(t));
+    if (mp_chart_term(c, 100, 28, MP_TERM_BRAILLE | MP_TERM_HOME, out) == MP_OK) {
+      print(mp_buf_str(out));           // MP_TERM_HOME redraws in place
+    }
+    thread_sleep_ms(50);
+    i = i + 1;
+  }
+  mp_buf_free(out);
+  mp_chart_free(c);
+  return 0;
 }
 ```
 
-Only committed changes count: a rolled-back transaction reloads nothing, and
-a reader that fell behind the feed reloads everything. The watcher doesn't read
-row values from events yet, so the chart re-queries the table on each change.
-`mp_meo_table_stats` says when a table last changed and at which commit, and
-`mp_meo_fmt_subtitle` formats that as `updated 10:42:07 · commit 57`. When the
-writer is another process, `mp_meo_probe_check` watches the file's commit
-counter instead.
+Modes are `MP_TERM_BRAILLE`, `MP_TERM_BLOCKS` and `MP_TERM_ASCII`
+(`MP_TERM_AUTO` picks blocks for bar charts); add `MP_TERM_PLAIN` for output
+with no escape codes. To write a file instead: `mp_chart_svg(c, w, h, out)`
+fills a buffer and `mp_chart_save_svg(c, w, h, path)` saves it.
+
+## MeoDB
+
+`integrations/meodb/mp_meo.mettle`, on MeoDB's committed-change feed. Your app
+maps MeoDB as `meodb`. A chart follows a table: either you reload it on a change
+(`mp_meo_watch_table`), or you map columns with `mp_meo_watch_xy` and committed
+inserts go straight in.
+
+```mettle
+var g_chart: MpChart* = 0;
+var g_watch: MpMeoWatch* = 0;
+
+fn reload_readings(ctx: rawptr, table_id: uint32, c: MpChart*) -> int32 {
+  mp_chart_clear(c);                    // runs under the chart lock: no half-drawn frame
+  // re-scan the table and mp_chart_push each row
+  return mp_meo_set_subtitle(g_watch, table_id, c);
+}
+
+// setup
+g_chart = mp_chart_new(MP_LINE);
+mp_chart_window(g_chart, 30.0);
+g_watch = mp_meo_watch_new(feed);
+mp_meo_watch_table(g_watch, READINGS, g_chart, &reload_readings, (rawptr)app);
+
+// poll thread
+mp_meo_poll(g_watch);                   // apply the committed changes
+mp_raize_notify(g_chart);               // tell joined pages, if the chart is on a channel
+```
+
+Only committed changes count: a rolled-back transaction reloads nothing, and a
+reader that fell behind the feed reloads everything. `mp_meo_table_stats` says
+when a table last changed and at which commit. When the writer is another
+process, `mp_meo_probe_check` watches the file's commit counter instead.
 
 Example: `integrations/meodb/examples/meo_live_chart.mettle`.
 
@@ -171,14 +219,13 @@ Example: `integrations/meodb/examples/meo_live_chart.mettle`.
 
 Known head-compiler bugs MistPlot works around:
 
-- `--release`: assigning a struct returned by value to a module-scope
-  variable fails (`global_access`) when it nests a struct from another module,
-  e.g. `g = mp_chart_spec(...)`. Keep such globals on the heap.
+- `--release`: assigning a struct returned by value to a module-scope variable
+  fails (`global_access`) when it nests a struct from another module. Keep such
+  globals on the heap, and fill `MpChartInfo` through an out-pointer.
 - Debug: an exported function with a `string` parameter, called through a
-  function pointer, receives a garbage string. Text-measure callbacks passed
-  to `mp_text_set_measure` should not be exported.
-- A literal `0` can't be passed for a function-pointer parameter; use
-  `mp_text_reset_measure()` instead of `mp_text_set_measure(0, 0)`.
+  function pointer, receives a garbage string. Callbacks are therefore never
+  exported (`tools/lint.sh` checks it).
+- A literal `0` can't be passed for a function-pointer parameter.
 
 ## License
 
