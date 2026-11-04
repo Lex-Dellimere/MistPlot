@@ -6,14 +6,14 @@
 #
 # Needs ../raize_web next to this repo (mettle.deps maps raize=../raize_web).
 # Env: METTLE (compiler, default ../Mettle/bin/mettle next to this repo),
-#      SMOKE_PORT (default 18088; the push check uses SMOKE_PORT + 1).
+#      SMOKE_PORT (default derived from the process id; the push check uses SMOKE_PORT + 1).
 
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT" || exit 1
 METTLE="${METTLE:-$ROOT/../Mettle/bin/mettle}"
 OUT="build/integrations/raize"
-SMOKE_PORT="${SMOKE_PORT:-18088}"
+SMOKE_PORT="${SMOKE_PORT:-$((20000 + $$ % 20000))}"   # per process, so parallel runs differ
 mkdir -p "$OUT"
 
 if [ ! -d ../raize_web/framework ]; then

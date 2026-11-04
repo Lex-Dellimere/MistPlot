@@ -386,7 +386,7 @@ export fn mp_raize_live_free(rl: MpRaizeLive*) {
   if (rl == 0) { return; }
   if (rl->chans != 0) {
     mp_raize_reg_drop(rl);
-    raize_str_free(rl->topic);
+    rz_str_free(rl->topic);
   }
   mp_buf_free(rl->svg);
   free((rawptr)rl);
@@ -617,7 +617,7 @@ fn mp_raize_reg_find(chans: RzChanRouter*, topic: string) -> MpRaizeLive* {
   var i: int32 = 0;
   while (i < g_mp_raize_reg_n) {
     var rl: MpRaizeLive* = g_mp_raize_reg[i];
-    if (rl->chans == chans && raize_str_eq(rl->topic, topic)) { return rl; }
+    if (rl->chans == chans && rz_str_eq(rl->topic, topic)) { return rl; }
     i = i + 1;
   }
   return 0;
@@ -678,7 +678,7 @@ fn mp_raize_chan_join(ctx: RzChanCtx*, payload: string) -> int32 {
 }
 
 fn mp_raize_chan_in(ctx: RzChanCtx*, event: string, payload: string) -> int32 {
-  if (raize_str_eq(event, "heartbeat")) {
+  if (rz_str_eq(event, "heartbeat")) {
     rz_chan_reply_json(ctx, "{{}");
     return 0;
   }
@@ -710,11 +710,11 @@ export fn mp_raize_live_channel(rl: MpRaizeLive*, chans: RzChanRouter*,
 fn mp_raize_reg_add(rl: MpRaizeLive*, chans: RzChanRouter*, topic: string) -> int32 {
   if (rl->chans != 0 || g_mp_raize_reg_n >= MP_RAIZE_MAX_CHANNELS) { return MP_ERR_STATE; }
   if (mp_raize_reg_find(chans, topic) != 0) { return MP_ERR_STATE; }
-  var own: string = raize_str_dup(topic);
+  var own: string = rz_str_dup(topic);
   if (own.chars == 0) { return MP_ERR_ALLOC; }
   if (rz_chan_define(chans, own, &mp_raize_chan_join, &mp_raize_chan_in,
                      &mp_raize_chan_leave) != 0) {
-    raize_str_free(own);
+    rz_str_free(own);
     return MP_ERR_STATE;
   }
   mp_raize_reg_set(rl, chans, own);

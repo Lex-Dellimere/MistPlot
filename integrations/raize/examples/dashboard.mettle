@@ -102,7 +102,7 @@ fn h_index(ctx: RzContext*) -> int32 {
   rz_vars_init(&vars);
   rz_vars_set(&vars, "title", "MistPlot on RaizeWeb");
   var ibuf: uint8[24];
-  rz_vars_set(&vars, "interval", raize_int_buf((int64)DASH_INTERVAL_MS, &ibuf[0], 24));
+  rz_vars_set(&vars, "interval", rz_int_buf((int64)DASH_INTERVAL_MS, &ibuf[0], 24));
   var r1: int32 = mp_raize_tpl_figure(&vars, "bar", g_bar, g_bar_opts, bar);
   // The embed carries the current frame, so the page paints immediately.
   var r2: int32 = mp_raize_tpl_live_ws(&vars, "live", g_rl, "/chart/live.svg",
@@ -195,10 +195,10 @@ export fn dash_stopper_main(arg: cstring) -> uint32 {
 fn parse_args(argc: int32, argv: cstring*, port: int32*) {
   var i: int32 = 1;
   while (i + 1 < argc) {
-    var a: string = raize_str_from_c(argv[i]);
-    var v: int64 = raize_str_to_int(raize_str_from_c(argv[i + 1]));
-    if (raize_str_eq(a, "--port") && v > 0 && v < 65536) { *port = (int32)v; }
-    if (raize_str_eq(a, "--run-for") && v > 0 && v < 86400) { g_run_for = (int32)v; }
+    var a: string = rz_str_from_c(argv[i]);
+    var v: int64 = rz_str_to_int(rz_str_from_c(argv[i + 1]));
+    if (rz_str_eq(a, "--port") && v > 0 && v < 65536) { *port = (int32)v; }
+    if (rz_str_eq(a, "--run-for") && v > 0 && v < 86400) { g_run_for = (int32)v; }
     i = i + 1;
   }
 }
@@ -296,7 +296,7 @@ fn build_web() -> int32 {
   var a2: int32 = rz_router_add(g_router, "GET", "/chart/live.svg", &h_live_svg);
   var a3: int32 = rz_router_add(g_router, "GET", "/chart/live.html", &h_live_html);
   var a4: int32 = rz_router_add(g_router, "GET", DASH_SOCKET, &h_socket);
-  if (a0 != RZ_E_OK || a1 != RZ_E_OK || a2 != RZ_E_OK || a3 != RZ_E_OK || a4 != RZ_E_OK) {
+  if (a0 != RZ_OK || a1 != RZ_OK || a2 != RZ_OK || a3 != RZ_OK || a4 != RZ_OK) {
     println("dashboard: route registration failed {a0} {a1} {a2} {a3} {a4}");
     return 4;
   }

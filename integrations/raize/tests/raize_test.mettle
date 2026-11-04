@@ -74,7 +74,7 @@ fn run(verb: string, path: string, inm: string) -> int32 {
   return rz_router_handle(g_rt, &g_ctx);
 }
 
-fn body() -> string { return raize_buf_str(g_resp->body); }
+fn body() -> string { return rz_buf_str(g_resp->body); }
 fn hdr(name: string) -> string { return rz_resp_header_get(g_resp, name); }
 
 // Copies the current ETag out of the arena (the next run() resets it).
@@ -108,7 +108,7 @@ fn check_static() {
   mp_expect_i64("etag len", tn, 21);
   var etag: string = str_from_bytes((cstring)&tag[0], tn);
   mp_expect("etag quoted", tn > 2 && tag[0] == 34 && tag[tn - 1] == 34);
-  mp_expect("etag mp- prefix", raize_str_starts(etag, "\"mp-"));
+  mp_expect("etag mp- prefix", rz_str_starts(etag, "\"mp-"));
 
   st = run("GET", "/s.svg", "");
   mp_expect_str("etag stable", hdr("ETag"), etag);
@@ -186,8 +186,8 @@ fn check_template() {
   defer mp_buf_free(fig);
   mp_chart_figure(g_spec, g_opts, fig);
 
-  var page: RaizeBuf* = raize_buf_new_cap(256);
-  defer raize_buf_free(page);
+  var page: RzBuf* = rz_buf_new_cap(256);
+  defer rz_buf_free(page);
   var vars: RzVarMap;
   rz_vars_init(&vars);
   var slot: MpBuf* = mp_buf_new(1024);
@@ -197,12 +197,12 @@ fn check_template() {
   // The render copied the bytes: the caller buffer may go now.
   mp_buf_free(slot);
   mp_expect_i64("template renders", (int64)rr, (int64)RZ_TPL_OK);
-  var got: string = raize_buf_str(page);
+  var got: string = rz_buf_str(page);
   var flen: int64 = mp_buf_len(fig);
   mp_expect_i64("template length", (int64)got.length, flen + 13);
-  mp_expect("template prefix", raize_str_starts(got, "<main><figure class=\"mp-figure\">"));
-  mp_expect("template suffix", raize_str_ends(got, "</figure>\n</main>"));
-  var mid: string = raize_str_sub(got, 6, 6 + flen);
+  mp_expect("template prefix", rz_str_starts(got, "<main><figure class=\"mp-figure\">"));
+  mp_expect("template suffix", rz_str_ends(got, "</figure>\n</main>"));
+  var mid: string = rz_str_sub(got, 6, 6 + flen);
   mp_expect("template body == figure (raw, unescaped)", mid == mp_buf_str(fig));
 
   var bad_vars: RzVarMap;
@@ -220,9 +220,9 @@ fn setup() -> bool {
   g_rt = rz_router_new();
   if (g_arena == 0 || g_resp == 0 || g_rt == 0) { return false; }
   rz_router_set_path_decoded(g_rt, true);
-  if (rz_router_add(g_rt, "GET", "/s.svg", &h_svg) != RZ_E_OK) { return false; }
-  if (rz_router_add(g_rt, "GET", "/f.html", &h_fig) != RZ_E_OK) { return false; }
-  if (rz_router_add(g_rt, "GET", "/bad.svg", &h_bad) != RZ_E_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/s.svg", &h_svg) != RZ_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/f.html", &h_fig) != RZ_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/bad.svg", &h_bad) != RZ_OK) { return false; }
   if (!setup_live()) { return false; }
 
   g_series = mp_series_new("sales", 8);
@@ -288,9 +288,9 @@ fn setup_live() -> bool {
   *g_lopts = mp_render_opts(480.0, 240.0, mp_theme_light());
   g_rl = mp_raize_live_new(g_lv, g_lopts);
   if (g_rl == 0) { return false; }
-  if (rz_router_add(g_rt, "GET", "/live.svg", &h_live) != RZ_E_OK) { return false; }
-  if (rz_router_add(g_rt, "GET", "/embed", &h_embed) != RZ_E_OK) { return false; }
-  if (rz_router_add(g_rt, "GET", "/embed0", &h_embed0) != RZ_E_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/live.svg", &h_live) != RZ_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/embed", &h_embed) != RZ_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/embed0", &h_embed0) != RZ_OK) { return false; }
   return true;
 }
 
@@ -303,7 +303,7 @@ fn teardown_live() {
 // `"<gen>-<seq>"` into out; returns the view.
 fn seq_tag(gen: int64, seq: int64, out: uint8*) -> string {
   var digits: uint8[32];
-  var g: string = raize_int_buf(gen, &digits[0], 32);
+  var g: string = rz_int_buf(gen, &digits[0], 32);
   var n: int64 = (int64)g.length;
   out[0] = 34;
   var i: int64 = 0;
@@ -313,7 +313,7 @@ fn seq_tag(gen: int64, seq: int64, out: uint8*) -> string {
   }
   out[1 + n] = 45;
   var digits2: uint8[32];
-  var d: string = raize_int_buf(seq, &digits2[0], 32);
+  var d: string = rz_int_buf(seq, &digits2[0], 32);
   var m: int64 = (int64)d.length;
   i = 0;
   while (i < m) {
@@ -373,7 +373,7 @@ fn check_live() {
   mp_expect("mp_live_svg ok", mp_live_svg(g_lv, g_lopts, want) == MP_OK);
   mp_expect_i64("mp_live_svg leaves seq", mp_live_seq(g_lv), seq);
   mp_expect("live body == mp_live_svg", body() == mp_buf_str(want));
-  mp_expect("live body is svg", raize_str_starts(body(), "<svg "));
+  mp_expect("live body is svg", rz_str_starts(body(), "<svg "));
 
   // Same seq, no If-None-Match: cached bytes, no render.
   var k: int32 = 0;
@@ -427,7 +427,7 @@ fn check_live() {
   mp_raize_live_unlock(g_rl);
   st = run("GET", "/live.svg", tag2);
   mp_expect_i64("touch -> 200", (int64)st, 200);
-  mp_expect("edited title in body", raize_str_contains(body(), "signal (edited)"));
+  mp_expect("edited title in body", rz_str_contains(body(), "signal (edited)"));
   mp_expect_i64("touch one render", (int64)mp_raize_live_renders(g_rl), (int64)(r0 + 3));
 
   // Embed snippet, as a response and as a template variable: the div holds
@@ -443,10 +443,10 @@ fn check_live() {
   mp_expect_str("embed content-type", hdr("Content-Type"), "text/html; charset=utf-8");
   mp_expect("embed body == mp_live_embed_with(current frame)",
             body() == mp_buf_str(emb));
-  mp_expect("embed has data-src", raize_str_contains(body(), "data-src=\"/live.svg\""));
+  mp_expect("embed has data-src", rz_str_contains(body(), "data-src=\"/live.svg\""));
   mp_expect("embed div starts with the frame",
-            raize_str_contains(body(), "data-interval=\"500\"><svg "));
-  mp_expect("embed has script", raize_str_contains(body(), "<script>"));
+            rz_str_contains(body(), "data-interval=\"500\"><svg "));
+  mp_expect("embed has script", rz_str_contains(body(), "<script>"));
   mp_expect_i64("embed reuses the cached frame", (int64)mp_raize_live_renders(g_rl),
                 (int64)r3);
 
@@ -500,7 +500,7 @@ fn main() -> int32 {
 fn def_for(chans: RzChanRouter*, topic: string) -> int32 {
   var i: int32 = 0;
   while (i < chans->ndefs) {
-    if (raize_str_eq(chans->defs[i].pattern, topic)) { return i; }
+    if (rz_str_eq(chans->defs[i].pattern, topic)) { return i; }
     i = i + 1;
   }
   return -1;
@@ -619,7 +619,7 @@ fn check_channel() {
   if (d < 0) { return; }
 
   // Join: the reply carries the current tag.
-  var reply: RaizeBuf* = raize_buf_new();
+  var reply: RzBuf* = rz_buf_new();
   var c: RzChanCtx;
   c.router = chans;
   c.hub = hub;
@@ -631,29 +631,29 @@ fn check_channel() {
   var jb: uint8[96];
   var want: string = tag_json(77, mp_raize_live_seq(rl), &jb[0]);
   mp_expect_i64("join accepted", (int64)call_join(chans, d, &c, "{{}"), 0);
-  mp_expect_str("join reply is the tag", raize_buf_str(reply), want);
+  mp_expect_str("join reply is the tag", rz_buf_str(reply), want);
   mp_expect("join leaves no state", c.state == 0);
   // The ETag the route sends for this seq is the same string as the tag.
   var tb: uint8[64];
-  mp_expect("join tag == route etag", raize_str_contains(want,
+  mp_expect("join tag == route etag", rz_str_contains(want,
             seq_tag(77, mp_raize_live_seq(rl), &tb[0])));
 
   // A topic that reaches the callback without a registration is refused.
   reply->len = 0;
   c.topic = "chart:gone";
   mp_expect("unknown topic refused", call_join(chans, d, &c, "{{}") != 0);
-  mp_expect_str("refusal reason", raize_buf_str(reply), "{{\"reason\":\"unknown chart\"}");
+  mp_expect_str("refusal reason", rz_buf_str(reply), "{{\"reason\":\"unknown chart\"}");
   c.topic = "chart:live";
 
   reply->len = 0;
   mp_expect_i64("heartbeat ok", (int64)call_in(chans, d, &c, "heartbeat", "{{}"), 0);
-  mp_expect_str("heartbeat reply", raize_buf_str(reply), "{{}");
+  mp_expect_str("heartbeat reply", rz_buf_str(reply), "{{}");
   reply->len = 0;
   mp_expect("other event refused", call_in(chans, d, &c, "set", "{{}") != 0);
-  mp_expect_str("other event reason", raize_buf_str(reply),
+  mp_expect_str("other event reason", rz_buf_str(reply),
                 "{{\"reason\":\"unknown event\"}");
   call_leave(chans, d, &c);
-  raize_buf_free(reply);
+  rz_buf_free(reply);
 
   // Notices: one per moved seq, coalesced across pushes.
   mp_expect_i64("first notify", (int64)mp_raize_live_notify(rl), (int64)MP_OK);

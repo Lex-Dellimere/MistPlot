@@ -29,6 +29,9 @@ export METTLE="${METTLE:-$ROOT/../Mettle/bin/mettle}"
 MBUILD="${MBUILD:-$(command -v mbuild || echo "$ROOT/../mbuild/build/linux/release/mbuild")}"
 OUT="build/check"
 mkdir -p "$OUT"
+# Runs share build/ and the integration ports, so a second run waits for the first.
+exec 9> build/.check.lock
+flock 9
 
 fails=0
 step() { # name, command...
