@@ -14,7 +14,7 @@ src/live/        ring buffers, min/max decimation, MpLive
 src/backends/    web (SVG, figure, live embed) and terminal
 src/export/      write an SVG file
 integrations/    raize (RaizeWeb), mythic (MythicUI), meosql (MeoSQL)
-cmd/line_svg/    renders the golden chart in tests/golden/
+cmd/golden/      prints the tests/golden/ fixtures (tools/golden.sh --update rewrites them)
 ```
 
 ## Build
@@ -27,7 +27,7 @@ v0.17.0 release.
 ```
 
 `check.sh` runs every test in the interpreter, builds and runs each test in
-debug and release, compares `cmd/line_svg` with `tests/golden/line.svg`, and
+debug and release, compares `cmd/golden` with every file in `tests/golden/`, and
 runs the RaizeWeb, MythicUI and MeoSQL integration builds. It prints `PASS`.
 `MEOSQL_DIR` picks the MeoSQL checkout (default `../meosql`); an
 integration whose library isn't on disk is skipped.

@@ -5,7 +5,8 @@
 #   2. `mbuild test` (every src/**/*_test.mettle in the compile-time interpreter)
 #   3. every unit test built and run natively in debug and release
 #      (release builds have miscompiles, so both run)
-#   4. cmd/line_svg in debug and release, byte-compared with tests/golden/line.svg
+#   4. tools/golden.sh: cmd/golden in debug and release, byte-compared with
+#      every file in tests/golden/
 #   5. the raize, mythic and meosql integration builds (each skipped when
 #      ../raize_web, ../mythic_ui or the MeoSQL checkout is missing;
 #      MEOSQL_DIR picks the checkout, default ../meosql)
@@ -70,16 +71,7 @@ for src in $(find src -name '*_test.mettle' | sort); do
   done
 done
 
-# The golden: cmd/line_svg's debug and release output must equal
-# tests/golden/line.svg byte for byte.
-for mode in debug release; do
-  flag=""
-  [ "$mode" = release ] && flag="--release"
-  bin="$OUT/line_svg.$mode"
-  rm -f "$bin"
-  step "build-line_svg-$mode" "$METTLE" $flag --build cmd/line_svg/main.mettle -o "$bin"
-  [ -x "$bin" ] && step "golden-line-$mode" sh -c "\"$bin\" | cmp - tests/golden/line.svg"
-done
+step golden tools/golden.sh
 
 if [ -d ../raize_web/framework ]; then
   step integration-raize integrations/raize/build.sh

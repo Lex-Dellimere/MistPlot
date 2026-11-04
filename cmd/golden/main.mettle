@@ -1,15 +1,14 @@
-// cmd/line_svg — prints the line-chart fixture as SVG on stdout. check.sh
-// compares its debug and release output byte for byte with
-// tests/golden/line.svg, so the golden is enforced instead of documentary.
-// The fixture is the one src/integration_test.mettle renders (two series of 13
-// points, a title with `&` and `<`, both axis titles).
+// cmd/golden — prints one golden fixture on stdout:
 //
-// Regenerate the golden only on purpose, after looking at the new chart:
-//   ../Mettle/bin/mettle --build cmd/line_svg/main.mettle -o build/line_svg
-//   build/line_svg > tests/golden/line.svg
+//   golden <fixture>        e.g. `golden line` prints tests/golden/line.svg
+//
+// tools/golden.sh builds this in debug and release and byte-compares every
+// file in tests/golden/ with the output of the fixture named by its stem, so
+// the goldens are enforced instead of documentary. Unknown fixture: exit 2.
 
 import "std/io";
 import "std/mem";
+import "std/conv";
 import "mistplot/core/buf";
 import "mistplot/core/color";
 import "mistplot/core/data";
@@ -28,7 +27,9 @@ fn drop(ser: MpSeries*) {
   if (ser->ys != 0) { free(ser->ys); }
 }
 
-export fn main() -> int32 {
+// Two series of 13 points, a title with `&` and `<`, both axis titles: the
+// chart src/integration_test.mettle renders.
+fn fixture_line() -> int32 {
   var api: float64[13] = [14.0, 22.0, 19.0, 31.0, 44.0, 39.0, 52.0, 63.0, 58.0,
                           71.0, 84.0, 78.0, 93.0];
   var cache: float64[13] = [9.0, 12.0, 17.0, 15.0, 24.0, 31.0, 28.0, 37.0, 45.0,
@@ -54,4 +55,13 @@ export fn main() -> int32 {
   var s: string = mp_buf_str(b);
   print("{s}");
   return 0;
+}
+
+export fn main(argc: int32, argv: cstring*) -> int32 {
+  if (argc == 2) {
+    var name: string = str_from_cstr(argv[1]);
+    if (name == "line") { return fixture_line(); }
+  }
+  print_err("usage: golden <fixture>   (fixtures: line)\n");
+  return 2;
 }
