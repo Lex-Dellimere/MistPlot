@@ -19,11 +19,11 @@ import "raize_core/str/str";
 import "raize_core/core/status";
 import "raize_core/context/context";
 import "raize_core/router/router";
-import "raize_core/template/template";
-import "raize_core/template/vars";
+import "raize_template/template";
+import "raize_template/vars";
 import "raize_realtime/hub/hub";
 import "raize_realtime/channel/channel";
-import "raize/app/app";
+import "raize_app/app";
 import "../mp_raize";
 
 var g_rt: RzRouter* = 0;

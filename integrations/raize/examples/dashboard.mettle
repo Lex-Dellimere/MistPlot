@@ -30,9 +30,9 @@ import "std/math";
 import "std/bench";
 import "raize_core/str/str";
 import "raize_core/context/context";
-import "raize_core/template/template";
-import "raize_core/template/vars";
-import "raize/app/app";
+import "raize_template/template";
+import "raize_template/vars";
+import "raize_app/app";
 import "mistplot/mistplot";
 import "../mp_raize";
 

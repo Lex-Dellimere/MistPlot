@@ -4,6 +4,7 @@
 mistplot=../src
 raize_core=../../raize_web/libs/core
 raize_realtime=../../raize_web/libs/realtime
-raize=../../raize_web
+raize_app=../../raize_web/libs/app
+raize_template=../../raize_web/libs/template
 mythic=../../mythic_ui/src
 meodb=../../meodb
