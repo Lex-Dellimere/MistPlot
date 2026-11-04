@@ -7,10 +7,12 @@
 #      (release builds have miscompiles, so both run)
 #   4. tools/golden.sh: cmd/golden in debug and release, byte-compared with
 #      every file in tests/golden/
-#   5. the raize, mythic and meodb integration builds (each skipped when
+#   5. cmd/bench built with --release and run with --check (its hard gates: times
+#      within 4x of the targets, B3's O(width) ratio and zero steady-frame allocations)
+#   6. the raize, mythic and meodb integration builds (each skipped when
 #      ../raize_web, ../mythic_ui or the MeoDB checkout is missing;
 #      MEODB_DIR picks the checkout, default ../meodb)
-#   6. no memory-analyser warning (warning[M01..]) for a MistPlot file in any
+#   7. no memory-analyser warning (warning[M01..]) for a MistPlot file in any
 #      build log of this run
 #
 #   ./check.sh                  # from anywhere; cds to the repo root
@@ -75,6 +77,10 @@ for src in $(find src -name '*_test.mettle' | sort); do
 done
 
 step golden tools/golden.sh
+
+rm -f "$OUT/bench.release"
+step build-bench "$METTLE" --release --build cmd/bench/main.mettle -o "$OUT/bench.release"
+[ -x "$OUT/bench.release" ] && step bench "$OUT/bench.release" --check
 
 if [ -d ../raize_web/libs/core ]; then
   step integration-raize integrations/raize/build.sh

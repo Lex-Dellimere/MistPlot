@@ -1,0 +1,337 @@
+// cmd/bench — MistPlot's performance gate. Build with --release and run:
+//
+//   bench            print every measure with its target and hard gate
+//   bench --check    the same, then exit 1 when any hard gate fails
+//
+// B1..B8 are the measures of the design table; L1 and L2 (lock overhead) are reported
+// without a gate. Times are medians where several runs are taken. The machine-independent
+// gates are B3's ratio (1M samples within 1.5x of 10k samples, i.e. O(width) frames) and
+// B6 (no mp_alloc in 200 steady frames). A time over its target prints a warning; only a
+// time over its gate (4x the target) fails.
+
+import "std/io";
+import "std/conv";
+import "std/math";
+import "std/mem";
+import "std/time";
+import "mistplot/core/buf";
+import "mistplot/core/mem";
+import "mistplot/core/target";
+import "mistplot/chart/chart";
+import "mistplot/mistplot";
+import "mistplot/sync/share";
+
+const W: float64 = 1200.0;
+const H: float64 = 400.0;
+const TCOLS: int32 = 200;
+const TROWS: int32 = 50;
+const FRAMES: int32 = 200;
+const BATCH: int32 = 1000;
+
+var g_fails: int32 = 0;
+var g_seed: uint64 = 12345;
+
+fn noise() -> float64 {
+  g_seed = g_seed * (uint64)6364136223846793005 + (uint64)1442695040888963407;
+  return (float64)((int64)(g_seed >> (uint64)40)) / 16777216.0;
+}
+
+// Precomputed y values, so the timed loops measure the chart and not the data source.
+const YS_N: int64 = 1048576;
+var g_ys: float64* = 0;
+
+fn make_ys() {
+  g_ys = (float64*)malloc(YS_N * 8);
+  var i: int64 = 0;
+  while (i < YS_N) {
+    g_ys[i] = 50.0 + 30.0 * sin((float64)i * 0.001) + 10.0 * noise();
+    i = i + 1;
+  }
+}
+
+fn sample_y(i: int64) -> float64 {
+  return g_ys[i & (YS_N - 1)];
+}
+
+fn median(v: int64*, n: int32) -> int64 {
+  var i: int32 = 1;
+  while (i < n) {
+    var k: int64 = v[i];
+    var j: int32 = i - 1;
+    while (j >= 0 && v[j] > k) {
+      v[j + 1] = v[j];
+      j = j - 1;
+    }
+    v[j + 1] = k;
+    i = i + 1;
+  }
+  return v[n / 2];
+}
+
+fn pad(b: MpBuf*, from: int64, width: int64) {
+  while (mp_buf_len(b) - from < width) { mp_buf_putc(b, 32); }
+}
+
+// One row: id, what, measured value, target and gate (gate < 0: reported only).
+fn row(id: string, what: string, v: float64, unit: string, target: float64, gate: float64) {
+  var b: MpBuf* = mp_buf_new(256);
+  mp_buf_puts(b, id);
+  mp_buf_puts(b, "  ");
+  var at: int64 = mp_buf_len(b);
+  mp_buf_puts(b, what);
+  pad(b, at, 50);
+  at = mp_buf_len(b);
+  mp_buf_put_f64(b, v, 3);
+  mp_buf_puts(b, " ");
+  mp_buf_puts(b, unit);
+  pad(b, at, 16);
+  mp_buf_puts(b, "target <= ");
+  mp_buf_put_f64(b, target, 1);
+  if (gate >= 0.0) {
+    mp_buf_puts(b, "  gate <= ");
+    mp_buf_put_f64(b, gate, 1);
+  } else {
+    mp_buf_puts(b, "  (no gate)");
+  }
+  if (gate >= 0.0 && v > gate) {
+    mp_buf_puts(b, "  FAIL");
+    g_fails = g_fails + 1;
+  } else if (v > target) {
+    mp_buf_puts(b, "  warning: over target");
+  }
+  mp_buf_puts(b, "\n");
+  print(mp_buf_str(b));
+  mp_buf_free(b);
+}
+
+fn ms(ns: int64) -> float64 {
+  return (float64)ns / 1000000.0;
+}
+
+fn fill(c: MpChart*, s: int32, n: int64) {
+  var i: int64 = 0;
+  while (i < n) {
+    mp_chart_push(c, s, (float64)i, sample_y(i));
+    i = i + 1;
+  }
+}
+
+fn live_chart(series: int32, keep: int64) -> MpChart* {
+  var c: MpChart* = mp_chart_new(MP_LINE);
+  mp_chart_set_title(c, "bench");
+  mp_chart_keep(c, keep);
+  var k: int32 = 0;
+  while (k < series) {
+    mp_chart_series(c, "s");
+    k = k + 1;
+  }
+  return c;
+}
+
+// B1 and B2 over three fresh charts; medians.
+fn bench_cold() {
+  var push_ns: int64[3];
+  var cold_ns: int64[3];
+  var r: int32 = 0;
+  while (r < 3) {
+    var c: MpChart* = live_chart(1, 1000000);
+    var t0: int64 = time_mono_ns();
+    fill(c, 0, 1000000);
+    var t1: int64 = time_mono_ns();
+    var t: MpTarget = mp_target(W, H);
+    mp_chart_scene(c, &t);
+    var t2: int64 = time_mono_ns();
+    if (mp_chart_error(c) != MP_OK) { g_fails = g_fails + 1; }
+    push_ns[r] = t1 - t0;
+    cold_ns[r] = t2 - t1;
+    mp_chart_free(c);
+    r = r + 1;
+  }
+  row("B1", "1M pushes, keep 1M, 1 series", (float64)median(&push_ns[0], 3) / 1000000.0,
+      "ns/push", 40.0, 160.0);
+  row("B2", "cold frame (summary rebuild), 1M at 1200x400", ms(median(&cold_ns[0], 3)), "ms",
+      25.0, 100.0);
+}
+
+struct Steady {
+  scene: int64;   // median push + scene, ns
+  svg: int64;     // median SVG serialize, ns
+  term: int64;    // median terminal frame, ns
+  allocs: int64;  // mp_alloc_count delta over the timed frames
+}
+
+fn push_batch(c: MpChart*, series: int32, next: int64) {
+  var k: int32 = 0;
+  while (k < series) {
+    var i: int64 = 0;
+    while (i < (int64)BATCH) {
+      mp_chart_push(c, k, (float64)(next + i), sample_y(next + i));
+      i = i + 1;
+    }
+    k = k + 1;
+  }
+}
+
+// FRAMES steady frames after a warm-up: push BATCH per series, scene, SVG, terminal.
+fn steady(series: int32, keep: int64, out: Steady*) {
+  var c: MpChart* = live_chart(series, keep);
+  var k: int32 = 0;
+  while (k < series) {
+    fill(c, k, keep);
+    k = k + 1;
+  }
+  var svg: MpBuf* = mp_buf_new(1 << 20);
+  var txt: MpBuf* = mp_buf_new(1 << 20);
+  var t: MpTarget = mp_target(W, H);
+  var a: int64[200];
+  var b: int64[200];
+  var d: int64[200];
+  var next: int64 = keep;
+  var f: int32 = -5;
+  var n0: int64 = 0;
+  while (f < FRAMES) {
+    if (f == 0) { n0 = mp_alloc_count(); }
+    var t0: int64 = time_mono_ns();
+    push_batch(c, series, next);
+    mp_chart_scene(c, &t);
+    var t1: int64 = time_mono_ns();
+    mp_chart_svg(c, W, H, svg);
+    var t2: int64 = time_mono_ns();
+    mp_chart_term(c, TCOLS, TROWS, MP_TERM_BRAILLE, txt);
+    var t3: int64 = time_mono_ns();
+    if (f >= 0) {
+      a[f] = t1 - t0;
+      b[f] = t2 - t1;
+      d[f] = t3 - t2;
+    }
+    next = next + (int64)BATCH;
+    f = f + 1;
+  }
+  out->allocs = mp_alloc_count() - n0;
+  if (mp_chart_error(c) != MP_OK || mp_buf_len(svg) == 0 || mp_buf_len(txt) == 0) {
+    print_err("bench: a steady frame failed\n");
+    g_fails = g_fails + 1;
+  }
+  out->scene = median(&a[0], FRAMES);
+  out->svg = median(&b[0], FRAMES);
+  out->term = median(&d[0], FRAMES);
+  mp_buf_free(svg);
+  mp_buf_free(txt);
+  mp_chart_free(c);
+}
+
+fn bench_steady() {
+  var small: Steady;
+  var big: Steady;
+  var multi: Steady;
+  steady(1, 10000, &small);
+  steady(1, 1000000, &big);
+  steady(4, 250000, &multi);
+  row("B3", "steady push 1000 + scene, 1M samples", ms(big.scene), "ms", 0.5, 2.0);
+  row("B3r", "  ratio to the same run with 10k samples", (float64)big.scene / (float64)small.scene,
+      "x", 1.5, 1.5);
+  row("B4", "SVG serialize of that frame", ms(big.svg), "ms", 1.0, 4.0);
+  row("B5", "mp_chart_term 200x50 Braille, same chart", ms(big.term), "ms", 1.0, 4.0);
+  row("B6", "mp_alloc_count delta, 200 frames scene+SVG+term",
+      (float64)(big.allocs + small.allocs + multi.allocs), "allocs", 0.0, 0.0);
+  row("B7", "4 series x 250k, push 1000 each + scene", ms(multi.scene), "ms", 1.0, 4.0);
+}
+
+// B8: a static chart rebuilt every frame (mp_chart_touch), scene + SVG.
+fn bench_static() {
+  var c: MpChart* = mp_chart_new(MP_AREA);
+  mp_chart_set_title(c, "static");
+  var s: int32 = mp_chart_series(c, "area");
+  mp_series_set_smooth(c, s, true);
+  var i: int64 = 0;
+  while (i < 500) {
+    mp_chart_push(c, s, (float64)i, 100.0 + 40.0 * sin((float64)i * 0.05) + 5.0 * noise());
+    i = i + 1;
+  }
+  var svg: MpBuf* = mp_buf_new(1 << 20);
+  var t: MpTarget = mp_target(W, H);
+  var v: int64[200];
+  var f: int32 = -5;
+  while (f < FRAMES) {
+    mp_chart_touch(c);
+    var t0: int64 = time_mono_ns();
+    mp_chart_scene(c, &t);
+    mp_chart_svg(c, W, H, svg);
+    var t1: int64 = time_mono_ns();
+    if (f >= 0) { v[f] = t1 - t0; }
+    f = f + 1;
+  }
+  if (mp_chart_error(c) != MP_OK) { g_fails = g_fails + 1; }
+  row("B8", "static 500-point smooth area, scene + SVG", ms(median(&v[0], FRAMES)), "ms", 1.0,
+      4.0);
+  mp_buf_free(svg);
+  mp_chart_free(c);
+}
+
+// ns per call of n pushes into a full ring.
+fn push_cost(c: MpChart*, n: int64, from: int64) -> float64 {
+  var t0: int64 = time_mono_ns();
+  var i: int64 = 0;
+  while (i < n) {
+    mp_chart_push(c, 0, (float64)(from + i), 1.0);
+    i = i + 1;
+  }
+  return (float64)(time_mono_ns() - t0) / (float64)n;
+}
+
+// L1: what the shared lock adds to an uncontended call; L2: a mp_chart_lock pair.
+fn bench_lock() {
+  var n: int64 = 1000000;
+  var plain: MpChart* = live_chart(1, n);
+  var shared: MpChart* = live_chart(1, n);
+  mp_chart_share(shared);
+  fill(plain, 0, n);
+  fill(shared, 0, n);
+  var a: int64[5];
+  var r: int32 = 0;
+  while (r < 5) {
+    var p: float64 = push_cost(plain, n, n * (int64)(r + 1));
+    var q: float64 = push_cost(shared, n, n * (int64)(r + 1));
+    a[r] = (int64)((q - p) * 1000.0);
+    r = r + 1;
+  }
+  var d: float64 = (float64)median(&a[0], 5) / 1000.0;
+  if (d < 0.0) { d = 0.0; }
+  row("L1", "shared-lock overhead per uncontended call", d, "ns", 10.0, -1.0);
+  var t0: int64 = time_mono_ns();
+  var i: int64 = 0;
+  while (i < n) {
+    mp_chart_lock(shared);
+    mp_chart_unlock(shared);
+    i = i + 1;
+  }
+  row("L2", "mp_chart_lock + mp_chart_unlock pair, shared", (float64)(time_mono_ns() - t0) /
+      (float64)n, "ns", 200.0, -1.0);
+  mp_chart_free(plain);
+  mp_chart_free(shared);
+}
+
+export fn main(argc: int32, argv: cstring*) -> int32 {
+  var check: bool = false;
+  if (argc == 2 && str_from_cstr(argv[1]) == "--check") {
+    check = true;
+  } else if (argc != 1) {
+    print_err("usage: bench [--check]\n");
+    return 2;
+  }
+  make_ys();
+  bench_cold();
+  bench_steady();
+  bench_static();
+  bench_lock();
+  if (g_fails != 0) {
+    print("bench: ");
+    var tmp: uint8[24];
+    print(i64_to_str((int64)g_fails, &tmp[0], 24));
+    print(" hard gate(s) failed\n");
+    if (check) { return 1; }
+    return 0;
+  }
+  print("bench: all hard gates hold\n");
+  return 0;
+}
