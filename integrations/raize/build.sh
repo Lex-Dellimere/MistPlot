@@ -4,7 +4,8 @@
 # channel push end to end with python (RaizeWeb's ws_client.py, imported from
 # ../raize_web) and checks both embed scripts with node. Prints PASS or FAIL.
 #
-# Needs ../raize_web next to this repo (integrations/mettle.deps maps raize_core= and raize_realtime=).
+# Needs ../raize_web next to this repo (integrations/mettle.deps maps raize=, raize_core= and
+# raize_realtime=).
 # Env: METTLE (compiler, default ../Mettle/bin/mettle next to this repo),
 #      SMOKE_PORT (default derived from the process id; the push check uses SMOKE_PORT + 1).
 
@@ -65,7 +66,8 @@ smoke() {
   code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
   [ "$(code "$base/")" = 200 ] || ok=1
   curl -s -o "$OUT/page.html" "$base/" || ok=1
-  curl -s -o "$OUT/fragment.html" "$base/chart/live.html" || ok=1
+  curl -s -o "$OUT/fragment.html" "$base/chart/poll.html" || ok=1
+  [ "$(code "$base/chart/live.html")" = 200 ] || ok=1
   [ "$(code "$base/chart/static.svg")" = 200 ] || ok=1
   local etag
   etag="$(curl -s -D - -o /dev/null "$base/chart/live.svg" | tr -d '\r' |

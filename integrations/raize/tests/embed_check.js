@@ -1,8 +1,8 @@
 // Runs the live-embed scripts from the served pages under node with a fake
 // DOM, fetch, timers and WebSocket, and checks their browser-side rules.
 //
-// Both scripts (mp_live_embed's polling one and mp_live_embed_ws's channel
-// one, the latter with a socket that never opens):
+// Both scripts of mp_html_live (the polling one, and the channel one with a
+// socket that never opens):
 //   1. backoff after failures stays within [interval, max(interval, 60000)]
 //      and never exceeds 2^31-1 ms (setTimeout treats a larger delay as 0);
 //   2. an ETag is stored only after its body was swapped in;
@@ -25,7 +25,7 @@
 //
 // usage: node embed_check.js page.html [fragment.html]
 //   page.html holds the channel embed (dashboard /), fragment.html the
-//   polling embed (dashboard /chart/live.html). Prints "embed ok" and exits
+//   polling embed (dashboard /chart/poll.html). Prints "embed ok" and exits
 //   0 on success.
 "use strict";
 const fs = require("fs");
