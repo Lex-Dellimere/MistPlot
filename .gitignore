@@ -3,3 +3,4 @@ build/
 *.o
 *.svg.tmp
 /mettle.deps
+reports/
