@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{title}}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; background: #f6f7f9; color: #1f2933; }
+    main { max-width: 1040px; margin: 0 auto; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    p.note { margin: 0 0 16px; color: #6b7280; font-size: 14px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    section { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; }
+    h2 { font-size: 14px; margin: 0 0 8px; color: #374151; }
+    svg { max-width: 100%; height: auto; display: block; }
+    figure { margin: 0; }
+    figcaption { display: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{{title}}</h1>
+    <p class="note">Server-rendered by MistPlot inside a RaizeWeb handler. The live chart polls
+      <a href="/chart/live.svg">/chart/live.svg</a> every {{interval}} ms with If-None-Match;
+      an unchanged frame is a 304.</p>
+    <div class="grid">
+      <section>
+        <h2>Requests by region (static, <a href="/chart/static.svg">/chart/static.svg</a>)</h2>
+        {{{bar}}}
+      </section>
+      <section>
+        <h2>Signal (live)</h2>
+        {{{live}}}
+      </section>
+    </div>
+  </main>
+</body>
+</html>

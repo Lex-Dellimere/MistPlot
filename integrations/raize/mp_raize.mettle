@@ -1,0 +1,505 @@
+// integrations/raize/mp_raize — MistPlot charts served by RaizeWeb handlers.
+//
+// Dependencies: raize/framework/context/context (RzContext, RzResponse,
+// rz_ctx_*, rz_req_header, rz_resp_header_set), raize/framework/template/vars
+// (RzVarMap), mistplot/backends/web/{page,live}, mistplot/live/stream,
+// mistplot/core/buf, std/mem, std/thread (spin_lock). The core library under
+// src/ never imports this file, so it builds without RaizeWeb on disk.
+//
+// Handler contract: a RaizeWeb handler must RETURN the HTTP status it built
+// (100..599), or the router turns it into a 500. Every mp_raize_* handler
+// helper returns that status, so a handler is one line:
+//
+//   fn h_chart(ctx: RzContext*) -> int32 { return mp_raize_svg(ctx, g_spec, g_opts); }
+//
+// Ownership:
+//   * The spec, its series, and the render options are borrowed for the call.
+//   * Each handler helper renders into one scratch MpBuf, which is freed on
+//     return; the response copies the bytes into its own body.
+//   * Header values are built in stack buffers; rz_resp_header_set copies them
+//     into the request arena, so nothing here outlives the call.
+//   * The template helpers (mp_raize_tpl_*) render into a CALLER-owned MpBuf
+//     and store a view of its bytes in the RzVarMap. That buffer must stay
+//     alive and unmodified until rz_template_render_into has returned; the
+//     raw substitution copies the bytes into the response body, so the buffer
+//     may be freed right after.
+//
+// Caching policy for static charts: the SVG is rendered on every request (a
+// chart over changing data is the common case) and given a strong ETag that
+// is a 64-bit FNV-1a hash of the bytes, "mp-<16 hex>", with
+// `Cache-Control: no-cache` (store, but revalidate). A matching If-None-Match
+// answers 304 with no body, which saves the transfer, not the render. A caller
+// that knows its chart is immutable overrides Cache-Control afterwards with
+// rz_resp_header_set(ctx->resp, "Cache-Control", "max-age=3600").
+//
+// Failure: a render error answers 500 with the short text body
+// "chart render failed\n" (the MP_* code is not leaked to the client); a null
+// ctx/resp returns 500 without touching anything.
+//
+// Never prints, keeps no globals. The one extern is clock_gettime, read once
+// per mp_raize_live_new for the live ETag generation.
+
+import "std/mem";
+import "std/thread";
+import "raize/framework/context/context";
+import "raize/framework/template/vars";
+import "mistplot/core/buf";
+import "mistplot/renderer/backend";
+import "mistplot/chart/spec";
+import "mistplot/backends/web/page";
+import "mistplot/live/stream";
+import "mistplot/backends/web/live";
+
+// Wall clock for the live ETag generation (CLOCK_REALTIME = 0 on Linux).
+extern fn mp_raize_clock_gettime(clk: int32, ts: cstring) -> int32 = "clock_gettime";
+
+export const MP_RAIZE_CT_SVG: string = "image/svg+xml";
+export const MP_RAIZE_CT_HTML: string = "text/html; charset=utf-8";
+export const MP_RAIZE_FAIL_BODY: string = "chart render failed\n";
+// Scratch capacity for one rendered chart; MpBuf grows past it when needed.
+export const MP_RAIZE_BUF_CAP: int64 = 8192;
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn mp_raize_ctx_ok(ctx: RzContext*) -> bool {
+  if (ctx == 0) { return false; }
+  if (ctx->resp == 0) { return false; }
+  return true;
+}
+
+// 500 with a fixed short body. Returns the status for the router.
+fn mp_raize_fail(ctx: RzContext*) -> int32 {
+  if (!mp_raize_ctx_ok(ctx)) { return 500; }
+  rz_ctx_text(ctx, 500, MP_RAIZE_FAIL_BODY);
+  return 500;
+}
+
+// 64-bit FNV-1a over the bytes of `b`. Deterministic, so the same chart always
+// gets the same ETag across workers and restarts.
+fn mp_raize_fnv(b: MpBuf*) -> uint64 {
+  var h: uint64 = (uint64)14695981039346656037;
+  if (b == 0 || b->data == 0) { return h; }
+  var i: int64 = 0;
+  while (i < b->len) {
+    h = h ^ (uint64)b->data[i];
+    h = h * (uint64)1099511628211;
+    i = i + 1;
+  }
+  return h;
+}
+
+// Writes `"mp-<16 lowercase hex>"` (with the quotes) into out[0..21) and
+// returns 21. `out` must hold at least 21 bytes.
+fn mp_raize_hash_tag(h: uint64, out: uint8*) -> int64 {
+  out[0] = 34;
+  out[1] = 109;  // m
+  out[2] = 112;  // p
+  out[3] = 45;   // -
+  var i: int32 = 0;
+  while (i < 16) {
+    var shift: uint64 = (uint64)(60 - 4 * i);
+    var d: int32 = (int32)((h >> shift) & (uint64)15);
+    if (d < 10) {
+      out[4 + i] = (uint8)(48 + d);
+    } else {
+      out[4 + i] = (uint8)(87 + d);
+    }
+    i = i + 1;
+  }
+  out[20] = 34;
+  return 21;
+}
+
+// Writes the decimal digits of `v` at out[pos..]; returns the new position.
+// Callers guarantee 20 bytes of room.
+fn mp_raize_u64_at(v: uint64, out: uint8*, pos: int64) -> int64 {
+  var tmp: uint8[24];
+  var n: int32 = 0;
+  var u: uint64 = v;
+  if (u == (uint64)0) {
+    tmp[0] = 48;
+    n = 1;
+  }
+  while (u > (uint64)0) {
+    tmp[n] = (uint8)(48 + (int32)(u % (uint64)10));
+    u = u / (uint64)10;
+    n = n + 1;
+  }
+  var j: int32 = 0;
+  while (j < n) {
+    out[pos + (int64)j] = tmp[n - 1 - j];
+    j = j + 1;
+  }
+  return pos + (int64)n;
+}
+
+// Writes `"<gen>-<seq>"` (decimal, with the quotes) into out and returns the
+// length. The generation is written as its unsigned 64-bit value; a negative
+// seq is written as 0. `out` must hold at least 48 bytes.
+fn mp_raize_seq_tag(gen: int64, seq: int64, out: uint8*) -> int64 {
+  var v: uint64 = 0;
+  if (seq > 0) { v = (uint64)seq; }
+  out[0] = 34;
+  var pos: int64 = mp_raize_u64_at((uint64)gen, out, 1);
+  out[pos] = 45;
+  pos = mp_raize_u64_at(v, out, pos + 1);
+  out[pos] = 34;
+  return pos + 1;
+}
+
+// Microseconds since the Unix epoch (0 when the clock cannot be read).
+fn mp_raize_now_us() -> int64 {
+  var ts: uint8[16];
+  if (mp_raize_clock_gettime(0, &ts[0]) != 0) { return 0; }
+  var sec: int64 = *((int64*)&ts[0]);
+  var nsec: int64 = *((int64*)&ts[8]);
+  return sec * 1000000 + nsec / 1000;
+}
+
+fn mp_raize_is_ows(c: int32) -> bool {
+  if (c == 32 || c == 9) { return true; }
+  return false;
+}
+
+// True when one If-None-Match member equals `tag` (a quoted entity tag).
+// Accepted spellings of a member: `"5"` (strong), `W/"5"` (weak comparison is
+// what RFC 9110 prescribes for If-None-Match), and a bare `5` (a hand-written
+// client that dropped the quotes). Comparison is byte-exact after that.
+fn mp_raize_member_eq(m: string, tag: string) -> bool {
+  var n: int64 = (int64)m.length;
+  var t: int64 = (int64)tag.length;
+  var s: int64 = 0;
+  if (n >= 2 && m.chars[0] == 87 && m.chars[1] == 47) { s = 2; }  // W/
+  var len: int64 = n - s;
+  if (len == t) {
+    var i: int64 = 0;
+    while (i < t) {
+      if (m.chars[s + i] != tag.chars[i]) { return false; }
+      i = i + 1;
+    }
+    return true;
+  }
+  // bare: compare against the tag without its surrounding quotes
+  if (t >= 2 && len == t - 2) {
+    var k: int64 = 0;
+    while (k < len) {
+      if (m.chars[s + k] != tag.chars[1 + k]) { return false; }
+      k = k + 1;
+    }
+    return true;
+  }
+  return false;
+}
+
+// True when the request's If-None-Match lists `tag` or is `*`. The header is
+// a comma-separated list; OWS around members is ignored. The bytes are views
+// into the request (never stored).
+fn mp_raize_inm_matches(ctx: RzContext*, tag: string) -> bool {
+  if (ctx == 0 || ctx->req == 0) { return false; }
+  var v: string = rz_req_header(ctx->req, "If-None-Match");
+  var n: int64 = (int64)v.length;
+  if (n == 0) { return false; }
+  var i: int64 = 0;
+  while (i < n) {
+    while (i < n && (mp_raize_is_ows((int32)v.chars[i]) || v.chars[i] == 44)) {
+      i = i + 1;
+    }
+    var start: int64 = i;
+    while (i < n && v.chars[i] != 44) { i = i + 1; }
+    var end: int64 = i;
+    while (end > start && mp_raize_is_ows((int32)v.chars[end - 1])) {
+      end = end - 1;
+    }
+    if (end > start) {
+      var m: string = str_from_bytes((cstring)&v.chars[start], end - start);
+      if (end - start == 1 && v.chars[start] == 42) { return true; }  // *
+      if (mp_raize_member_eq(m, tag)) { return true; }
+    }
+  }
+  return false;
+}
+
+// Sets ETag + Cache-Control, then either a bodiless 304 or `status` with the
+// buffer's bytes. Returns the status for the router, or 500 when a header
+// could not be stored (full table / arena exhausted).
+fn mp_raize_send(ctx: RzContext*, ct: string, tag: string, cache: string,
+                 b: MpBuf*) -> int32 {
+  if (rz_resp_header_set(ctx->resp, "ETag", tag) != 0) {
+    return mp_raize_fail(ctx);
+  }
+  if (rz_resp_header_set(ctx->resp, "Cache-Control", cache) != 0) {
+    return mp_raize_fail(ctx);
+  }
+  if (mp_raize_inm_matches(ctx, tag)) {
+    rz_ctx_empty(ctx, 304);
+    return 304;
+  }
+  // RaizeWeb turns a 200 with an empty body into a 500 anyway; an empty chart
+  // is a render bug, so report it as one.
+  if (mp_buf_len(b) <= 0) { return mp_raize_fail(ctx); }
+  rz_ctx_bytes(ctx, 200, ct, mp_buf_str(b));
+  return 200;
+}
+
+// ---------------------------------------------------------------------------
+// Static charts
+// ---------------------------------------------------------------------------
+
+// GET handler body: the chart as a standalone `image/svg+xml` document. The
+// bytes are exactly mp_chart_svg's output. 200, 304 (If-None-Match matched
+// the content ETag), or 500.
+export fn mp_raize_svg(ctx: RzContext*, spec: MpChartSpec*,
+                       o: MpRenderOpts*) -> int32 {
+  if (!mp_raize_ctx_ok(ctx)) { return 500; }
+  var b: MpBuf* = mp_buf_new(MP_RAIZE_BUF_CAP);
+  if (b == 0) { return mp_raize_fail(ctx); }
+  defer mp_buf_free(b);
+  var rc: int32 = mp_chart_svg(spec, o, b);
+  if (rc != MP_OK) { return mp_raize_fail(ctx); }
+  var tagbuf: uint8[32];
+  var tn: int64 = mp_raize_hash_tag(mp_raize_fnv(b), &tagbuf[0]);
+  var tag: string = str_from_bytes((cstring)&tagbuf[0], tn);
+  return mp_raize_send(ctx, MP_RAIZE_CT_SVG, tag, "no-cache", b);
+}
+
+// GET handler body: the chart as an HTML `<figure>` fragment (text/html),
+// exactly mp_chart_figure's output, for htmx-style partial swaps. Same ETag
+// and 304 rules as mp_raize_svg.
+export fn mp_raize_figure(ctx: RzContext*, spec: MpChartSpec*,
+                          o: MpRenderOpts*) -> int32 {
+  if (!mp_raize_ctx_ok(ctx)) { return 500; }
+  var b: MpBuf* = mp_buf_new(MP_RAIZE_BUF_CAP);
+  if (b == 0) { return mp_raize_fail(ctx); }
+  defer mp_buf_free(b);
+  var rc: int32 = mp_chart_figure(spec, o, b);
+  if (rc != MP_OK) { return mp_raize_fail(ctx); }
+  var tagbuf: uint8[32];
+  var tn: int64 = mp_raize_hash_tag(mp_raize_fnv(b), &tagbuf[0]);
+  var tag: string = str_from_bytes((cstring)&tagbuf[0], tn);
+  return mp_raize_send(ctx, MP_RAIZE_CT_HTML, tag, "no-cache", b);
+}
+
+// Template helper: renders the chart's <figure> into the caller-owned `out`
+// and binds `name` to a view of those bytes in `vars`, for a raw `{{{name}}}`
+// placeholder (the figure is markup; an escaped `{{name}}` would print it as
+// text). `name` is borrowed by the map too, so pass a literal.
+//
+// Lifetime rule: `out` must outlive rz_template_render_into and must not be
+// written to in between (a growth would move the bytes under the view). The
+// render copies the bytes into the response, so `out` may be freed after it.
+// On failure the variable is not bound and the MP_* code is returned.
+export fn mp_raize_tpl_figure(vars: RzVarMap*, name: string,
+                              spec: MpChartSpec*, o: MpRenderOpts*,
+                              out: MpBuf*) -> int32 {
+  if (vars == 0 || out == 0) { return MP_ERR_ARG; }
+  var rc: int32 = mp_chart_figure(spec, o, out);
+  if (rc != MP_OK) { return rc; }
+  if (rz_vars_set(vars, name, mp_buf_str(out)) != 0) { return MP_ERR_STATE; }
+  return MP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Live charts
+// ---------------------------------------------------------------------------
+//
+// RaizeWeb has no streaming (one buffered response per request), so a live
+// chart is polled: mp_live_embed's script GETs the live URL every interval
+// with If-None-Match set to the last ETag it saw. The ETag is
+// "\"<generation>-<seq>\"", so an unchanged chart costs a bodiless 304 and no
+// render. mp_raize_live_new sets the generation to the wall-clock start time
+// in microseconds when the MpLive still has generation 0; seq restarts at 0
+// with the process but the generation does not repeat, so a browser that kept
+// polling across a restart cannot match and gets the new frame. An app that
+// wants another scheme (a deploy id, a persisted counter) calls
+// mp_live_set_generation before mp_raize_live_new.
+//
+// Concurrency: RaizeWeb serves requests on worker threads while the app's
+// producer pushes samples, and MpLive is not thread-safe. MpRaizeLive owns ONE
+// spin lock that guards the MpLive, the cached bytes and the counters:
+//   * mp_raize_live_push and mp_raize_live_serve take it themselves;
+//   * any other access to the MpLive (mp_live_spec edits, mp_live_window,
+//     mp_live_series_name, direct mp_live_push) must be bracketed by
+//     mp_raize_live_lock / mp_raize_live_unlock, and a template edit must end
+//     with mp_live_touch so the seq (and with it the ETag) moves.
+// The lock is held across the render and the copy into the response body, so
+// it spins around O(width) work. That is fine for a handful of workers and is
+// why the bytes are cached: N clients polling one seq cost one render.
+//
+// Ownership: MpRaizeLive BORROWS the MpLive (free the MpRaizeLive first) and
+// copies the render options. It owns the cached-bytes MpBuf, released only by
+// mp_raize_live_free. Free it only after every thread that can reach it
+// (workers, producer) has been joined.
+
+export struct MpRaizeLive {
+  lv: MpLive*;          // borrowed
+  opts: MpRenderOpts;   // copied at new
+  lock: int32;          // spin_lock / spin_unlock
+  svg: MpBuf*;          // owned: the SVG of seq `svg_seq`
+  svg_seq: int64;       // -1 when `svg` holds no valid frame
+  renders: int32;       // successful mp_live_svg calls (cache misses)
+  not_modified: int32;  // 304s answered
+}
+
+// Wraps `lv` (borrowed) with a lock and an SVG cache rendered with a copy of
+// `o`, stamping the generation if it is 0. Returns 0 on a null argument or an
+// allocation failure.
+export fn mp_raize_live_new(lv: MpLive*, o: MpRenderOpts*) -> MpRaizeLive* {
+  if (lv == 0 || o == 0) { return 0; }
+  var rl: MpRaizeLive* = (MpRaizeLive*)calloc(1, sizeof(MpRaizeLive));
+  if (rl == 0) { return 0; }
+  var b: MpBuf* = mp_buf_new(MP_RAIZE_BUF_CAP);
+  if (b == 0) {
+    free((rawptr)rl);
+    return 0;
+  }
+  if (mp_live_generation(lv) == 0) {
+    mp_live_set_generation(lv, mp_raize_now_us());
+  }
+  rl->lv = lv;
+  rl->opts = *o;
+  rl->lock = 0;
+  rl->svg = b;
+  rl->svg_seq = -1;
+  rl->renders = 0;
+  rl->not_modified = 0;
+  return rl;
+}
+
+// Releases the cache and the wrapper, not the MpLive.
+export fn mp_raize_live_free(rl: MpRaizeLive*) {
+  if (rl == 0) { return; }
+  mp_buf_free(rl->svg);
+  free((rawptr)rl);
+}
+
+export fn mp_raize_live_lock(rl: MpRaizeLive*) {
+  if (rl == 0) { return; }
+  spin_lock(&rl->lock);
+}
+
+export fn mp_raize_live_unlock(rl: MpRaizeLive*) {
+  if (rl == 0) { return; }
+  spin_unlock(&rl->lock);
+}
+
+// mp_live_push under the lock. Returns the MP_* code.
+export fn mp_raize_live_push(rl: MpRaizeLive*, series: int32, x: float64,
+                             y: float64) -> int32 {
+  if (rl == 0) { return MP_ERR_ARG; }
+  spin_lock(&rl->lock);
+  var rc: int32 = mp_live_push(rl->lv, series, x, y);
+  spin_unlock(&rl->lock);
+  return rc;
+}
+
+// The current seq, read under the lock.
+export fn mp_raize_live_seq(rl: MpRaizeLive*) -> int64 {
+  if (rl == 0) { return 0; }
+  spin_lock(&rl->lock);
+  var s: int64 = mp_live_seq(rl->lv);
+  spin_unlock(&rl->lock);
+  return s;
+}
+
+// Cache misses so far (each one is a real mp_live_svg render).
+export fn mp_raize_live_renders(rl: MpRaizeLive*) -> int32 {
+  if (rl == 0) { return 0; }
+  spin_lock(&rl->lock);
+  var n: int32 = rl->renders;
+  spin_unlock(&rl->lock);
+  return n;
+}
+
+// GET handler body for the polled live endpoint. Under the lock: re-render
+// only when the seq moved since the cached bytes, then answer
+//   304, empty body             when If-None-Match carries the ETag;
+//   200 image/svg+xml           otherwise, body == mp_live_svg's output;
+//   500 "chart render failed"   when the frame cannot be rendered (e.g. an
+//                               MpLive with no samples yet; the embed backs
+//                               off and retries).
+// 200 and 304 carry ETag "\"<generation>-<seq>\"" and Cache-Control: no-cache.
+export fn mp_raize_live_serve(ctx: RzContext*, rl: MpRaizeLive*) -> int32 {
+  if (!mp_raize_ctx_ok(ctx)) { return 500; }
+  if (rl == 0) { return mp_raize_fail(ctx); }
+  spin_lock(&rl->lock);
+  var seq: int64 = mp_live_seq(rl->lv);
+  if (rl->svg_seq != seq) {
+    var rc: int32 = mp_live_svg(rl->lv, &rl->opts, rl->svg);
+    if (rc != MP_OK) {
+      rl->svg_seq = -1;
+      spin_unlock(&rl->lock);
+      return mp_raize_fail(ctx);
+    }
+    rl->svg_seq = seq;
+    rl->renders = rl->renders + 1;
+  }
+  var tagbuf: uint8[48];
+  var tn: int64 = mp_raize_seq_tag(mp_live_generation(rl->lv), seq, &tagbuf[0]);
+  var tag: string = str_from_bytes((cstring)&tagbuf[0], tn);
+  var st: int32 = mp_raize_send(ctx, MP_RAIZE_CT_SVG, tag, "no-cache", rl->svg);
+  if (st == 304) { rl->not_modified = rl->not_modified + 1; }
+  spin_unlock(&rl->lock);
+  return st;
+}
+
+// Writes the embed for `url` into `out`. With an `rl`, the current frame is
+// rendered (or taken from the cache) under the lock and placed inside the
+// div with mp_live_embed_with, so the page paints the chart before the first
+// poll; when there is no frame yet (no samples) the div starts empty. With
+// rl == 0 this is plain mp_live_embed.
+fn mp_raize_live_embed_into(rl: MpRaizeLive*, url: string, interval_ms: int32,
+                            out: MpBuf*) -> int32 {
+  if (rl == 0) { return mp_live_embed(url, interval_ms, out); }
+  spin_lock(&rl->lock);
+  var seq: int64 = mp_live_seq(rl->lv);
+  if (rl->svg_seq != seq) {
+    var rc: int32 = mp_live_svg(rl->lv, &rl->opts, rl->svg);
+    if (rc == MP_OK) {
+      rl->svg_seq = seq;
+      rl->renders = rl->renders + 1;
+    } else {
+      rl->svg_seq = -1;
+    }
+  }
+  var rc2: int32 = MP_OK;
+  if (rl->svg_seq == seq) {
+    rc2 = mp_live_embed_with(url, interval_ms, mp_buf_str(rl->svg), out);
+  } else {
+    rc2 = mp_live_embed(url, interval_ms, out);
+  }
+  spin_unlock(&rl->lock);
+  return rc2;
+}
+
+// GET handler body: the embed snippet alone as text/html (for a page that
+// fetches fragments), with `rl`'s current frame inside the div (rl may be 0
+// for an empty div). 200, or 500 on an empty url / interval_ms outside
+// 1..MP_LIVE_MAX_INTERVAL_MS.
+export fn mp_raize_live_embed(ctx: RzContext*, rl: MpRaizeLive*, url: string,
+                              interval_ms: int32) -> int32 {
+  if (!mp_raize_ctx_ok(ctx)) { return 500; }
+  var b: MpBuf* = mp_buf_new(MP_RAIZE_BUF_CAP);
+  if (b == 0) { return mp_raize_fail(ctx); }
+  defer mp_buf_free(b);
+  var rc: int32 = mp_raize_live_embed_into(rl, url, interval_ms, b);
+  if (rc != MP_OK) { return mp_raize_fail(ctx); }
+  rz_ctx_bytes(ctx, 200, MP_RAIZE_CT_HTML, mp_buf_str(b));
+  return 200;
+}
+
+// Template helper: writes the embed snippet for `url` (with `rl`'s current
+// frame inside the div, as mp_raize_live_embed; rl may be 0) into the
+// caller-owned `out` and binds `name` to it for a raw `{{{name}}}`
+// placeholder. Same lifetime rule as mp_raize_tpl_figure: `out` must outlive
+// rz_template_render_into and stay unmodified until then.
+export fn mp_raize_tpl_live(vars: RzVarMap*, name: string, rl: MpRaizeLive*,
+                            url: string, interval_ms: int32,
+                            out: MpBuf*) -> int32 {
+  if (vars == 0 || out == 0) { return MP_ERR_ARG; }
+  var rc: int32 = mp_raize_live_embed_into(rl, url, interval_ms, out);
+  if (rc != MP_OK) { return rc; }
+  if (rz_vars_set(vars, name, mp_buf_str(out)) != 0) { return MP_ERR_STATE; }
+  return MP_OK;
+}

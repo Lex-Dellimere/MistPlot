@@ -1,0 +1,347 @@
+// integrations/raize/examples/dashboard — a RaizeWeb app with one static and
+// one live MistPlot chart.
+//
+//   GET /                  HTML page with the bar chart <figure> ({{{bar}}})
+//                          and the live-chart embed ({{{live}}})
+//   GET /chart/static.svg  the bar chart as image/svg+xml
+//   GET /chart/live.svg    the live line chart, polled by the embed
+//
+// A producer thread pushes a 10 s sine plus noise four times a second; x is
+// seconds since start and the chart shows the last 60 s. All MpLive access
+// goes through MpRaizeLive's lock. The static spec and the template are built
+// before the server starts and are read-only afterwards.
+//
+// Build and run from the mistplot repo root:
+//   mettle --build integrations/raize/examples/dashboard.mettle \
+//       -o build/integrations/raize/dashboard
+//   ./build/integrations/raize/dashboard                 # :8088, until killed
+//   ./build/integrations/raize/dashboard --port 8099
+//   ./build/integrations/raize/dashboard --run-for 10    # stop cleanly after 10 s
+//
+// With --run-for N a stopper thread calls rz_server_stop after N seconds; the
+// workers and the producer are joined and everything is freed before exit.
+
+import "std/io";
+import "std/mem";
+import "std/math";
+import "std/thread";
+import "std/bench";
+import "raize/framework/str/str";
+import "raize/framework/context/context";
+import "raize/framework/router/router";
+import "raize/framework/server/server";
+import "raize/framework/middleware/chain";
+import "raize/framework/middleware/logging";
+import "raize/framework/middleware/recover";
+import "raize/framework/template/template";
+import "raize/framework/template/vars";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/data";
+import "mistplot/renderer/backend";
+import "mistplot/chart/spec";
+import "mistplot/live/stream";
+import "../mp_raize";
+
+const DASH_PORT: int32 = 8088;
+const DASH_INTERVAL_MS: int32 = 1000;
+const DASH_PUSH_MS: uint32 = 250;
+const DASH_WINDOW_S: float64 = 60.0;
+const DASH_RING: int64 = 4096;
+
+// Embedded at compile time (no cwd-relative path at run time). import_str
+// bytes are not interpolated, so the template's `{{name}}` is written as is.
+const DASH_PAGE: string = import_str "dashboard.html";
+
+// Set before any worker or producer starts. Specs and options live on the
+// heap: assigning mp_chart_spec(...) to a module-scope struct is a --release
+// ICE (see README.md, Compiler issues).
+var g_router: RzRouter* = 0;
+var g_chain: RzChain* = 0;
+var g_rec: RzRecover* = 0;
+var g_log: RzLog* = 0;
+var g_tpl: RzTemplate* = 0;
+var g_bar_series: MpSeries* = 0;
+var g_bar: MpChartSpec* = 0;
+var g_regions: string* = 0;   // category labels of the bar chart (literals)
+var g_bar_opts: MpRenderOpts* = 0;
+var g_lv: MpLive* = 0;
+var g_live_opts: MpRenderOpts* = 0;
+var g_rl: MpRaizeLive* = 0;
+var g_srv: RzServer* = 0;
+var g_stop: int32 = 0;        // producer stop flag (atomic)
+var g_run_for: int32 = 0;     // seconds; 0 = run until killed
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+fn h_index(ctx: RzContext*) -> int32 {
+  // Both buffers are request-scoped and outlive rz_template_render_into, which
+  // copies their bytes into the response body; then they are freed.
+  var bar: MpBuf* = mp_buf_new(MP_RAIZE_BUF_CAP);
+  if (bar == 0) { rz_ctx_text(ctx, 500, "out of memory\n"); return 500; }
+  defer mp_buf_free(bar);
+  var live: MpBuf* = mp_buf_new(MP_RAIZE_BUF_CAP);
+  if (live == 0) { rz_ctx_text(ctx, 500, "out of memory\n"); return 500; }
+  defer mp_buf_free(live);
+
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  rz_vars_set(&vars, "title", "MistPlot on RaizeWeb");
+  var ibuf: uint8[24];
+  rz_vars_set(&vars, "interval", raize_int_buf((int64)DASH_INTERVAL_MS, &ibuf[0], 24));
+  var r1: int32 = mp_raize_tpl_figure(&vars, "bar", g_bar, g_bar_opts, bar);
+  // The embed carries the current frame, so the page paints immediately.
+  var r2: int32 = mp_raize_tpl_live(&vars, "live", g_rl, "/chart/live.svg",
+                                    DASH_INTERVAL_MS, live);
+  if (r1 != MP_OK || r2 != MP_OK) {
+    rz_ctx_text(ctx, 500, "chart render failed\n");
+    return 500;
+  }
+  var st: int32 = rz_template_render_into(g_tpl, &vars, ctx->resp->body);
+  if (st != RZ_TPL_OK) {
+    rz_ctx_text(ctx, 500, "template render failed\n");
+    return 500;
+  }
+  if (rz_resp_set_content_type(ctx->resp, RZ_CT_HTML) != 0) { return 500; }
+  ctx->resp->status = 200;
+  ctx->status = 200;
+  return 200;
+}
+
+fn h_static_svg(ctx: RzContext*) -> int32 {
+  return mp_raize_svg(ctx, g_bar, g_bar_opts);
+}
+
+fn h_live_svg(ctx: RzContext*) -> int32 {
+  return mp_raize_live_serve(ctx, g_rl);
+}
+
+fn handle_route(ctx: RzContext*) -> int32 {
+  return rz_router_handle(g_router, ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Producer and stopper threads
+// ---------------------------------------------------------------------------
+
+fn xorshift32(s: uint32*) -> uint32 {
+  var x: uint32 = *s;
+  x = x ^ (x << (uint32)13);
+  x = x ^ (x >> (uint32)17);
+  x = x ^ (x << (uint32)5);
+  *s = x;
+  return x;
+}
+
+fn stop_requested() -> bool {
+  return atomic_compare_exchange_i32(&g_stop, 0, 0) != 0;
+}
+
+export fn dash_producer_main(arg: cstring) -> uint32 {
+  var rng: uint32 = (uint32)2463534242;
+  var t0: int64 = bench_time_us();
+  var pushed: uint32 = 0;
+  while (!stop_requested()) {
+    var t: float64 = (float64)(bench_time_us() - t0) / 1000000.0;
+    var u: float64 = (float64)xorshift32(&rng) / 4294967296.0;
+    var y: float64 = sin(t * 6.283185307179586 / 10.0) + (u - 0.5) * 0.4;
+    if (mp_raize_live_push(g_rl, 0, t, y) == MP_OK) { pushed = pushed + (uint32)1; }
+    thread_sleep_ms(DASH_PUSH_MS);
+  }
+  return pushed;
+}
+
+// Sleeps in 100 ms steps (so it also notices an early stop), then stops the
+// server, which makes rz_server_run return in main.
+export fn dash_stopper_main(arg: cstring) -> uint32 {
+  var left: int64 = (int64)g_run_for * 10;
+  while (left > 0 && !stop_requested()) {
+    thread_sleep_ms((uint32)100);
+    left = left - 1;
+  }
+  rz_server_stop(g_srv);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+// `--port N` and `--run-for S` from argv.
+fn parse_args(argc: int32, argv: cstring*, port: int32*) {
+  var i: int32 = 1;
+  while (i + 1 < argc) {
+    var a: string = raize_str_from_c(argv[i]);
+    var v: int64 = raize_str_to_int(raize_str_from_c(argv[i + 1]));
+    if (raize_str_eq(a, "--port") && v > 0 && v < 65536) { *port = (int32)v; }
+    if (raize_str_eq(a, "--run-for") && v > 0 && v < 86400) { g_run_for = (int32)v; }
+    i = i + 1;
+  }
+}
+
+fn build_bar() -> bool {
+  g_bar_series = mp_series_new("requests", 8);
+  if (g_bar_series == 0) { return false; }
+  var vals: float64[6] = [420.0, 310.0, 515.0, 180.0, 260.0, 390.0];
+  var i: int32 = 0;
+  while (i < 6) {
+    if (mp_series_push(g_bar_series, (float64)(i + 1), vals[i]) != MP_OK) { return false; }
+    i = i + 1;
+  }
+  g_bar = (MpChartSpec*)calloc(1, sizeof(MpChartSpec));
+  g_bar_opts = (MpRenderOpts*)calloc(1, sizeof(MpRenderOpts));
+  if (g_bar == 0 || g_bar_opts == 0) { return false; }
+  *g_bar = mp_chart_spec(MP_CHART_BAR, g_bar_series, 1);
+  g_bar->title = "Requests by region";
+  g_bar->x_label = "region";
+  g_bar->y_label = "req/min";
+  g_bar->width = 480.0;
+  g_bar->height = 300.0;
+  g_bar->legend = MP_LEGEND_NONE;
+  g_bar->x_format = MP_FMT_INT;
+  g_regions = (string*)calloc(6, sizeof(string));
+  if (g_regions == 0) { return false; }
+  g_regions[0] = "north";
+  g_regions[1] = "south";
+  g_regions[2] = "east";
+  g_regions[3] = "west";
+  g_regions[4] = "central";
+  g_regions[5] = "islands";
+  g_bar->categories = g_regions;
+  g_bar->n_categories = 6;
+  *g_bar_opts = mp_render_opts(480.0, 300.0, mp_theme_light());
+  return true;
+}
+
+fn build_live() -> bool {
+  g_lv = mp_live_new(MP_CHART_LINE, 1, DASH_RING);
+  if (g_lv == 0) { return false; }
+  if (mp_live_series_name(g_lv, 0, "signal") != MP_OK) { return false; }
+  if (mp_live_window(g_lv, DASH_WINDOW_S) != MP_OK) { return false; }
+  var sp: MpChartSpec* = mp_live_spec(g_lv);
+  sp->title = "sin(2*pi*t/10) + noise";
+  sp->x_label = "uptime";
+  sp->width = 480.0;
+  sp->height = 300.0;
+  sp->legend = MP_LEGEND_NONE;
+  sp->x_format = MP_FMT_TIME;
+  sp->y_fixed = true;
+  sp->y_min = -1.5;
+  sp->y_max = 1.5;
+  sp->y_start_at_zero = false;
+  mp_live_touch(g_lv);
+  g_live_opts = (MpRenderOpts*)calloc(1, sizeof(MpRenderOpts));
+  if (g_live_opts == 0) { return false; }
+  *g_live_opts = mp_render_opts(480.0, 300.0, mp_theme_light());
+  g_rl = mp_raize_live_new(g_lv, g_live_opts);
+  if (g_rl == 0) { return false; }
+  // One sample before the first request, so the live endpoint never serves an
+  // empty-chart error to the first poll.
+  if (mp_raize_live_push(g_rl, 0, 0.0, 0.0) != MP_OK) { return false; }
+  return true;
+}
+
+fn build_web() -> int32 {
+  g_tpl = rz_template_new();
+  if (g_tpl == 0) { return 1; }
+  var decls: RzVarMap;
+  rz_vars_init(&decls);
+  rz_vars_set(&decls, "title", "-");
+  rz_vars_set(&decls, "interval", "-");
+  rz_vars_set(&decls, "bar", "-");
+  rz_vars_set(&decls, "live", "-");
+  var trc: int32 = rz_template_from_string(g_tpl, DASH_PAGE, &decls);
+  if (trc != RZ_TPL_OK) {
+    println("dashboard: template refused: {rz_template_strerror(trc)}");
+    return 2;
+  }
+  g_router = rz_router_new();
+  if (g_router == 0) { return 3; }
+  var a0: int32 = rz_router_add(g_router, "GET", "/", &h_index);
+  var a1: int32 = rz_router_add(g_router, "GET", "/chart/static.svg", &h_static_svg);
+  var a2: int32 = rz_router_add(g_router, "GET", "/chart/live.svg", &h_live_svg);
+  if (a0 != RZ_E_OK || a1 != RZ_E_OK || a2 != RZ_E_OK) {
+    println("dashboard: route registration failed {a0} {a1} {a2}");
+    return 4;
+  }
+  g_rec = rz_recover_new();
+  g_log = rz_log_new();
+  if (g_rec == 0 || g_log == 0) { return 5; }
+  if (rz_recover_use(g_rec) != 0 || rz_log_use(g_log) != 0) { return 6; }
+  g_chain = rz_chain_new();
+  if (g_chain == 0) { return 7; }
+  var s0: int32 = rz_chain_add(g_chain, "recover", &rz_mw_recover);
+  var s1: int32 = rz_chain_add(g_chain, "logging", &rz_mw_logging);
+  var s2: int32 = rz_chain_set_terminal(g_chain, &handle_route);
+  if (s0 != 0 || s1 != 0 || s2 != 0) { return 8; }
+  return 0;
+}
+
+fn teardown() {
+  rz_chain_free(g_chain);
+  rz_log_free(g_log);
+  rz_recover_free(g_rec);
+  rz_router_free(g_router);
+  rz_template_free(g_tpl);
+  mp_raize_live_free(g_rl);
+  mp_live_free(g_lv);
+  free((rawptr)g_live_opts);
+  free((rawptr)g_bar);
+  free((rawptr)g_regions);
+  free((rawptr)g_bar_opts);
+  mp_series_free(g_bar_series);
+}
+
+fn main(argc: int32, argv: cstring*) -> int32 {
+  var port: int32 = DASH_PORT;
+  parse_args(argc, argv, &port);
+  if (!build_bar()) { println("dashboard: bar chart setup failed"); return 1; }
+  if (!build_live()) { println("dashboard: live chart setup failed"); return 1; }
+  var wrc: int32 = build_web();
+  if (wrc != 0) { println("dashboard: web setup failed ({wrc})"); return 1; }
+  var handler: fn(RzContext*) -> int32 = rz_chain_handler(g_chain);
+  if (handler == (fn(RzContext*) -> int32)0) {
+    println("dashboard: chain mount failed");
+    return 1;
+  }
+
+  var opts: RzServerOpts = rz_server_opts_default();
+  opts.port = port;
+  g_srv = rz_server_new(opts);
+  if (g_srv == 0) { println("dashboard: server_new failed"); return 1; }
+  if (rz_server_set_handler(g_srv, handler) != 0) {
+    println("dashboard: set_handler failed");
+    return 1;
+  }
+
+  var producer: int64 = CreateThread(0, 0, &dash_producer_main, 0, 0, 0);
+  if (producer <= 0) { println("dashboard: producer thread failed"); return 1; }
+  var stopper: int64 = 0;
+  if (g_run_for > 0) {
+    stopper = CreateThread(0, 0, &dash_stopper_main, 0, 0, 0);
+  }
+
+  println("dashboard: listening on http://127.0.0.1:{port}/");
+  var rc: int32 = rz_server_run(g_srv);
+  if (rc != 0) {
+    println("dashboard: server failed rc={rc} err={rz_server_last_error(g_srv)}");
+  }
+
+  // Stop and join every thread before anything they touch is freed.
+  atomic_exchange_i32(&g_stop, 1);
+  if (stopper > 0) {
+    thread_join_infinite(stopper);
+    thread_close(stopper);
+  }
+  thread_join_infinite(producer);
+  thread_close(producer);
+  var seq: int64 = mp_raize_live_seq(g_rl);
+  var renders: int32 = mp_raize_live_renders(g_rl);
+  println("dashboard: stopped; live seq={seq} renders={renders}");
+  rz_server_free(g_srv);
+  teardown();
+  if (rc != 0) { return 1; }
+  return 0;
+}

@@ -1,0 +1,485 @@
+// integrations/raize/tests/raize_test — the RaizeWeb helpers, driven without a
+// socket.
+//
+// Each request is built exactly as a RaizeWeb worker builds it (rz_arena_reset,
+// rz_request_init, rz_response_reset, rz_ctx_init) and dispatched through a
+// real router, so every check also goes through the router's status contract:
+// a handler returning something outside 100..599 would surface as 500.
+//
+// Covered: static SVG and figure responses (content ETag, 304 for plain, weak,
+// listed and `*` If-None-Match, 500 on a render failure), the template helper,
+// the live endpoint (gen-seq ETag, cached bytes reused per seq, one render per
+// push, generation mismatch after a restart), the embed snippet with the
+// current frame, and the generation stamp.
+//
+// Deterministic apart from the generation, which is read once from the clock
+// and compared only through mp_live_generation. Exit code 0 on pass.
+
+import "std/io";
+import "std/mem";
+import "mistplot/harness";
+import "mistplot/core/buf";
+import "mistplot/core/color";
+import "mistplot/core/data";
+import "mistplot/renderer/backend";
+import "mistplot/chart/spec";
+import "mistplot/backends/web/page";
+import "mistplot/live/stream";
+import "mistplot/backends/web/live";
+import "raize/framework/str/str";
+import "raize/framework/context/context";
+import "raize/framework/router/router";
+import "raize/framework/template/template";
+import "raize/framework/template/vars";
+import "../mp_raize";
+
+var g_rt: RzRouter* = 0;
+var g_arena: RzArena* = 0;
+var g_resp: RzResponse* = 0;
+var g_req: RzRequest;
+var g_ctx: RzContext;
+
+var g_series: MpSeries* = 0;
+// Heap, not `var g_spec: MpChartSpec;`: assigning mp_chart_spec(...) to a
+// module-scope struct is a --release ICE; see README.md, Compiler issues.
+var g_spec: MpChartSpec* = 0;
+var g_bad: MpChartSpec* = 0;
+var g_opts: MpRenderOpts* = 0;
+
+fn h_svg(ctx: RzContext*) -> int32 { return mp_raize_svg(ctx, g_spec, g_opts); }
+fn h_fig(ctx: RzContext*) -> int32 { return mp_raize_figure(ctx, g_spec, g_opts); }
+fn h_bad(ctx: RzContext*) -> int32 { return mp_raize_svg(ctx, g_bad, g_opts); }
+
+// One request, built exactly as a worker builds it. `inm` empty = no header.
+fn run(verb: string, path: string, inm: string) -> int32 {
+  rz_arena_reset(g_arena);
+  if (!rz_request_init(&g_req, g_arena)) { return -1; }
+  g_req.verb = verb;
+  g_req.path = path;
+  g_req.target = path;
+  if (inm.length > 0) {
+    g_req.headers[0].name = "If-None-Match";
+    g_req.headers[0].value = inm;
+    g_req.header_count = 1;
+  }
+  rz_response_reset(g_resp);
+  rz_ctx_init(&g_ctx, &g_req, g_resp, g_arena);
+  return rz_router_handle(g_rt, &g_ctx);
+}
+
+fn body() -> string { return raize_buf_str(g_resp->body); }
+fn hdr(name: string) -> string { return rz_resp_header_get(g_resp, name); }
+
+// Copies the current ETag out of the arena (the next run() resets it).
+fn save_etag(out: uint8*, cap: int64) -> int64 {
+  var e: string = hdr("ETag");
+  var n: int64 = (int64)e.length;
+  if (n >= cap) { return 0; }
+  var i: int64 = 0;
+  while (i < n) {
+    out[i] = e.chars[i];
+    i = i + 1;
+  }
+  return n;
+}
+
+fn check_static() {
+  var want: MpBuf* = mp_buf_new(4096);
+  defer mp_buf_free(want);
+  mp_expect("chart_svg ok", mp_chart_svg(g_spec, g_opts, want) == MP_OK);
+
+  var st: int32 = run("GET", "/s.svg", "");
+  mp_expect_i64("svg status", (int64)st, 200);
+  mp_expect_i64("svg ctx status", (int64)g_ctx.status, 200);
+  mp_expect_str("svg content-type", hdr("Content-Type"), "image/svg+xml");
+  mp_expect_str("svg cache-control", hdr("Cache-Control"), "no-cache");
+  mp_expect("svg body == mp_chart_svg", body() == mp_buf_str(want));
+  mp_expect_i64("svg body len", rz_resp_body_len(g_resp), mp_buf_len(want));
+
+  var tag: uint8[64];
+  var tn: int64 = save_etag(&tag[0], 64);
+  mp_expect_i64("etag len", tn, 21);
+  var etag: string = str_from_bytes((cstring)&tag[0], tn);
+  mp_expect("etag quoted", tn > 2 && tag[0] == 34 && tag[tn - 1] == 34);
+  mp_expect("etag mp- prefix", raize_str_starts(etag, "\"mp-"));
+
+  st = run("GET", "/s.svg", "");
+  mp_expect_str("etag stable", hdr("ETag"), etag);
+
+  st = run("GET", "/s.svg", etag);
+  mp_expect_i64("svg 304", (int64)st, 304);
+  mp_expect_i64("svg 304 empty body", rz_resp_body_len(g_resp), 0);
+  mp_expect_str("svg 304 keeps etag", hdr("ETag"), etag);
+
+  var wk: uint8[96];
+  wk[0] = 87;
+  wk[1] = 47;
+  var i: int64 = 0;
+  while (i < tn) {
+    wk[2 + i] = tag[i];
+    i = i + 1;
+  }
+  st = run("GET", "/s.svg", str_from_bytes((cstring)&wk[0], tn + 2));
+  mp_expect_i64("svg 304 weak", (int64)st, 304);
+
+  var ls: uint8[128];
+  var pre: string = "\"zz\" ,  ";
+  var pn: int64 = (int64)pre.length;
+  i = 0;
+  while (i < pn) {
+    ls[i] = pre.chars[i];
+    i = i + 1;
+  }
+  i = 0;
+  while (i < tn) {
+    ls[pn + i] = tag[i];
+    i = i + 1;
+  }
+  st = run("GET", "/s.svg", str_from_bytes((cstring)&ls[0], pn + tn));
+  mp_expect_i64("svg 304 list", (int64)st, 304);
+
+  st = run("GET", "/s.svg", "*");
+  mp_expect_i64("svg 304 star", (int64)st, 304);
+
+  st = run("GET", "/s.svg", "\"mp-0000000000000000\"");
+  mp_expect_i64("svg stale tag 200", (int64)st, 200);
+  mp_expect("svg stale body", body() == mp_buf_str(want));
+
+  st = run("HEAD", "/s.svg", "");
+  mp_expect_i64("svg HEAD routed as GET", (int64)st, 200);
+
+  var fig: MpBuf* = mp_buf_new(4096);
+  defer mp_buf_free(fig);
+  mp_expect("chart_figure ok", mp_chart_figure(g_spec, g_opts, fig) == MP_OK);
+  st = run("GET", "/f.html", "");
+  mp_expect_i64("fig status", (int64)st, 200);
+  mp_expect_str("fig content-type", hdr("Content-Type"), "text/html; charset=utf-8");
+  mp_expect("fig body == mp_chart_figure", body() == mp_buf_str(fig));
+
+  st = run("GET", "/bad.svg", "");
+  mp_expect_i64("bad status", (int64)st, 500);
+  mp_expect_str("bad content-type", hdr("Content-Type"), "text/plain; charset=utf-8");
+  mp_expect_str("bad body", body(), "chart render failed\n");
+  mp_expect_i64("bad has no etag", (int64)hdr("ETag").length, 0);
+
+  // null context is a 500, not a crash
+  mp_expect_i64("null ctx", (int64)mp_raize_svg(0, g_spec, g_opts), 500);
+}
+
+fn check_template() {
+  var t: RzTemplate* = rz_template_new();
+  defer rz_template_free(t);
+  var decls: RzVarMap;
+  rz_vars_init(&decls);
+  rz_vars_set(&decls, "chart", "-");
+  var trc: int32 = rz_template_from_string(t, "<main>{{{{{{chart}}}</main>", &decls);
+  mp_expect_i64("template compiles", (int64)trc, (int64)RZ_TPL_OK);
+
+  var fig: MpBuf* = mp_buf_new(4096);
+  defer mp_buf_free(fig);
+  mp_chart_figure(g_spec, g_opts, fig);
+
+  var page: RaizeBuf* = raize_buf_new_cap(256);
+  defer raize_buf_free(page);
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  var slot: MpBuf* = mp_buf_new(1024);
+  var rc: int32 = mp_raize_tpl_figure(&vars, "chart", g_spec, g_opts, slot);
+  mp_expect("tpl_figure ok", rc == MP_OK);
+  var rr: int32 = rz_template_render_into(t, &vars, page);
+  // The render copied the bytes: the caller buffer may go now.
+  mp_buf_free(slot);
+  mp_expect_i64("template renders", (int64)rr, (int64)RZ_TPL_OK);
+  var got: string = raize_buf_str(page);
+  var flen: int64 = mp_buf_len(fig);
+  mp_expect_i64("template length", (int64)got.length, flen + 13);
+  mp_expect("template prefix", raize_str_starts(got, "<main><figure class=\"mp-figure\">"));
+  mp_expect("template suffix", raize_str_ends(got, "</figure>\n</main>"));
+  var mid: string = raize_str_sub(got, 6, 6 + flen);
+  mp_expect("template body == figure (raw, unescaped)", mid == mp_buf_str(fig));
+
+  var bad_vars: RzVarMap;
+  rz_vars_init(&bad_vars);
+  var slot2: MpBuf* = mp_buf_new(64);
+  defer mp_buf_free(slot2);
+  mp_expect("tpl_figure bad spec fails",
+            mp_raize_tpl_figure(&bad_vars, "chart", g_bad, g_opts, slot2) != MP_OK);
+  mp_expect("tpl_figure bad spec unbound", !rz_vars_has(&bad_vars, "chart"));
+}
+
+fn setup() -> bool {
+  g_arena = rz_arena_new();
+  g_resp = rz_response_new();
+  g_rt = rz_router_new();
+  if (g_arena == 0 || g_resp == 0 || g_rt == 0) { return false; }
+  rz_router_set_path_decoded(g_rt, true);
+  if (rz_router_add(g_rt, "GET", "/s.svg", &h_svg) != RZ_E_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/f.html", &h_fig) != RZ_E_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/bad.svg", &h_bad) != RZ_E_OK) { return false; }
+  if (!setup_live()) { return false; }
+
+  g_series = mp_series_new("sales", 8);
+  if (g_series == 0) { return false; }
+  var vals: float64[6] = [12.0, 19.0, 7.0, 15.0, 22.0, 9.0];
+  var i: int32 = 0;
+  while (i < 6) {
+    mp_series_push(g_series, (float64)i, vals[i]);
+    i = i + 1;
+  }
+  g_spec = (MpChartSpec*)calloc(1, sizeof(MpChartSpec));
+  g_bad = (MpChartSpec*)calloc(1, sizeof(MpChartSpec));
+  g_opts = (MpRenderOpts*)calloc(1, sizeof(MpRenderOpts));
+  if (g_spec == 0 || g_bad == 0 || g_opts == 0) { return false; }
+  *g_spec = mp_chart_spec(MP_CHART_BAR, g_series, 1);
+  g_spec->title = "Units & <sold>";
+  g_spec->width = 480.0;
+  g_spec->height = 300.0;
+  *g_bad = mp_chart_spec(99, g_series, 1);
+  *g_opts = mp_render_opts(480.0, 300.0, mp_theme_light());
+  return true;
+}
+
+fn teardown() {
+  teardown_live();
+  free((rawptr)g_spec);
+  free((rawptr)g_bad);
+  free((rawptr)g_opts);
+  mp_series_free(g_series);
+  rz_router_free(g_rt);
+  rz_response_free(g_resp);
+  rz_arena_free(g_arena);
+}
+
+// ---------------------------------------------------------------------------
+// Live
+// ---------------------------------------------------------------------------
+
+var g_lv: MpLive* = 0;
+var g_lopts: MpRenderOpts* = 0;
+var g_rl: MpRaizeLive* = 0;
+
+fn h_live(ctx: RzContext*) -> int32 { return mp_raize_live_serve(ctx, g_rl); }
+fn h_embed(ctx: RzContext*) -> int32 {
+  return mp_raize_live_embed(ctx, g_rl, "/live.svg", 500);
+}
+
+fn h_embed0(ctx: RzContext*) -> int32 {
+  return mp_raize_live_embed(ctx, 0, "/live.svg", 500);
+}
+
+fn setup_live() -> bool {
+  g_lv = mp_live_new(MP_CHART_LINE, 1, 256);
+  if (g_lv == 0) { return false; }
+  var sp: MpChartSpec* = mp_live_spec(g_lv);
+  sp->title = "signal";
+  sp->width = 480.0;
+  sp->height = 240.0;
+  sp->x_format = MP_FMT_TIME;
+  mp_live_series_name(g_lv, 0, "sine");
+  g_lopts = (MpRenderOpts*)calloc(1, sizeof(MpRenderOpts));
+  if (g_lopts == 0) { return false; }
+  *g_lopts = mp_render_opts(480.0, 240.0, mp_theme_light());
+  g_rl = mp_raize_live_new(g_lv, g_lopts);
+  if (g_rl == 0) { return false; }
+  if (rz_router_add(g_rt, "GET", "/live.svg", &h_live) != RZ_E_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/embed", &h_embed) != RZ_E_OK) { return false; }
+  if (rz_router_add(g_rt, "GET", "/embed0", &h_embed0) != RZ_E_OK) { return false; }
+  return true;
+}
+
+fn teardown_live() {
+  mp_raize_live_free(g_rl);
+  mp_live_free(g_lv);
+  free((rawptr)g_lopts);
+}
+
+// `"<gen>-<seq>"` into out; returns the view.
+fn seq_tag(gen: int64, seq: int64, out: uint8*) -> string {
+  var digits: uint8[32];
+  var g: string = raize_int_buf(gen, &digits[0], 32);
+  var n: int64 = (int64)g.length;
+  out[0] = 34;
+  var i: int64 = 0;
+  while (i < n) {
+    out[1 + i] = g.chars[i];
+    i = i + 1;
+  }
+  out[1 + n] = 45;
+  var digits2: uint8[32];
+  var d: string = raize_int_buf(seq, &digits2[0], 32);
+  var m: int64 = (int64)d.length;
+  i = 0;
+  while (i < m) {
+    out[2 + n + i] = d.chars[i];
+    i = i + 1;
+  }
+  out[2 + n + m] = 34;
+  return str_from_bytes((cstring)out, n + m + 3);
+}
+
+// mp_raize_live_new stamps an MpLive that has no generation with the
+// wall-clock start time and keeps one the app chose.
+fn check_generation() {
+  var gen: int64 = mp_live_generation(g_lv);
+  mp_expect("raize stamps a generation", gen > (int64)1600000000000000);
+  var lv2: MpLive* = mp_live_new(MP_CHART_LINE, 1, 16);
+  mp_expect("gen live", lv2 != 0);
+  if (lv2 == 0) { return; }
+  mp_live_set_generation(lv2, 42);
+  var rl2: MpRaizeLive* = mp_raize_live_new(lv2, g_lopts);
+  mp_expect("gen raize live", rl2 != 0);
+  mp_expect_i64("an app-chosen generation is kept", mp_live_generation(lv2), 42);
+  mp_raize_live_free(rl2);
+  mp_live_free(lv2);
+}
+
+fn check_live() {
+  // An MpLive with no samples: whatever the core answers, the handler must
+  // return a routable status (200 or the documented 500), never garbage.
+  var st: int32 = run("GET", "/live.svg", "");
+  mp_expect("empty live is 200 or 500", st == 200 || st == 500);
+
+  var i: int32 = 0;
+  while (i < 20) {
+    var x: float64 = (float64)i * 0.5;
+    var y: float64 = (float64)((i * 7) % 11);
+    mp_expect("push ok", mp_raize_live_push(g_rl, 0, x, y) == MP_OK);
+    i = i + 1;
+  }
+  mp_expect("push bad series", mp_raize_live_push(g_rl, 3, 0.0, 0.0) != MP_OK);
+  var seq: int64 = mp_raize_live_seq(g_rl);
+  mp_expect("seq moved", seq >= 20);
+  var gen: int64 = mp_live_generation(g_lv);
+  var tb: uint8[64];
+  var tag: string = seq_tag(gen, seq, &tb[0]);
+
+  var r0: int32 = mp_raize_live_renders(g_rl);
+  st = run("GET", "/live.svg", "");
+  mp_expect_i64("live status", (int64)st, 200);
+  mp_expect_str("live content-type", hdr("Content-Type"), "image/svg+xml");
+  mp_expect_str("live cache-control", hdr("Cache-Control"), "no-cache");
+  mp_expect_str("live etag is quoted gen-seq", hdr("ETag"), tag);
+  mp_expect_i64("live one render", (int64)mp_raize_live_renders(g_rl), (int64)(r0 + 1));
+
+  var want: MpBuf* = mp_buf_new(4096);
+  defer mp_buf_free(want);
+  mp_expect("mp_live_svg ok", mp_live_svg(g_lv, g_lopts, want) == MP_OK);
+  mp_expect_i64("mp_live_svg leaves seq", mp_live_seq(g_lv), seq);
+  mp_expect("live body == mp_live_svg", body() == mp_buf_str(want));
+  mp_expect("live body is svg", raize_str_starts(body(), "<svg "));
+
+  // Same seq, no If-None-Match: cached bytes, no render.
+  var k: int32 = 0;
+  while (k < 5) {
+    st = run("GET", "/live.svg", "");
+    k = k + 1;
+  }
+  mp_expect_i64("live cached status", (int64)st, 200);
+  mp_expect("live cached body", body() == mp_buf_str(want));
+  mp_expect_i64("live cache reused", (int64)mp_raize_live_renders(g_rl), (int64)(r0 + 1));
+
+  // The embed's poll: If-None-Match with the ETag it saw.
+  var nm0: int32 = g_rl->not_modified;
+  st = run("GET", "/live.svg", tag);
+  mp_expect_i64("live 304", (int64)st, 304);
+  mp_expect_i64("live 304 empty body", rz_resp_body_len(g_resp), 0);
+  mp_expect_str("live 304 etag", hdr("ETag"), tag);
+  mp_expect_i64("live 304 counted", (int64)g_rl->not_modified, (int64)(nm0 + 1));
+  mp_expect_i64("live 304 no render", (int64)mp_raize_live_renders(g_rl), (int64)(r0 + 1));
+
+  // A push moves the ETag; the stale tag gets the new frame, one render.
+  mp_raize_live_push(g_rl, 0, 10.0, 4.0);
+  var seq2: int64 = mp_raize_live_seq(g_rl);
+  mp_expect_i64("seq +1", seq2, seq + 1);
+  var tb2: uint8[64];
+  var tag2: string = seq_tag(gen, seq2, &tb2[0]);
+  st = run("GET", "/live.svg", tag);
+  mp_expect_i64("live stale -> 200", (int64)st, 200);
+  mp_expect_str("live new etag", hdr("ETag"), tag2);
+  mp_expect_i64("live new frame one render", (int64)mp_raize_live_renders(g_rl),
+                (int64)(r0 + 2));
+  mp_expect("mp_live_svg ok 2", mp_live_svg(g_lv, g_lopts, want) == MP_OK);
+  mp_expect("live new body == mp_live_svg", body() == mp_buf_str(want));
+  st = run("GET", "/live.svg", tag2);
+  mp_expect_i64("live 304 new tag", (int64)st, 304);
+  // Restart: the same seq under another generation (a previous process) is
+  // not a match.
+  var tb3: uint8[64];
+  var old_gen_tag: string = seq_tag(gen - 1, seq2, &tb3[0]);
+  st = run("GET", "/live.svg", old_gen_tag);
+  mp_expect_i64("same seq, other generation -> 200", (int64)st, 200);
+  var tb4: uint8[64];
+  var bare_seq: string = seq_tag(0, seq2, &tb4[0]);
+  st = run("GET", "/live.svg", bare_seq);
+  mp_expect_i64("generation 0 tag does not match", (int64)st, 200);
+
+  // Template edit under the lock + touch -> new seq, new render.
+  mp_raize_live_lock(g_rl);
+  mp_live_spec(g_lv)->title = "signal (edited)";
+  mp_live_touch(g_lv);
+  mp_raize_live_unlock(g_rl);
+  st = run("GET", "/live.svg", tag2);
+  mp_expect_i64("touch -> 200", (int64)st, 200);
+  mp_expect("edited title in body", raize_str_contains(body(), "signal (edited)"));
+  mp_expect_i64("touch one render", (int64)mp_raize_live_renders(g_rl), (int64)(r0 + 3));
+
+  // Embed snippet, as a response and as a template variable: the div holds
+  // the current frame (first paint is not blank).
+  mp_expect("mp_live_svg ok 3", mp_live_svg(g_lv, g_lopts, want) == MP_OK);
+  var emb: MpBuf* = mp_buf_new(8192);
+  defer mp_buf_free(emb);
+  mp_expect("mp_live_embed_with ok",
+            mp_live_embed_with("/live.svg", 500, mp_buf_str(want), emb) == MP_OK);
+  var r3: int32 = mp_raize_live_renders(g_rl);
+  st = run("GET", "/embed", "");
+  mp_expect_i64("embed status", (int64)st, 200);
+  mp_expect_str("embed content-type", hdr("Content-Type"), "text/html; charset=utf-8");
+  mp_expect("embed body == mp_live_embed_with(current frame)",
+            body() == mp_buf_str(emb));
+  mp_expect("embed has data-src", raize_str_contains(body(), "data-src=\"/live.svg\""));
+  mp_expect("embed div starts with the frame",
+            raize_str_contains(body(), "data-interval=\"500\"><svg "));
+  mp_expect("embed has script", raize_str_contains(body(), "<script>"));
+  mp_expect_i64("embed reuses the cached frame", (int64)mp_raize_live_renders(g_rl),
+                (int64)r3);
+
+  var plain: MpBuf* = mp_buf_new(2048);
+  defer mp_buf_free(plain);
+  mp_expect("mp_live_embed ok", mp_live_embed("/live.svg", 500, plain) == MP_OK);
+  st = run("GET", "/embed0", "");
+  mp_expect_i64("embed without rl status", (int64)st, 200);
+  mp_expect("embed without rl == mp_live_embed", body() == mp_buf_str(plain));
+
+  var vars: RzVarMap;
+  rz_vars_init(&vars);
+  var slot: MpBuf* = mp_buf_new(256);
+  defer mp_buf_free(slot);
+  mp_expect("tpl_live ok",
+            mp_raize_tpl_live(&vars, "live", g_rl, "/live.svg", 500, slot) == MP_OK);
+  mp_expect("tpl_live bound", rz_vars_get(&vars, "live") == mp_buf_str(emb));
+  mp_expect("tpl_live bad interval",
+            mp_raize_tpl_live(&vars, "x", g_rl, "/live.svg", 0, slot) != MP_OK);
+  mp_expect("tpl_live interval above one hour",
+            mp_raize_tpl_live(&vars, "x", g_rl, "/live.svg", 3600001, slot) != MP_OK);
+  var slot2: MpBuf* = mp_buf_new(256);
+  defer mp_buf_free(slot2);
+  mp_expect("tpl_live without rl",
+            mp_raize_tpl_live(&vars, "p", 0, "/live.svg", 500, slot2) == MP_OK);
+  mp_expect("tpl_live without rl == mp_live_embed",
+            rz_vars_get(&vars, "p") == mp_buf_str(plain));
+
+  mp_expect_i64("live null rl", (int64)mp_raize_live_serve(&g_ctx, 0), 500);
+}
+
+fn main() -> int32 {
+  if (!setup()) {
+    println("setup failed");
+    return 2;
+  }
+  check_static();
+  check_template();
+  check_live();
+  check_generation();
+  teardown();
+  return mp_summary();
+}
