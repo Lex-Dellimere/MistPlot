@@ -1,6 +1,6 @@
-//! View building: picks the visible x range of a frame (window, fixed range or the data
-//! extent) and reduces each series to at most about four points per pixel column into its
-//! own grow-only view arrays. A series of at most MP_SUMMARY_MIN_LEN samples is scanned
+//! View building: picks the visible x range of a frame (window at the caller's time or at
+//! the newest sample, fixed range or the data extent) and reduces each series to at most
+//! about four points per pixel column into its own grow-only view arrays. A series of at most MP_SUMMARY_MIN_LEN samples is scanned
 //! directly; a longer sorted line, area or scatter series goes through its MpSummary
 //! (O(width)); anything else falls back to mp_col_decimate (O(n)). Uses chart/chart and
 //! data. Steady frames allocate nothing.
@@ -116,10 +116,28 @@ fn view_clip_lead(d: MpSeriesData*, x0: float64) {
   d->vx[0] = x0;
 }
 
+// With a caller time, a line to the first sample after x1 ends on x1 instead of at the
+// last sample before it (the view has one spare slot for this).
+fn view_clip_trail(d: MpSeriesData*, x1: float64) {
+  var col: MpCol* = &d->col;
+  if (d->vn < 1 || !mp_col_sorted(col)) { return; }
+  var xa: float64 = d->vx[d->vn - 1];
+  var ya: float64 = d->vy[d->vn - 1];
+  if (!(xa < x1) || is_finite(ya) == 0) { return; }
+  var i: int64 = mp_col_lower_bound(col, x1);
+  if (i >= mp_col_len(col)) { return; }
+  var xb: float64 = mp_col_x(col, i);
+  var yb: float64 = mp_col_y(col, i);
+  if (!(xb > x1) || is_finite(xb) == 0 || is_finite(yb) == 0) { return; }
+  d->vx[d->vn] = x1;
+  d->vy[d->vn] = ya + (yb - ya) * ((x1 - xa) / (xb - xa));
+  d->vn = d->vn + 1;
+}
+
 fn view_series(c: MpChart*, d: MpSeriesData*, r: MpViewRange*, cols: int32,
                lead: bool) -> int32 {
   var cap: int64 = (int64)cols * 4 + 2;
-  var rc: int32 = view_reserve(d, cap);
+  var rc: int32 = view_reserve(d, cap + 1);
   if (rc != MP_OK) { return rc; }
   var col: MpCol* = &d->col;
   var n: int64 = 0;
@@ -138,6 +156,7 @@ fn view_series(c: MpChart*, d: MpSeriesData*, r: MpViewRange*, cols: int32,
   }
   d->vn = n;
   if (lead) { view_clip_lead(d, r->x0); }
+  if (lead && r->windowed && c->has_now) { view_clip_trail(d, r->x1); }
   return MP_OK;
 }
 
@@ -181,6 +200,12 @@ fn view_bars(c: MpChart*, r: MpViewRange*) -> int32 {
 }
 
 fn view_range(c: MpChart*, r: MpViewRange*) -> bool {
+  if (c->span > 0.0 && c->has_now && is_finite(c->now - c->span) != 0) {
+    r->x0 = c->now - c->span;
+    r->x1 = c->now;
+    r->windowed = true;
+    return r->x1 > r->x0;
+  }
   if (c->span > 0.0 && c->has_latest && view_window(c, &r->x0, &r->x1)) {
     r->windowed = true;
     return true;

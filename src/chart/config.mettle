@@ -169,6 +169,7 @@ const CFG_XLOG: int32 = 4;
 const CFG_YLOG: int32 = 5;
 const CFG_YZERO: int32 = 6;
 const CFG_HOVER: int32 = 7;
+const CFG_YEASE: int32 = 8;
 
 fn cfg_int_slot(c: MpChart*, which: int32) -> int32* {
   if (which == CFG_LEGEND) { return &c->legend; }
@@ -197,6 +198,7 @@ fn cfg_flag_slot(c: MpChart*, which: int32) -> bool* {
   if (which == CFG_XLOG) { return &c->x_log; }
   if (which == CFG_YLOG) { return &c->y_log; }
   if (which == CFG_YZERO) { return &c->y_zero; }
+  if (which == CFG_YEASE) { return &c->y_ease; }
   return &c->hover;
 }
 
@@ -296,6 +298,29 @@ export fn mp_chart_set_y_log(c: MpChart*, on: bool) -> int32 {
 /// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
 export fn mp_chart_set_y_zero(c: MpChart*, on: bool) -> int32 {
   return cfg_flag(c, CFG_YZERO, on);
+}
+
+/// Whether a live chart eases its y domain (default on). Easing applies while a time is set
+/// (mp_chart_set_now) to a line, area or scatter chart whose y axis is automatic and linear;
+/// fixed ranges, log axes, bars and charts without a time keep the plain automatic domain.
+/// The target domain is the visible data (with 0 when mp_chart_set_y_zero is on) plus 15%
+/// of its height of headroom on each side that is not at 0, so data from 0 to m targets
+/// [0, 1.15 m]. Each frame moves each end towards its target by 1 - exp(-dt / tau), dt
+/// being the time since the previous frame: tau = 0.04 when the domain grows (about 35% of
+/// the gap per frame at 60 fps) and 0.8 when it shrinks (about 2%). It never stays inside
+/// the data: an end is pushed out at once to cover every visible point. The first frame,
+/// and a dt below 0 or above 1, jump to the target; a dt of 0 (another target, or a push
+/// at the same time) keeps the domain. The ticks are the nice values inside the eased
+/// domain, which is not widened to them, so grid lines and labels glide.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param on Ease the y domain of a live chart. Valid: any.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+export fn mp_chart_set_y_ease(c: MpChart*, on: bool) -> int32 {
+  return cfg_flag(c, CFG_YEASE, on);
 }
 
 /// Whether interactive hosts show a hover readout (default on).

@@ -81,7 +81,9 @@ function scan(s, c,    i, n, ch, instr, depth, nx) {
 }
 
 # Splits a parameter list at depth-0 commas (parentheses, brackets and angle
-# brackets nest; "->" is not a bracket). Fills P_name[], P_type[]; returns n.
+# brackets nest; "->" is not a bracket). A comma not followed by "name:" belongs
+# to a fn type's effect clause ("with alloc, syscall"). Fills P_name[], P_type[];
+# returns n.
 function split_params(s,    i, n, ch, depth, cur, k, p) {
   n = 0; depth = 0; cur = ""
   s = trim(s)
@@ -91,7 +93,9 @@ function split_params(s,    i, n, ch, depth, cur, k, p) {
     if (ch == "-" && substr(s, i + 1, 1) == ">") { cur = cur "->"; i++; continue }
     if (ch == "(" || ch == "[" || ch == "<") depth++
     else if (ch == ")" || ch == "]" || ch == ">") depth--
-    if (ch == "," && depth == 0) { P_raw[++n] = cur; cur = ""; continue }
+    if (ch == "," && depth == 0 && substr(s, i + 1) ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*:/) {
+      P_raw[++n] = cur; cur = ""; continue
+    }
     cur = cur ch
   }
   P_raw[++n] = cur

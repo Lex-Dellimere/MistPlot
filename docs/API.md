@@ -1041,12 +1041,19 @@ The chart. Read and change it only through the mp_chart_* and mp_series_* functi
 | `span` | `float64` | window span; 0 = everything |
 | `latest_x` | `float64` | largest finite x pushed to any series |
 | `has_latest` | `bool` | latest_x is set |
+| `has_now` | `bool` | mp_chart_set_now is in effect |
+| `now` | `float64` | the caller's current time, x units |
+| `y_ease` | `bool` | live charts ease an auto y domain (default on) |
+| `ease_ok` | `bool` | ease_lo, ease_hi and ease_t hold the last eased frame |
+| `ease_t` | `float64` | now of the last eased frame |
+| `ease_lo` | `float64` | eased y domain start |
+| `ease_hi` | `float64` | eased y domain end |
 | `seq` | `int64` | change counter |
 | `generation` | `int64` | caller-chosen frame generation |
 | `err` | `int32` | sticky first error |
 | `stats` | `MpChartStats` | counters |
-| `lock_cb` | `fn(rawptr, int32) -> void` | lock hook (ctx, batch) |
-| `unlock_cb` | `fn(rawptr, int32) -> void` | unlock hook (ctx, batch) |
+| `lock_cb` | `fn(rawptr, int32) -> void with alloc, syscall, asm` | lock hook (ctx, batch) |
+| `unlock_cb` | `fn(rawptr, int32) -> void with alloc, syscall, asm` | unlock hook |
 | `lock_ctx` | `rawptr` | passed to the hooks |
 | `sync_word` | `int32` | mp_chart_share: 0 free, 1 held |
 | `sync_owner` | `uint32` | mp_chart_share: thread holding a batch lock, or 0 |
@@ -1624,6 +1631,29 @@ Whether an automatic y domain always includes 0 (default on; bars always do).
 
 **Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
 
+### `mp_chart_set_y_ease`
+
+```mettle
+fn mp_chart_set_y_ease(c: MpChart*, on: bool) -> int32
+```
+
+Whether a live chart eases its y domain (default on). Easing applies while a time is set (mp_chart_set_now) to a line, area or scatter chart whose y axis is automatic and linear; fixed ranges, log axes, bars and charts without a time keep the plain automatic domain. The target domain is the visible data (with 0 when mp_chart_set_y_zero is on) plus 15% of its height of headroom on each side that is not at 0, so data from 0 to m targets [0, 1.15 m]. Each frame moves each end towards its target by 1 - exp(-dt / tau), dt being the time since the previous frame: tau = 0.04 when the domain grows (about 35% of the gap per frame at 60 fps) and 0.8 when it shrinks (about 2%). It never stays inside the data: an end is pushed out at once to cover every visible point. The first frame, and a dt below 0 or above 1, jump to the target; a dt of 0 (another target, or a push at the same time) keeps the domain. The ticks are the nice values inside the eased domain, which is not widened to them, so grid lines and labels glide.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `c` | `MpChart*` | The chart. Valid: non-zero. |
+| `on` | `bool` | Ease the y domain of a live chart. Valid: any. |
+
+**Returns:** MP_OK, or MP_ERR_ARG when c is 0.
+
+**Errors:**
+
+- `MP_ERR_ARG` c is 0.
+
+**Memory:** Nothing is retained.
+
+**Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
 ### `mp_chart_set_hover`
 
 ```mettle
@@ -1811,7 +1841,7 @@ Returns to margins measured from the text (the default).
 
 `import "mistplot/chart/frame";`
 
-The frame pipeline: views, then domains (fixed, zero, nice and log rules), ticks, the measured layout, final scales, and the scene in painter's order: background, plot, grid, baseline, tick labels, axis titles, marks, legend, title. A chart without visible data draws its title and a muted, centred "No data". The scene is cached per chart and rebuilt only when seq or the target key changed. Uses every chart/* internal module.
+The frame pipeline: views, then domains (fixed, zero, nice and log rules, or the eased y domain of a live chart), ticks, the measured layout, final scales, and the scene in painter's order: background, plot, grid, baseline, tick labels, axis titles, marks, legend, title. A chart without visible data draws its title and a muted, centred "No data". The scene is cached per chart and rebuilt only when seq or the target key changed. Uses every chart/* internal module.
 
 ### `mp_chart_scene`
 
@@ -1954,7 +1984,7 @@ Hover text for a y value of the last frame: fixed decimals one digit finer than 
 
 `import "mistplot/chart/samples";`
 
-Sample input of a chart: pushes, bar-style values by category, in-place overwrite by x, clearing, ring size (mp_chart_keep) and the sliding window (mp_chart_window), with getters for the newest x, the ring size, the window and whether the chart is live. Each call takes the chart's lock hooks, records its first failure as the sticky error and moves seq only when the data or the setting changed. Uses chart/chart, data/col and core.
+Sample input of a chart: pushes, bar-style values by category, in-place overwrite by x, clearing, ring size (mp_chart_keep), the sliding window (mp_chart_window) and the caller's current time (mp_chart_set_now), with getters for the newest x, the ring size, the window and whether the chart is live. Each call takes the chart's lock hooks, records its first failure as the sticky error and moves seq only when the data or the setting changed. Uses chart/chart, data/col and core.
 
 ### `mp_chart_push`
 
@@ -2136,7 +2166,7 @@ Makes every series a ring of n samples (keeping the newest), or unbounded with 0
 fn mp_chart_window(c: MpChart*, span: float64) -> int32
 ```
 
-Shows only the newest span of x: [latest x - span, latest x], where latest x is the largest finite x pushed to any series and the start is clamped up to the oldest retained sample (so the axis starts at the first sample until the data covers the span). Each line enters from the plot's left edge. 0 shows everything.
+Shows only the newest span of x: [latest x - span, latest x], where latest x is the largest finite x pushed to any series and the start is clamped up to the oldest retained sample (so the axis starts at the first sample until the data covers the span). Each line enters from the plot's left edge. 0 shows everything. With mp_chart_set_now the window is [now - span, now] instead.
 
 | Parameter | Type | Meaning |
 |---|---|---|
@@ -2152,6 +2182,55 @@ Shows only the newest span of x: [latest x - span, latest x], where latest x is 
 **Memory:** Nothing is allocated.
 
 **Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+### `mp_chart_set_now`
+
+```mettle
+fn mp_chart_set_now(c: MpChart*, t: float64) -> int32
+```
+
+Sets the current time for a live chart, so it scrolls continuously instead of in steps at each sample. While a window span is set (mp_chart_window), every frame's x domain is exactly [t - span, t], whatever the newest sample: the sample before t - span is interpolated onto the left edge, and a line to a sample newer than t is cut at the right edge. It also turns on the eased y domain (mp_chart_set_y_ease). Call it once per displayed frame with the host's clock in x units; the chart never reads a clock.
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `c` | `MpChart*` | The chart. Valid: non-zero. |
+| `t` | `float64` | The current time. Units: data units (seconds when the x format is MP_FMT_TIME). Valid: finite. |
+
+**Returns:** MP_OK, or an error code (also recorded as the sticky error).
+
+**Errors:**
+
+- `MP_ERR_ARG` c is 0 or t is not finite; nothing changes.
+
+**Memory:** Nothing is allocated.
+
+**Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+**Cost:** O(1); seq moves only when t differs from the current time.
+
+### `mp_chart_clear_now`
+
+```mettle
+fn mp_chart_clear_now(c: MpChart*) -> int32
+```
+
+Forgets the time set by mp_chart_set_now: the window follows the newest sample again and the y domain is the plain automatic one (data, zero and nice ticks).
+
+| Parameter | Type | Meaning |
+|---|---|---|
+| `c` | `MpChart*` | The chart. Valid: non-zero. |
+
+**Returns:** MP_OK, or MP_ERR_ARG when c is 0.
+
+**Errors:**
+
+- `MP_ERR_ARG` c is 0.
+
+**Memory:** Nothing is retained.
+
+**Threads:** Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+
+**Cost:** O(1); seq moves only when a time was set.
 
 ### `mp_chart_keep_count`
 
@@ -5847,19 +5926,19 @@ Marks a change that can alter the next frame.
 ```mettle
 fn mp_chart_set_lock_hooks(
   c: MpChart*,
-  mp_chart_lock_cb: fn(rawptr, int32) -> void,
-  mp_chart_unlock_cb: fn(rawptr, int32) -> void,
+  mp_chart_lock_cb: fn(rawptr, int32) -> void with alloc, syscall, asm,
+  mp_chart_unlock_cb: fn(rawptr, int32) -> void with alloc, syscall, asm,
   ctx: rawptr
 ) -> int32
 ```
 
-Installs lock hooks; called with batch = 1 for mp_chart_lock/unlock and 0 around every other exported call. mp_chart_share installs a recursive spin lock through this.
+Installs lock hooks; called with batch = 1 for mp_chart_lock/unlock and 0 around every other exported call. mp_chart_share installs a recursive spin lock through this. The hook types are closed to alloc, syscall and asm, so callers whose own callback types carry effect clauses (MeoDB scans) can call chart functions.
 
 | Parameter | Type | Meaning |
 |---|---|---|
 | `c` | `MpChart*` | The chart. Valid: non-zero, not yet shared between threads. |
-| `mp_chart_lock_cb` | `fn(rawptr, int32) -> void` | Acquires; called as mp_chart_lock_cb(ctx, batch). Valid: must allow re-entry by the thread holding a batch lock. |
-| `mp_chart_unlock_cb` | `fn(rawptr, int32) -> void` | Releases; called as mp_chart_unlock_cb(ctx, batch). |
+| `mp_chart_lock_cb` | `fn(rawptr, int32) -> void with alloc, syscall, asm` | Acquires; called as mp_chart_lock_cb(ctx, batch). Valid: must allow re-entry by the thread holding a batch lock. |
+| `mp_chart_unlock_cb` | `fn(rawptr, int32) -> void with alloc, syscall, asm` | Releases; called as mp_chart_unlock_cb(ctx, batch). |
 | `ctx` | `rawptr` | Passed to both hooks. Valid: any; borrowed for the chart's lifetime. |
 
 **Returns:** MP_OK, or MP_ERR_ARG.
@@ -6232,7 +6311,7 @@ Draws every series' marks for the chart's kind, series in index order.
 
 `import "mistplot/chart/view";`
 
-View building: picks the visible x range of a frame (window, fixed range or the data extent) and reduces each series to at most about four points per pixel column into its own grow-only view arrays. A series of at most MP_SUMMARY_MIN_LEN samples is scanned directly; a longer sorted line, area or scatter series goes through its MpSummary (O(width)); anything else falls back to mp_col_decimate (O(n)). Uses chart/chart and data. Steady frames allocate nothing.
+View building: picks the visible x range of a frame (window at the caller's time or at the newest sample, fixed range or the data extent) and reduces each series to at most about four points per pixel column into its own grow-only view arrays. A series of at most MP_SUMMARY_MIN_LEN samples is scanned directly; a longer sorted line, area or scatter series goes through its MpSummary (O(width)); anything else falls back to mp_col_decimate (O(n)). Uses chart/chart and data. Steady frames allocate nothing.
 
 ### `MpViewRange`
 

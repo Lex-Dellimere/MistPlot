@@ -152,12 +152,19 @@ export struct MpChart {
   span: float64;               /// window span; 0 = everything
   latest_x: float64;           /// largest finite x pushed to any series
   has_latest: bool;            /// latest_x is set
+  has_now: bool;               /// mp_chart_set_now is in effect
+  now: float64;                /// the caller's current time, x units
+  y_ease: bool;                /// live charts ease an auto y domain (default on)
+  ease_ok: bool;               /// ease_lo, ease_hi and ease_t hold the last eased frame
+  ease_t: float64;             /// now of the last eased frame
+  ease_lo: float64;            /// eased y domain start
+  ease_hi: float64;            /// eased y domain end
   seq: int64;                  /// change counter
   generation: int64;           /// caller-chosen frame generation
   err: int32;                  /// sticky first error
   stats: MpChartStats;         /// counters
-  lock_cb: fn(rawptr, int32) -> void;    /// lock hook (ctx, batch)
-  unlock_cb: fn(rawptr, int32) -> void;  /// unlock hook (ctx, batch)
+  lock_cb: fn(rawptr, int32) -> void with alloc, syscall, asm;    /// lock hook (ctx, batch)
+  unlock_cb: fn(rawptr, int32) -> void with alloc, syscall, asm;  /// unlock hook
   lock_ctx: rawptr;            /// passed to the hooks
   sync_word: int32;            /// mp_chart_share: 0 free, 1 held
   sync_owner: uint32;          /// mp_chart_share: thread holding a batch lock, or 0
@@ -254,6 +261,7 @@ export fn mp_chart_new(kind: int32) -> MpChart* {
   c->legend = MP_LEGEND_AUTO;
   c->grid = MP_GRID_Y;
   c->y_zero = true;
+  c->y_ease = true;
   c->hover = true;
   c->bar_gap = 0.2;
   c->margins_auto = true;
@@ -519,7 +527,9 @@ export fn mp_chart_unlock(c: MpChart*) {
 }
 
 /// Installs lock hooks; called with batch = 1 for mp_chart_lock/unlock and 0 around every
-/// other exported call. mp_chart_share installs a recursive spin lock through this.
+/// other exported call. mp_chart_share installs a recursive spin lock through this. The
+/// hook types are closed to alloc, syscall and asm, so callers whose own callback types
+/// carry effect clauses (MeoDB scans) can call chart functions.
 ///
 /// @param c The chart. Valid: non-zero, not yet shared between threads.
 /// @param mp_chart_lock_cb Acquires; called as mp_chart_lock_cb(ctx, batch). Valid: must
@@ -531,8 +541,11 @@ export fn mp_chart_unlock(c: MpChart*) {
 /// @mem ctx is borrowed and must outlive the chart.
 /// @thread Call before any other thread can reach c.
 /// @internal
-export fn mp_chart_set_lock_hooks(c: MpChart*, mp_chart_lock_cb: fn(rawptr, int32) -> void,
-                                  mp_chart_unlock_cb: fn(rawptr, int32) -> void,
+export fn mp_chart_set_lock_hooks(c: MpChart*,
+                                  mp_chart_lock_cb: fn(rawptr, int32) -> void with alloc,
+                                    syscall, asm,
+                                  mp_chart_unlock_cb: fn(rawptr, int32) -> void with alloc,
+                                    syscall, asm,
                                   ctx: rawptr) -> int32 {
   if (c == 0) { return MP_ERR_ARG; }
   c->lock_cb = mp_chart_lock_cb;

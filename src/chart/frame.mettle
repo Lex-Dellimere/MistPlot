@@ -1,6 +1,7 @@
-//! The frame pipeline: views, then domains (fixed, zero, nice and log rules), ticks,
-//! the measured layout, final scales, and the scene in painter's order: background, plot,
-//! grid, baseline, tick labels, axis titles, marks, legend, title. A chart without visible
+//! The frame pipeline: views, then domains (fixed, zero, nice and log rules, or the eased
+//! y domain of a live chart), ticks, the measured layout, final scales, and the scene in
+//! painter's order: background, plot, grid, baseline, tick labels, axis titles, marks,
+//! legend, title. A chart without visible
 //! data draws its title and a muted, centred "No data". The scene is cached per chart and
 //! rebuilt only when seq or the target key changed. Uses every chart/* internal module.
 
@@ -22,6 +23,11 @@ import "mistplot/chart/marks";
 import "mistplot/chart/legend";
 
 const FRAME_TICKS: int32 = 5;
+// Eased y domain of a live chart (see mp_chart_set_y_ease). Units: x units (seconds).
+const FRAME_TAU_GROW: float64 = 0.04;
+const FRAME_TAU_SHRINK: float64 = 0.8;
+const FRAME_EASE_MAX_DT: float64 = 1.0;
+const FRAME_HEADROOM: float64 = 0.15;
 
 fn frame_time(fmt: int32) -> bool {
   return fmt == MP_FMT_TIME || fmt == MP_FMT_TIME_TENTHS;
@@ -47,8 +53,62 @@ fn frame_log_ok(on: bool, d0: float64, d1: float64) -> bool {
   return on && d0 > 0.0 && d1 > d0 && is_finite(d0) != 0 && is_finite(d1) != 0;
 }
 
+fn frame_ease_step(cur: float64, target: float64, dt: float64, grow: bool) -> float64 {
+  var tau: float64 = FRAME_TAU_SHRINK;
+  if (grow) { tau = FRAME_TAU_GROW; }
+  return cur + (target - cur) * (1.0 - exp(0.0 - dt / tau));
+}
+
+// Moves the eased domain towards the data plus headroom; returns false (and forgets the
+// eased state) when this chart does not ease.
+fn frame_y_eased(l: MpLayout*, r: MpViewRange*) -> bool {
+  var c: MpChart* = l->c;
+  if (!c->y_ease || !c->has_now || c->kind == MP_BAR || c->y_fixed || c->y_log) {
+    c->ease_ok = false;
+    return false;
+  }
+  var lo: float64 = r->y0;
+  var hi: float64 = r->y1;
+  if (c->y_zero && lo > 0.0) { lo = 0.0; }
+  if (c->y_zero && hi < 0.0) { hi = 0.0; }
+  var h: float64 = hi - lo;
+  if (!(h > 0.0)) { h = fabs(hi); }
+  if (!(h > 0.0)) { h = 1.0; }
+  var tlo: float64 = lo - FRAME_HEADROOM * h;
+  var thi: float64 = hi + FRAME_HEADROOM * h;
+  if (c->y_zero && lo == 0.0) { tlo = 0.0; }
+  if (c->y_zero && hi == 0.0 && lo < 0.0) { thi = 0.0; }
+  var dt: float64 = c->now - c->ease_t;
+  if (!c->ease_ok || dt < 0.0 || dt > FRAME_EASE_MAX_DT) {
+    c->ease_lo = tlo;
+    c->ease_hi = thi;
+  } else if (dt > 0.0) {
+    c->ease_hi = frame_ease_step(c->ease_hi, thi, dt, thi > c->ease_hi);
+    c->ease_lo = frame_ease_step(c->ease_lo, tlo, dt, tlo < c->ease_lo);
+  }
+  // Data never leaves the plot: an end inside the data moves out to it at once.
+  if (c->ease_hi < hi) { c->ease_hi = hi; }
+  if (c->ease_lo > lo) { c->ease_lo = lo; }
+  if (is_finite(c->ease_lo) == 0 || is_finite(c->ease_hi) == 0 ||
+      !(c->ease_hi > c->ease_lo)) {
+    c->ease_lo = tlo;
+    c->ease_hi = thi;
+  }
+  c->ease_ok = true;
+  c->ease_t = c->now;
+  l->y0 = c->ease_lo;
+  l->y1 = c->ease_hi;
+  l->ylog = false;
+  return true;
+}
+
 fn frame_y_domain(l: MpLayout*, r: MpViewRange*) {
   var c: MpChart* = l->c;
+  if (frame_y_eased(l, r)) {
+    l->yfmt = frame_fmt(c->y_fmt, false, l->y0, l->y1);
+    l->ny = frame_ticks(false, frame_time(c->y_fmt), l->y0, l->y1, &l->yv[0]);
+    return;
+  }
   var bar: bool = c->kind == MP_BAR;
   l->y0 = r->y0;
   l->y1 = r->y1;

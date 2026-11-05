@@ -12,6 +12,10 @@ METTLE="${METTLE:-$ROOT/../Mettle/bin/mettle}"
 OUT="build/integrations/mythic"
 mkdir -p "$OUT"
 
+# MythicUI's GL path (Glint) dlopens libEGL / libGL, so Linux builds bind libc.
+LIBS=()
+[ "$(uname -s)" = Linux ] && LIBS=(-lc)
+
 fails=0
 step() { # name, command...
   local name="$1"; shift
@@ -28,9 +32,9 @@ for mode in debug release; do
   flag=""
   [ "$mode" = release ] && flag="--release"
   rm -f "$OUT/mythic_test.$mode" "$OUT/live_dashboard.$mode"   # a failed build must not leave an old binary to run
-  step "build-test-$mode" "$METTLE" $flag --build \
+  step "build-test-$mode" "$METTLE" $flag "${LIBS[@]}" --build \
     integrations/mythic/tests/mythic_test.mettle -o "$OUT/mythic_test.$mode"
-  step "build-example-$mode" "$METTLE" $flag --build \
+  step "build-example-$mode" "$METTLE" $flag "${LIBS[@]}" --build \
     integrations/mythic/examples/live_dashboard.mettle -o "$OUT/live_dashboard.$mode"
 done
 

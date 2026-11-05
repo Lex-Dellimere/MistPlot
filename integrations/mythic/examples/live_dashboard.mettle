@@ -5,12 +5,13 @@
 // must be called outside MythicUI's frame callbacks.
 //
 // Build from the mistplot repo root:
-//   mettle --build integrations/mythic/examples/live_dashboard.mettle \
+//   mettle -lc --build integrations/mythic/examples/live_dashboard.mettle \
 //       -o build/integrations/mythic/live_dashboard
 //
 // Samples are pushed on ui->pass == 0 only: the frame callback can run up to
 // three times per frame (settle passes), and pushing on every pass would
-// triple the samples. x is the frame clock (mythic_time_us) in seconds.
+// triple the samples. x is the frame clock (mythic_time_us) in seconds, also given to
+// mp_chart_set_now each frame so the window scrolls smoothly between samples.
 
 import "std/mem";
 import "std/math";
@@ -55,6 +56,7 @@ fn ingest(ui: MythicUi*, app: App*) {
     app->last_x = t;
     t = t + SAMPLE_DT;
   }
+  mp_chart_set_now(app->load, x);
 }
 
 fn header(ui: MythicUi*, app: App*) {

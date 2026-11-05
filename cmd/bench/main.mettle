@@ -3,8 +3,8 @@
 //   bench            print every measure with its target and hard gate
 //   bench --check    the same, then exit 1 when any hard gate fails
 //
-// B1..B8 are the measures of the design table; L1 and L2 (lock overhead) are reported
-// without a gate. Times are medians where several runs are taken. The machine-independent
+// B1..B8 are the measures of the design table, B9 the steady frame of a live chart with a
+// caller time; L1 and L2 (lock overhead) are reported without a gate. Times are medians where several runs are taken. The machine-independent
 // gates are B3's ratio (1M samples within 1.5x of 10k samples, i.e. O(width) frames) and
 // B6 (no mp_alloc in 200 steady frames). A time over its target prints a warning; only a
 // time over its gate (4x the target) fails.
@@ -172,9 +172,12 @@ fn push_batch(c: MpChart*, series: int32, next: int64) {
   }
 }
 
-// FRAMES steady frames after a warm-up: push BATCH per series, scene, SVG, terminal.
-fn steady(series: int32, keep: int64, out: Steady*) {
+// FRAMES steady frames after a warm-up: push BATCH per series, scene, SVG, terminal. live
+// adds a window of half the ring and a caller time between samples each frame (continuous
+// scroll and the eased y domain).
+fn steady(series: int32, keep: int64, live: bool, out: Steady*) {
   var c: MpChart* = live_chart(series, keep);
+  if (live) { mp_chart_window(c, (float64)(keep / 2)); }
   var k: int32 = 0;
   while (k < series) {
     fill(c, k, keep);
@@ -193,6 +196,7 @@ fn steady(series: int32, keep: int64, out: Steady*) {
     if (f == 0) { n0 = mp_alloc_count(); }
     var t0: int64 = time_mono_ns();
     push_batch(c, series, next);
+    if (live) { mp_chart_set_now(c, (float64)(next + (int64)BATCH) - 0.5); }
     mp_chart_scene(c, &t);
     var t1: int64 = time_mono_ns();
     mp_chart_svg(c, W, H, svg);
@@ -224,17 +228,21 @@ fn bench_steady() {
   var small: Steady;
   var big: Steady;
   var multi: Steady;
-  steady(1, 10000, &small);
-  steady(1, 1000000, &big);
-  steady(4, 250000, &multi);
+  var live: Steady;
+  steady(1, 10000, false, &small);
+  steady(1, 1000000, false, &big);
+  steady(4, 250000, false, &multi);
+  steady(1, 1000000, true, &live);
   row("B3", "steady push 1000 + scene, 1M samples", ms(big.scene), "ms", 0.5, 2.0);
   row("B3r", "  ratio to the same run with 10k samples", (float64)big.scene / (float64)small.scene,
       "x", 1.5, 1.5);
   row("B4", "SVG serialize of that frame", ms(big.svg), "ms", 1.0, 4.0);
   row("B5", "mp_chart_term 200x50 Braille, same chart", ms(big.term), "ms", 1.0, 4.0);
   row("B6", "mp_alloc_count delta, 200 frames scene+SVG+term",
-      (float64)(big.allocs + small.allocs + multi.allocs), "allocs", 0.0, 0.0);
+      (float64)(big.allocs + small.allocs + multi.allocs + live.allocs), "allocs", 0.0, 0.0);
   row("B7", "4 series x 250k, push 1000 each + scene", ms(multi.scene), "ms", 1.0, 4.0);
+  row("B9", "live: window + caller time + eased y, 1M", ms(live.scene), "ms",
+      0.5, 2.0);
 }
 
 // B8: a static chart rebuilt every frame (mp_chart_touch), scene + SVG.

@@ -157,6 +157,35 @@ fn chart_live() -> MpChart* {
   return c;
 }
 
+// 10 Hz samples up to 60.5 s with a spike at 28 s, drawn at now = 60.25 after frames every
+// 1/60 s from 55 s: the window ends at now (the newest samples are cut at the right edge)
+// and the auto y domain is still easing down after the spike left the window.
+fn fixture_live_now() -> int32 {
+  var c: MpChart* = mp_chart_new(MP_AREA);
+  mp_chart_set_title(c, "Requests");
+  mp_chart_set_subtitle(c, "last 30 s, eased");
+  mp_chart_set_x_format(c, MP_FMT_TIME);
+  mp_chart_keep(c, 1000);
+  mp_chart_window(c, 30.0);
+  var a: int32 = mp_chart_series(c, "rps");
+  var i: int32 = 0;
+  while (i <= 605) {
+    var t: float64 = (float64)i * 0.1;
+    var y: float64 = 60.0 + 20.0 * sin(t * 0.4) + 6.0 * sin(t * 2.3);
+    if (i == 280) { y = 140.0; }
+    mp_chart_push(c, a, t, y);
+    i = i + 1;
+  }
+  var tg: MpTarget = mp_target(640.0, 360.0);
+  var k: int32 = 0;
+  while (k <= 315) {
+    mp_chart_set_now(c, 55.0 + (float64)k / 60.0);
+    mp_chart_scene(c, &tg);
+    k = k + 1;
+  }
+  return svg(c, 640.0, 360.0);
+}
+
 // 20000 noisy samples per series, so the Braille fast paths (dot runs, unclipped segments)
 // carry most of the drawing.
 fn chart_dense() -> MpChart* {
@@ -213,6 +242,7 @@ fn run(name: string) -> int32 {
   if (name == "bar_dark") { return fixture_bar_dark(); }
   if (name == "scatter_markers") { return fixture_scatter_markers(); }
   if (name == "live_window") { return svg(chart_live(), 640.0, 360.0); }
+  if (name == "live_now") { return fixture_live_now(); }
   if (name == "hidpi_1_5") { return fixture_hidpi(); }
   if (name == "term_braille") { return term(chart_line(), 100, 28, MP_TERM_BRAILLE); }
   if (name == "term_blocks") { return term(chart_bars(), 80, 24, MP_TERM_BLOCKS); }
@@ -231,7 +261,7 @@ export fn main(argc: int32, argv: cstring*) -> int32 {
     if (r != 2) { return r; }
   }
   print_err("usage: golden <fixture>   (line area_smooth bar_dark scatter_markers ");
-  print_err("live_window hidpi_1_5 term_braille term_blocks term_ascii term_plain ");
+  print_err("live_window live_now hidpi_1_5 term_braille term_blocks term_ascii term_plain ");
   print_err("term_dense term_scatter)\n");
   return 2;
 }

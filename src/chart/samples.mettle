@@ -1,9 +1,9 @@
 //! Sample input of a chart: pushes, bar-style values by category, in-place overwrite by x,
-//! clearing, ring size (mp_chart_keep) and the sliding window (mp_chart_window), with
-//! getters for the newest x, the ring size, the window and whether the chart is live. Each
-//! call takes the chart's lock hooks, records its first failure as the sticky error and
-//! moves seq only when the data or the setting changed. Uses chart/chart, data/col and
-//! core.
+//! clearing, ring size (mp_chart_keep), the sliding window (mp_chart_window) and the
+//! caller's current time (mp_chart_set_now), with getters for the newest x, the ring size,
+//! the window and whether the chart is live. Each call takes the chart's lock hooks,
+//! records its first failure as the sticky error and moves seq only when the data or the
+//! setting changed. Uses chart/chart, data/col and core.
 
 import "std/math";
 import "mistplot/core/error";
@@ -117,6 +117,7 @@ fn samples_clear(c: MpChart*) {
   c->n_cats = 0;
   c->latest_x = 0.0;
   c->has_latest = false;
+  c->ease_ok = false;
 }
 
 /// Removes every sample and category; series, names, style and window stay.
@@ -271,7 +272,8 @@ export fn mp_chart_keep(c: MpChart*, n: int64) -> int32 {
 /// Shows only the newest span of x: [latest x - span, latest x], where latest x is the
 /// largest finite x pushed to any series and the start is clamped up to the oldest retained
 /// sample (so the axis starts at the first sample until the data covers the span). Each
-/// line enters from the plot's left edge. 0 shows everything.
+/// line enters from the plot's left edge. 0 shows everything. With mp_chart_set_now the
+/// window is [now - span, now] instead.
 ///
 /// @param c The chart. Valid: non-zero.
 /// @param span Window width. Units: data units. Valid: finite and >= 0.
@@ -291,6 +293,58 @@ export fn mp_chart_window(c: MpChart*, span: float64) -> int32 {
   mp_chart_fail(c, rc);
   mp_chart_leave(c);
   return rc;
+}
+
+/// Sets the current time for a live chart, so it scrolls continuously instead of in steps
+/// at each sample. While a window span is set (mp_chart_window), every frame's x domain is
+/// exactly [t - span, t], whatever the newest sample: the sample before t - span is
+/// interpolated onto the left edge, and a line to a sample newer than t is cut at the
+/// right edge. It also turns on the eased y domain (mp_chart_set_y_ease). Call it once per
+/// displayed frame with the host's clock in x units; the chart never reads a clock.
+///
+/// @param c The chart. Valid: non-zero.
+/// @param t The current time. Units: data units (seconds when the x format is MP_FMT_TIME).
+///   Valid: finite.
+/// @return MP_OK, or an error code (also recorded as the sticky error).
+/// @error MP_ERR_ARG c is 0 or t is not finite; nothing changes.
+/// @mem Nothing is allocated.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(1); seq moves only when t differs from the current time.
+export fn mp_chart_set_now(c: MpChart*, t: float64) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  var rc: int32 = MP_OK;
+  if (is_finite(t) == 0) { rc = MP_ERR_ARG; }
+  if (rc == MP_OK && (!c->has_now || t != c->now)) {
+    c->has_now = true;
+    c->now = t;
+    mp_chart_touch(c);
+  }
+  mp_chart_fail(c, rc);
+  mp_chart_leave(c);
+  return rc;
+}
+
+/// Forgets the time set by mp_chart_set_now: the window follows the newest sample again
+/// and the y domain is the plain automatic one (data, zero and nice ticks).
+///
+/// @param c The chart. Valid: non-zero.
+/// @return MP_OK, or MP_ERR_ARG when c is 0.
+/// @error MP_ERR_ARG c is 0.
+/// @mem Nothing is retained.
+/// @thread Safe from any thread after mp_chart_share(c); otherwise one thread at a time.
+/// @cost O(1); seq moves only when a time was set.
+export fn mp_chart_clear_now(c: MpChart*) -> int32 {
+  if (c == 0) { return MP_ERR_ARG; }
+  mp_chart_enter(c);
+  if (c->has_now) {
+    c->has_now = false;
+    c->now = 0.0;
+    c->ease_ok = false;
+    mp_chart_touch(c);
+  }
+  mp_chart_leave(c);
+  return MP_OK;
 }
 
 /// The ring size set by mp_chart_keep.

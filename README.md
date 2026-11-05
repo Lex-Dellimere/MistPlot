@@ -116,6 +116,7 @@ fn frame(ui: MythicUi*, ud: rawptr) {
   if (ui->pass == 0) {                  // MythicUI may run a frame 3 times
     var t: float64 = (float64)mythic_time_us(ui) / 1000000.0;
     mp_chart_push(app->cpu, 0, t, read_cpu());
+    mp_chart_set_now(app->cpu, t);      // scroll smoothly between samples
   }
   mp_mythic_chart(ui, app->cpu, mythic_grow(), mythic_fixed(320));
 }
@@ -135,6 +136,12 @@ mp_chart_series(app->cpu, "cpu %");
 window's device scale, shows a hover readout and asks for the next frame while
 the chart is live. Push on pass 0 only; call it on every pass.
 `mp_mythic_save_png(c, w, h, scale, path)` writes a HiDPI PNG.
+
+Call `mp_chart_set_now(c, t)` every frame with your clock in x units (the chart
+never reads one): the window becomes exactly `[t - span, t]`, so it scrolls
+continuously instead of stepping at each sample, and an automatic y axis eases
+towards the data plus 15% (fast up, slow down) instead of snapping to nice ticks.
+`mp_chart_clear_now` and `mp_chart_set_y_ease(c, false)` turn these off.
 
 A frame costs O(plot width) however many samples a sorted series holds: each
 pixel column keeps its first, min, max and last sample, so peaks survive.
