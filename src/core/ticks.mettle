@@ -38,9 +38,10 @@ export fn mp_tick_step(d0: float64, d1: float64, target: int32) -> float64 {
   if (is_finite(span) == 0) { return 0.0; }
   if (target <= 1) { return span; }
   var raw: float64 = span / (float64)target;
-  // A subnormal span can underflow the ideal spacing to 0; log10(0) is not a
-  // number here, so fall back to one step for the whole span instead.
-  if (!(raw > 0.0) || is_finite(raw) == 0) { return span; }
+  // A subnormal spacing has too few bits for a 1/2/5 step to mean anything,
+  // so the whole span is the only usable step. Test it directly: pow and log10
+  // are exact enough to give subnormal results, so they do not underflow to 0.
+  if (!(raw >= 2.2250738585072014e-308) || is_finite(raw) == 0) { return span; }
   var mag: float64 = pow(10.0, floor(log10(raw)));
   // The magnitude itself can underflow for a subnormal span; same fallback.
   if (!(mag > 0.0) || is_finite(mag) == 0) { return span; }
